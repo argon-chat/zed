@@ -6,7 +6,8 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
+    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement,
+    EffectSpec, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
     PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
     point, px, quad, rems, size,
@@ -298,6 +299,22 @@ pub struct Style {
     /// `blur()` filter function is modelled; the rest of the CSS filter
     /// function list is not.
     pub backdrop_blur: Option<Pixels>,
+
+    /// The `--shading: <effect>(<args>)` custom property: shade this element's
+    /// border box with one of the built-in effect pipelines.
+    ///
+    /// `None` means the property was never declared. `--shading: none` is
+    /// [`EffectSpec::NONE`] — a *value*, because a refinement cannot spell
+    /// "explicitly nothing" and that is what has to cancel an effect declared
+    /// by an earlier rule in the cascade. Same shape as `backdrop-filter: none`
+    /// mapping to a 0px radius.
+    ///
+    /// Deliberate divergence from CSS, documented for authors: a browser
+    /// *inherits* custom properties down the subtree. vue-native applies
+    /// `--shading` to the declaring element only — inheriting a GPU effect into
+    /// every descendant is never what an author means, and a browser ignores
+    /// the property entirely anyway, so nothing renders differently there.
+    pub vn_effect: Option<EffectSpec>,
 
     /// The text style of this element
     #[refineable]
@@ -732,6 +749,33 @@ impl Style {
             );
         }
 
+        // `--shading` splits on whether the effect consumes the backdrop:
+        //
+        // * a BACKDROP effect (`frost`) replaces the pixels behind the element
+        //   and so paints exactly where `backdrop-filter` does — under the
+        //   element's own background. It also *has* to: it draws with blending
+        //   disabled and owns every pixel of its quad, so painting it later
+        //   would erase the background quad.
+        // * a non-backdrop effect (`noise`, `glow`) is an ordinary source-over
+        //   layer and paints over the background but under the content, which
+        //   is the only slot where film grain is visible on an opaque panel
+        //   and where a glow's inner rim survives.
+        //
+        // An effect whose output moves with `time` (an animated grain) keeps
+        // asking for the next frame. That is decorative motion, so it honours
+        // `App::reduce_motion` here — clearing the flag stops the repaint
+        // request, which freezes the effect on its current frame rather than
+        // removing it. Same behaviour vn-css's animator gives transitions.
+        let effect = self.vn_effect.filter(EffectSpec::is_some).map(|mut spec| {
+            spec.animated &= !cx.reduce_motion();
+            spec
+        });
+        if let Some(spec) = effect
+            && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0
+        {
+            window.paint_effect_quad(bounds, corner_radii, spec);
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -760,6 +804,12 @@ impl Style {
         }
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+
+        if let Some(spec) = effect
+            && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP == 0
+        {
+            window.paint_effect_quad(bounds, corner_radii, spec);
+        }
 
         continuation(window, cx);
 
@@ -829,6 +879,7 @@ impl Default for Style {
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             backdrop_blur: None,
+            vn_effect: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

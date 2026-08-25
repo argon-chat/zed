@@ -1454,6 +1454,14 @@ impl WgpuRenderer {
                         // DirectX is the only backend with backdrop blur support.
                         true
                     }
+                    PrimitiveBatch::EffectQuads { .. } => {
+                        // …and the only one with `--shading` effect pipelines.
+                        // The `.slang` sources retarget (`-target wgsl`, or
+                        // PEWPEW's SPIR-V→naga route), but the engine-owned
+                        // vertex stage and the pipeline table are per-backend,
+                        // so this is a real port rather than a flag.
+                        true
+                    }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,

@@ -48,6 +48,7 @@ pub struct Scene {
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub backdrop_blur_rects: Vec<BackdropBlurRect>,
+    pub effect_quads: Vec<EffectQuad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
@@ -74,6 +75,7 @@ impl Scene {
         self.shadows.clear();
         self.quads.clear();
         self.backdrop_blur_rects.clear();
+        self.effect_quads.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
@@ -128,6 +130,10 @@ impl Scene {
                 backdrop_blur_rect.order = order;
                 self.backdrop_blur_rects.push(*backdrop_blur_rect);
             }
+            Primitive::EffectQuad(effect_quad) => {
+                effect_quad.order = order;
+                self.effect_quads.push(*effect_quad);
+            }
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
@@ -173,6 +179,11 @@ impl Scene {
         self.quads.sort_by_key(|quad| quad.order);
         self.backdrop_blur_rects
             .sort_by_key(|backdrop_blur_rect| backdrop_blur_rect.order);
+        // Secondary key `effect_id`: the batch iterator breaks a run when the
+        // id changes (each id is a different pipeline), so sorting by it keeps
+        // same-effect quads at the same draw order in ONE instanced draw.
+        self.effect_quads
+            .sort_by_key(|effect_quad| (effect_quad.order, effect_quad.effect_id));
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -199,6 +210,8 @@ impl Scene {
             quads_iter: self.quads.iter().peekable(),
             backdrop_blur_rects_start: 0,
             backdrop_blur_rects_iter: self.backdrop_blur_rects.iter().peekable(),
+            effect_quads_start: 0,
+            effect_quads_iter: self.effect_quads.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -234,12 +247,23 @@ impl Scene {
     ///   blur. Upstream PR #59026 only bumped the innermost one, which meant a
     ///   blur painted inside a nested layer stopped forcing later siblings of
     ///   the *outer* layer above it — they would draw under the glass.
+    ///
+    /// An [`EffectQuad`] that reads the backdrop takes the identical treatment
+    /// for the identical reason — it too is composited from a render-target
+    /// snapshot. An effect that does *not* read the backdrop is an ordinary
+    /// blended quad and takes the ordinary path, which is the whole point of
+    /// [`EffectQuad::needs_backdrop`].
     fn draw_order_for_primitive(
         &mut self,
         primitive: &Primitive,
         clipped_bounds: Bounds<ScaledPixels>,
     ) -> DrawOrder {
-        if !matches!(primitive, Primitive::BackdropBlurRect(_)) {
+        let snapshots_backdrop = match primitive {
+            Primitive::BackdropBlurRect(_) => true,
+            Primitive::EffectQuad(effect_quad) => effect_quad.needs_backdrop(),
+            _ => false,
+        };
+        if !snapshots_backdrop {
             return self
                 .layer_stack
                 .last()
@@ -286,6 +310,7 @@ pub(crate) enum PrimitiveKind {
     #[default]
     Quad,
     BackdropBlurRect,
+    EffectQuad,
     Path,
     Underline,
     MonochromeSprite,
@@ -306,6 +331,7 @@ pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     BackdropBlurRect(BackdropBlurRect),
+    EffectQuad(EffectQuad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -321,6 +347,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::BackdropBlurRect(backdrop_blur_rect) => &backdrop_blur_rect.bounds,
+            Primitive::EffectQuad(effect_quad) => &effect_quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -335,6 +362,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::BackdropBlurRect(backdrop_blur_rect) => &backdrop_blur_rect.content_mask,
+            Primitive::EffectQuad(effect_quad) => &effect_quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -359,6 +387,8 @@ struct BatchIterator<'a> {
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
     backdrop_blur_rects_start: usize,
     backdrop_blur_rects_iter: Peekable<slice::Iter<'a, BackdropBlurRect>>,
+    effect_quads_start: usize,
+    effect_quads_iter: Peekable<slice::Iter<'a, EffectQuad>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -386,6 +416,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.backdrop_blur_rects_iter.peek().map(|b| b.order),
                 PrimitiveKind::BackdropBlurRect,
+            ),
+            (
+                self.effect_quads_iter.peek().map(|e| e.order),
+                PrimitiveKind::EffectQuad,
             ),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
@@ -465,6 +499,30 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::BackdropBlurRects(
                     backdrop_blur_rects_start..backdrop_blur_rects_end,
                 ))
+            }
+            PrimitiveKind::EffectQuad => {
+                // Each `effect_id` is a different fragment pipeline, so a run
+                // breaks when it changes — the same shape as the sprite batches
+                // breaking on `texture_id`.
+                let effect_id = self.effect_quads_iter.peek().unwrap().effect_id;
+                let effect_quads_start = self.effect_quads_start;
+                let mut effect_quads_end = effect_quads_start + 1;
+                self.effect_quads_iter.next();
+                while self
+                    .effect_quads_iter
+                    .next_if(|effect_quad| {
+                        (effect_quad.order, batch_kind) < max_order_and_kind
+                            && effect_quad.effect_id == effect_id
+                    })
+                    .is_some()
+                {
+                    effect_quads_end += 1;
+                }
+                self.effect_quads_start = effect_quads_end;
+                Some(PrimitiveBatch::EffectQuads {
+                    effect_id,
+                    range: effect_quads_start..effect_quads_end,
+                })
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -588,6 +646,10 @@ pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
     BackdropBlurRects(Range<usize>),
+    EffectQuads {
+        effect_id: u32,
+        range: Range<usize>,
+    },
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -614,6 +676,9 @@ impl PrimitiveBatch {
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::BackdropBlurRects(range) => {
                 format!("backdrop blur rects ({})", range.len())
+            }
+            Self::EffectQuads { effect_id, range } => {
+                format!("effect quads ({}) with effect {}", range.len(), effect_id)
             }
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
@@ -744,6 +809,196 @@ impl From<BackdropBlurRect> for Primitive {
     fn from(backdrop_blur_rect: BackdropBlurRect) -> Self {
         Primitive::BackdropBlurRect(backdrop_blur_rect)
     }
+}
+
+/// The built-in effect a [`EffectQuad`] selects, and the index of its pipeline
+/// in the renderer's effect table.
+///
+/// gpui deliberately does not know what these effects *do* — the shader
+/// sources, the CSS parameter schemas and the defaults all live in
+/// `crates/vn-effects`, which is above gpui in the dependency graph. What lives
+/// here is only the numbering, because three separate places have to agree on
+/// it: this enum, the pipeline table in `gpui_windows`, and the registry in
+/// `vn-effects`.
+pub mod effect_id {
+    /// `frost(strength, radius?, tint?)` — blurred backdrop + crystalline
+    /// grain + rim highlight. Reads the backdrop.
+    pub const FROST: u32 = 0;
+    /// `noise(amount, scale?, speed?)` — film grain over the element.
+    pub const NOISE: u32 = 1;
+    /// `glow(color?, radius, strength)` — soft halo around the border box.
+    pub const GLOW: u32 = 2;
+    /// How many built-in effects exist.
+    pub const COUNT: u32 = 3;
+    /// The id an [`super::EffectSpec`] carries when CSS said `--shading: none`.
+    /// A refinement has no way to spell "explicitly nothing", so — exactly as
+    /// `backdrop-filter: none` maps to a 0px radius — clearing is a *value*.
+    pub const NONE: u32 = u32::MAX;
+}
+
+/// Bit 0 of [`EffectQuad::flags`]: this effect samples the backdrop, so the
+/// renderer must snapshot the render target, run the blur pyramid, bind t0/t2
+/// and draw with blending disabled.
+pub const EFFECT_FLAG_NEEDS_BACKDROP: u32 = 1;
+
+/// The `--shading` value that came out of the cascade, carried on
+/// [`crate::Style`] and painted by [`crate::Style::paint`].
+///
+/// The eight `params` are the effect's positional CSS arguments, already
+/// converted to floats (a colour occupies four consecutive slots). Everything
+/// else is schema metadata the *painter* needs and gpui must not have to look
+/// up: which params are lengths (so they scale with the device factor), which
+/// one drives the backdrop blur, and which one dilates the quad.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EffectSpec {
+    /// One of [`effect_id`].
+    pub id: u32,
+    /// [`EFFECT_FLAG_NEEDS_BACKDROP`], …
+    pub flags: u32,
+    /// Bit *i* set means `params[i]` is a length in LOGICAL pixels, to be
+    /// multiplied by the device scale factor at paint time.
+    pub length_mask: u32,
+    /// `Some(i)`: `params[i]` (a logical-pixel length) is the backdrop blur
+    /// radius. Only meaningful with [`EFFECT_FLAG_NEEDS_BACKDROP`].
+    pub backdrop_radius_param: Option<u8>,
+    /// `Some(i)`: `params[i]` (a logical-pixel length) dilates the painted
+    /// quad, giving an outer glow somewhere to land.
+    pub bleed_param: Option<u8>,
+    /// Whether this effect's output depends on `time`, i.e. whether the window
+    /// must keep repainting for it to animate.
+    pub animated: bool,
+    /// The positional parameters, in schema order.
+    pub params: [f32; 8],
+}
+
+impl EffectSpec {
+    /// `--shading: none` — a value that clears an effect inherited from an
+    /// earlier rule in the cascade.
+    pub const NONE: EffectSpec = EffectSpec {
+        id: effect_id::NONE,
+        flags: 0,
+        length_mask: 0,
+        backdrop_radius_param: None,
+        bleed_param: None,
+        animated: false,
+        params: [0.; 8],
+    };
+
+    /// Whether this spec actually paints anything.
+    pub fn is_some(&self) -> bool {
+        self.id != effect_id::NONE
+    }
+
+    fn param(&self, index: Option<u8>) -> f32 {
+        index
+            .and_then(|i| self.params.get(i as usize))
+            .copied()
+            .unwrap_or(0.)
+    }
+
+    /// The quad dilation in logical pixels.
+    pub fn bleed(&self) -> f32 {
+        self.param(self.bleed_param).max(0.)
+    }
+
+    /// The backdrop blur radius in logical pixels.
+    pub fn backdrop_blur_radius(&self) -> f32 {
+        self.param(self.backdrop_radius_param).max(0.)
+    }
+}
+
+/// A rounded rect shaded by a custom fragment pipeline — the primitive behind
+/// the `--shading` CSS property.
+///
+/// Mechanically this is [`BackdropBlurRect`] with a swappable fragment shader
+/// and a parameter block, and it reuses that primitive's whole machinery: the
+/// render-target snapshot, the Dual-Kawase pyramid, the per-group re-snapshot,
+/// and the "everything painted after must draw after" ordering guarantee.
+///
+/// `bounds`/`corner_radii` describe the *drawn* quad, which is the element's
+/// border box dilated by `bleed`. Dilating a rounded rect is a Minkowski sum
+/// with a disc, so the element's own SDF is exactly the drawn quad's plus
+/// `bleed` — which is how the shader recovers one from the other with a single
+/// add instead of a second bounds pair.
+///
+/// Keep the field order in sync with `struct EffectQuad` in
+/// `gpui_windows/src/effects.hlsl` and with `struct VnEffectQuad` in the
+/// generated wrapper (`packages/vue-native/shaders.ts`).
+/// 32 words / 128 bytes.
+#[derive(Debug, Copy, Clone, Default)]
+#[repr(C)]
+#[expect(missing_docs)]
+pub struct EffectQuad {
+    pub order: DrawOrder,
+    /// Selects the pipeline; one of [`effect_id`].
+    pub effect_id: u32,
+    /// The element's border box, dilated by `bleed`.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The element's corner radii, dilated by `bleed`.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Effect parameters 0..3.
+    pub params0: [f32; 4],
+    /// Effect parameters 4..7.
+    pub params1: [f32; 4],
+    pub opacity: f32,
+    /// Seconds since the process started.
+    pub time: f32,
+    /// How far outside the element's border box this quad reaches.
+    pub bleed: ScaledPixels,
+    /// The blur radius applied to the backdrop before the effect sees it.
+    /// Ignored without [`EFFECT_FLAG_NEEDS_BACKDROP`].
+    pub backdrop_blur_radius: ScaledPixels,
+    /// Device pixels per logical pixel.
+    pub scale: f32,
+    pub flags: u32,
+    pub pad: [u32; 4],
+}
+
+impl EffectQuad {
+    /// Whether this quad reads the render-target snapshot, which decides both
+    /// its draw ordering and whether the renderer has to break the pass.
+    pub fn needs_backdrop(&self) -> bool {
+        self.flags & EFFECT_FLAG_NEEDS_BACKDROP != 0
+    }
+
+    /// The clamped number of Dual-Kawase pyramid levels this quad's backdrop
+    /// needs — the same quantisation (and the same saturation defect) as
+    /// [`BackdropBlurRect::effective_kernel_levels`].
+    pub fn effective_kernel_levels(&self) -> u32 {
+        if !self.needs_backdrop() || self.backdrop_blur_radius.0 <= 0. {
+            0
+        } else {
+            let radius_levels = (self.backdrop_blur_radius.0
+                / BACKDROP_BLUR_RADIUS_PER_KERNEL_LEVEL)
+                .ceil()
+                .max(1.) as u32;
+            radius_levels.min(MAX_BACKDROP_BLUR_KERNEL_LEVELS)
+        }
+    }
+}
+
+impl From<EffectQuad> for Primitive {
+    fn from(effect_quad: EffectQuad) -> Self {
+        Primitive::EffectQuad(effect_quad)
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
+
+/// Seconds since the first effect was painted — the clock [`EffectQuad::time`]
+/// carries.
+///
+/// Deliberately process-wide and monotonic rather than per-window: an f32 has
+/// ~7 significant digits, so anchoring at zero keeps sub-millisecond precision
+/// for the first couple of hours instead of quantising to ~64 ms the way a
+/// UNIX-epoch value would.
+pub fn effect_clock_seconds() -> f32 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32()
 }
 
 #[derive(Debug, Copy, Clone)]

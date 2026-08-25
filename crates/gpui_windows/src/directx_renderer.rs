@@ -19,7 +19,9 @@ use windows::{
     core::{HSTRING, Interface},
 };
 
-use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+use crate::directx_renderer::shader_resources::{
+    EffectShader, RawShaderBytes, ShaderModule, ShaderTarget,
+};
 use crate::*;
 use gpui::*;
 
@@ -94,6 +96,14 @@ struct DirectXRenderPipelines {
     blur_downsample_pipeline: PipelineState<BlurPassSprite>,
     blur_upsample_pipeline: PipelineState<BlurPassSprite>,
     blur_rect_pipeline: PipelineState<BackdropBlurRect>,
+    /// One entry per built-in effect, indexed by `EffectQuad::effect_id`.
+    ///
+    /// `None` when that effect's pipeline could not be built — a missing or
+    /// broken `crates/vn-effects/generated/*.hlsl`, or a GPU below D3D feature
+    /// level 11. A broken effect must degrade to "this element renders without
+    /// its shading", never to a dead window, so this is fallible per entry and
+    /// the whole renderer still comes up.
+    effect_pipelines: Vec<Option<PipelineState<EffectQuad>>>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -385,6 +395,11 @@ impl DirectXRenderer {
                     &scene.backdrop_blur_rects[range.clone()],
                     range.start,
                 ),
+                PrimitiveBatch::EffectQuads { effect_id, range } => self.draw_effect_quads(
+                    effect_id,
+                    &scene.effect_quads[range.clone()],
+                    range.start,
+                ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     self.draw_paths_to_intermediate(paths)?;
@@ -405,11 +420,12 @@ impl DirectXRenderer {
             .with_context(|| {
                 format!(
                     "scene too large:\
-                    {} paths, {} shadows, {} quads, {} backdrop blur rects, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                    {} paths, {} shadows, {} quads, {} backdrop blur rects, {} effect quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
                     scene.backdrop_blur_rects.len(),
+                    scene.effect_quads.len(),
                     scene.underlines.len(),
                     scene.monochrome_sprites.len(),
                     scene.subpixel_sprites.len(),
@@ -490,6 +506,32 @@ impl DirectXRenderer {
                 &devices.device_context,
                 &scene.backdrop_blur_rects,
             )?;
+        }
+
+        if !scene.effect_quads.is_empty() {
+            // Every effect draws out of the SAME instance array — the batch
+            // iterator only splits the *draw* on `effect_id`, and the vertex
+            // shader indexes with `batch_start_index + SV_InstanceID`. Each
+            // pipeline owns its own buffer, so upload to the ones this frame
+            // actually uses and no further: a window with one frost panel must
+            // not pay to upload the array three times.
+            let mut used = 0u64;
+            for quad in &scene.effect_quads {
+                if quad.effect_id < 64 {
+                    used |= 1 << quad.effect_id;
+                }
+            }
+            for (id, pipeline) in self.pipelines.effect_pipelines.iter_mut().enumerate() {
+                let Some(pipeline) = pipeline else { continue };
+                if used & (1 << id) == 0 {
+                    continue;
+                }
+                pipeline.update_buffer(
+                    &devices.device,
+                    &devices.device_context,
+                    &scene.effect_quads,
+                )?;
+            }
         }
 
         if !scene.underlines.is_empty() {
@@ -611,6 +653,155 @@ impl DirectXRenderer {
             group_start = group_end;
         }
 
+        Ok(())
+    }
+
+    /// The `--shading` primitive family.
+    ///
+    /// The batch already holds one effect id (the batch iterator breaks a run
+    /// when it changes), so this picks one pipeline and draws.
+    ///
+    /// An effect that reads the backdrop takes the *exact* path
+    /// [`Self::draw_backdrop_blur_rects`] takes — grouped by kernel depth and
+    /// mutual non-overlap, one render-target snapshot per group, the pyramid
+    /// built from it, then a composite with blending disabled. That is what
+    /// makes a frost panel over another frost panel see the first one's result
+    /// instead of erasing it.
+    ///
+    /// An effect that does not is one ordinary instanced, blended draw with no
+    /// snapshot at all — the fast path, and the reason the flag exists.
+    fn draw_effect_quads(
+        &mut self,
+        effect_id: u32,
+        effect_quads: &[EffectQuad],
+        start: usize,
+    ) -> Result<()> {
+        if effect_quads.is_empty() {
+            return Ok(());
+        }
+        if self
+            .pipelines
+            .effect_pipelines
+            .get(effect_id as usize)
+            .and_then(|pipeline| pipeline.as_ref())
+            .is_none()
+        {
+            // `build_effect_pipelines` already explained why, once. Silently
+            // skipping the draw here is the *documented* degradation: every
+            // other style on the element still renders.
+            return Ok(());
+        }
+
+        if !effect_quads[0].needs_backdrop() {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let pipeline = self.pipelines.effect_pipelines[effect_id as usize]
+                .as_ref()
+                .expect("checked above");
+            return pipeline.draw_range_with_texture_resources(
+                &devices.device_context,
+                None,
+                &[],
+                self.globals
+                    .batch_params_buffer
+                    .as_ref()
+                    .context("batch params buffer missing")?,
+                &self.samplers(),
+                start as u32,
+                effect_quads.len() as u32,
+            );
+        }
+
+        self.ensure_backdrop_blur_resources()?;
+
+        let mut group_start = 0;
+        while group_start < effect_quads.len() {
+            let kernel_levels = effect_quads[group_start].effective_kernel_levels() as usize;
+            let mut group_end = group_start + 1;
+            while group_end < effect_quads.len() {
+                let candidate = &effect_quads[group_end];
+                if candidate.effective_kernel_levels() as usize != kernel_levels {
+                    break;
+                }
+                if effect_quads[group_start..group_end]
+                    .iter()
+                    .any(|previous| previous.bounds.intersects(&candidate.bounds))
+                {
+                    break;
+                }
+                group_end += 1;
+            }
+
+            self.copy_backdrop_blur_snapshot()?;
+            if kernel_levels > 0 {
+                self.build_backdrop_blur_texture(kernel_levels)?;
+            }
+            self.composite_effect_quads(
+                effect_id,
+                start + group_start,
+                group_end - group_start,
+                kernel_levels,
+            )?;
+            group_start = group_end;
+        }
+
+        Ok(())
+    }
+
+    /// Binds the processed backdrop at t0 and the untouched snapshot at t2 —
+    /// the same register contract the blur composite uses, which is exactly why
+    /// a Slang effect module drops into it with no renderer changes.
+    fn composite_effect_quads(
+        &self,
+        effect_id: u32,
+        start: usize,
+        len: usize,
+        kernel_levels: usize,
+    ) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let blur_resources = resources
+            .backdrop_blur_resources
+            .as_ref()
+            .context("missing backdrop blur resources")?;
+        let backdrop_texture = if kernel_levels == 0 {
+            &blur_resources.snapshot_srv
+        } else {
+            &blur_resources.textures[0].srv
+        };
+        let backdrop_texture = slice::from_ref(backdrop_texture);
+        let original_texture = slice::from_ref(&blur_resources.snapshot_srv);
+        let fragment_textures = [(0, backdrop_texture), (2, original_texture)];
+
+        unsafe {
+            unbind_shader_resources(&devices.device_context);
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+        }
+
+        self.pipelines.effect_pipelines[effect_id as usize]
+            .as_ref()
+            .context("effect pipeline missing")?
+            .draw_range_with_texture_resources(
+                &devices.device_context,
+                None,
+                &fragment_textures,
+                self.globals
+                    .batch_params_buffer
+                    .as_ref()
+                    .context("batch params buffer missing")?,
+                &self.samplers(),
+                start as u32,
+                len as u32,
+            )?;
+
+        // Leave the pipeline the way the other batches expect to find it.
+        unsafe {
+            unbind_shader_resources(&devices.device_context);
+        }
         Ok(())
     }
 
@@ -1139,6 +1330,7 @@ impl DirectXRenderPipelines {
             8,
             create_blend_state_for_replace(device)?,
         )?;
+        let effect_pipelines = build_effect_pipelines(device);
         let path_rasterization_pipeline = PipelineState::new(
             device,
             "path_rasterization_pipeline",
@@ -1188,6 +1380,7 @@ impl DirectXRenderPipelines {
             blur_downsample_pipeline,
             blur_upsample_pipeline,
             blur_rect_pipeline,
+            effect_pipelines,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1196,6 +1389,79 @@ impl DirectXRenderPipelines {
             poly_sprites,
         })
     }
+}
+
+/// Builds the `--shading` pipeline table, one entry per built-in effect.
+///
+/// Deliberately infallible as a whole: an effect whose HLSL is missing or does
+/// not compile leaves a `None` in the table and the app comes up without that
+/// effect, with a one-shot advisory. The alternative — propagating the error —
+/// would turn a typo in a shader into a window that never opens.
+fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<EffectQuad>>> {
+    // Below feature level 11 the effect fragment shaders (ps_5_0) cannot be
+    // created at all, so do not even try — and say so exactly once. Everything
+    // else in gpui stays at 4_1 and renders normally.
+    if unsafe { device.GetFeatureLevel() }.0 < D3D_FEATURE_LEVEL_11_0.0 {
+        effects_advisory(
+            "`--shading` requires a Direct3D 11 GPU (feature level 11_0); effects are disabled \
+             and every other style renders normally",
+        );
+        return Vec::new();
+    }
+
+    EffectShader::ALL
+        .iter()
+        .map(|effect| {
+            let blend = if effect.needs_backdrop() {
+                // A backdrop effect rewrites every pixel of its quad from its
+                // own snapshot — the same reason blur_rect disables blending.
+                create_blend_state_for_replace(device)
+            } else {
+                create_blend_state(device)
+            };
+            let pipeline = blend.and_then(|blend| {
+                PipelineState::new(
+                    device,
+                    effect.pipeline_label(),
+                    ShaderModule::Effect(*effect),
+                    8,
+                    blend,
+                )
+            });
+            match pipeline {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => {
+                    effects_advisory(&format!(
+                        "`--shading: {}(…)` is unavailable — its pipeline failed to build: \
+                         {error:#}",
+                        effect.name()
+                    ));
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// One-shot advisory channel for the effect system.
+///
+/// House policy is compat-first: degraded behaviour is announced, never
+/// silent. Repeating it every frame would bury everything else, so each
+/// distinct message is printed once for the life of the process.
+fn effects_advisory(message: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<Vec<String>>> = Mutex::new(None);
+    let mut seen = match SEEN.lock() {
+        Ok(seen) => seen,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seen = seen.get_or_insert_with(Vec::new);
+    if seen.iter().any(|m| m == message) {
+        return;
+    }
+    seen.push(message.to_string());
+    log::warn!("{message}");
+    eprintln!("vue-native: {message}");
 }
 
 impl DirectComposition {
@@ -2086,7 +2352,8 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
 const BUFFER_COUNT: usize = 3;
 
 pub(crate) mod shader_resources {
-    use anyhow::Result;
+    #[cfg_attr(not(debug_assertions), allow(unused_imports))]
+    use anyhow::{Context, Result};
 
     #[cfg(debug_assertions)]
     use windows::{
@@ -2111,6 +2378,79 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        /// A `--shading` effect. Its two halves come from two different files:
+        /// the shared engine vertex stage from `src/effects.hlsl`, the
+        /// per-effect fragment stage from the checked-in slangc output under
+        /// `crates/vn-effects/generated/`.
+        Effect(EffectShader),
+    }
+
+    /// The built-in effects, in `gpui::effect_id` order. That numbering is the
+    /// contract between this table, `gpui::effect_id` and the CSS registry in
+    /// `crates/vn-effects` — all three have to agree.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum EffectShader {
+        Frost,
+        Noise,
+        Glow,
+    }
+
+    impl EffectShader {
+        pub(crate) const ALL: [EffectShader; gpui::effect_id::COUNT as usize] =
+            [EffectShader::Frost, EffectShader::Noise, EffectShader::Glow];
+
+        pub(crate) fn name(self) -> &'static str {
+            match self {
+                EffectShader::Frost => "frost",
+                EffectShader::Noise => "noise",
+                EffectShader::Glow => "glow",
+            }
+        }
+
+        pub(crate) fn pipeline_label(self) -> &'static str {
+            match self {
+                EffectShader::Frost => "effect_frost_pipeline",
+                EffectShader::Noise => "effect_noise_pipeline",
+                EffectShader::Glow => "effect_glow_pipeline",
+            }
+        }
+
+        /// Whether this effect samples the render-target snapshot, which
+        /// decides its blend state (replace vs source-over) and whether the
+        /// renderer has to break the pass for it.
+        ///
+        /// Duplicated from the `vn-effects` registry rather than shared,
+        /// because gpui sits below it in the dependency graph. The two are
+        /// tied together by `crates/vn-effects/generated/manifest.json`, whose
+        /// `backdrop` field is generated from the same `//! vn-backdrop:`
+        /// header the shader wrapper reads.
+        pub(crate) fn needs_backdrop(self) -> bool {
+            matches!(self, EffectShader::Frost)
+        }
+    }
+
+    const _: () = {
+        assert!(EffectShader::ALL.len() == gpui::effect_id::COUNT as usize);
+        assert!(gpui::effect_id::FROST == 0);
+        assert!(gpui::effect_id::NOISE == 1);
+        assert!(gpui::effect_id::GLOW == 2);
+    };
+
+    /// Where `bun shaders.ts` writes the compiled effect fragments.
+    ///
+    /// The generated HLSL is checked in NEXT TO its `.slang` sources (owner
+    /// decision 3 / docs/SHADERS.md §2.3), which is what gives an effect author
+    /// a real file to hot-reload and what keeps `cargo build` free of any
+    /// dependency on slangc. That puts it outside this crate, hence the walk
+    /// back up to the workspace root; `VN_EFFECTS_GENERATED_DIR` overrides it
+    /// for anyone consuming this gpui fork from a different layout.
+    #[cfg(debug_assertions)]
+    pub(super) fn effects_generated_dir() -> std::path::PathBuf {
+        if let Ok(dir) = std::env::var("VN_EFFECTS_GENERATED_DIR") {
+            return std::path::PathBuf::from(dir);
+        }
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../crates/vn-effects/generated")
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2200,6 +2540,16 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
                 },
+                // One vertex shader serves every effect; only the fragment
+                // half differs.
+                ShaderModule::Effect(effect) => match target {
+                    ShaderTarget::Vertex => EFFECT_VERTEX_BYTES,
+                    ShaderTarget::Fragment => match effect {
+                        EffectShader::Frost => EFFECT_FROST_FRAGMENT_BYTES,
+                        EffectShader::Noise => EFFECT_NOISE_FRAGMENT_BYTES,
+                        EffectShader::Glow => EFFECT_GLOW_FRAGMENT_BYTES,
+                    },
+                },
             };
             Self { inner: bytes }
         }
@@ -2212,30 +2562,57 @@ pub(crate) mod shader_resources {
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
-            } else {
-                "shaders.hlsl"
-            };
-
-            let entry = format!(
-                "{}_{}\0",
-                entry.as_str(),
-                match target {
-                    ShaderTarget::Vertex => "vertex",
-                    ShaderTarget::Fragment => "fragment",
+            // Which FILE, which ENTRY POINT and which PROFILE. Effects are the
+            // only module family that answers all three differently per
+            // target, and the only one compiled above Shader Model 4:
+            // `ps_5_0`/`vs_5_0` for effects, `4_1` for every core shader
+            // (owner decision 1 — the D3D11 requirement then exists only for
+            // apps that actually use `--shading`).
+            let (shader_path, entry, target) = match entry {
+                ShaderModule::Effect(effect) => match target {
+                    ShaderTarget::Vertex => (
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("src/effects.hlsl"),
+                        "effect_vertex\0".to_string(),
+                        "vs_5_0\0",
+                    ),
+                    ShaderTarget::Fragment => (
+                        super::shader_resources::effects_generated_dir()
+                            .join(format!("{}.hlsl", effect.name())),
+                        "effect_fragment\0".to_string(),
+                        "ps_5_0\0",
+                    ),
+                },
+                _ => {
+                    let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
+                        "color_text_raster.hlsl"
+                    } else {
+                        "shaders.hlsl"
+                    };
+                    (
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join(format!("src/{}", shader_name)),
+                        format!(
+                            "{}_{}\0",
+                            entry.as_str(),
+                            match target {
+                                ShaderTarget::Vertex => "vertex",
+                                ShaderTarget::Fragment => "fragment",
+                            }
+                        ),
+                        match target {
+                            ShaderTarget::Vertex => "vs_4_1\0",
+                            ShaderTarget::Fragment => "ps_4_1\0",
+                        },
+                    )
                 }
-            );
-            let target = match target {
-                ShaderTarget::Vertex => "vs_4_1\0",
-                ShaderTarget::Fragment => "ps_4_1\0",
             };
 
             let mut compile_blob = None;
             let mut error_blob = None;
-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(&format!("src/{}", shader_name))
-                .canonicalize()?;
+            let shader_path = shader_path.canonicalize().with_context(|| {
+                format!("locating shader source {}", shader_path.display())
+            })?;
 
             let entry_point = PCSTR::from_raw(entry.as_ptr());
             let target_cstr = PCSTR::from_raw(target.as_ptr());
@@ -2276,8 +2653,12 @@ pub(crate) mod shader_resources {
 
     #[cfg(debug_assertions)]
     impl ShaderModule {
+        /// The `shaders.hlsl` entry-point PREFIX. Effects do not have one —
+        /// their entry points are fixed (`effect_vertex`/`effect_fragment`) and
+        /// live in different files — so this is unreachable for them.
         pub fn as_str(self) -> &'static str {
             match self {
+                ShaderModule::Effect(effect) => effect.name(),
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
                 ShaderModule::BlurDownsample => "blur_downsample",

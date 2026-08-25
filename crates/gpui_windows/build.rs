@@ -69,6 +69,68 @@ mod shader_compilation {
                 &rust_binding_path,
             );
         }
+
+        compile_effect_shaders(&out_dir, &fxc_path, &rust_binding_path);
+    }
+
+    /// The `--shading` effect pipelines.
+    ///
+    /// Two things make these different from every other module:
+    ///
+    /// * they compile at **5_0**, not 4_1 (owner decision 1). Only effects
+    ///   require a D3D feature level 11 GPU; the core shaders stay at 4_1 and
+    ///   the renderer skips effect draws below FL11 with a one-shot advisory.
+    /// * their two halves come from two different files. The vertex stage is
+    ///   engine-owned HLSL shared by every effect (`src/effects.hlsl`) —
+    ///   `SV_ClipDistance` cannot be authored in Slang, see that file. The
+    ///   fragment stage is the checked-in slangc output living next to its
+    ///   `.slang` source under `crates/vn-effects/generated/`, which is what
+    ///   keeps `cargo build` free of any dependency on slangc.
+    fn compile_effect_shaders(out_dir: &str, fxc_path: &str, rust_binding_path: &str) {
+        let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let generated = match std::env::var("VN_EFFECTS_GENERATED_DIR") {
+            Ok(dir) => PathBuf::from(dir),
+            Err(_) => manifest_dir.join("../../../../crates/vn-effects/generated"),
+        };
+        let vertex_path = manifest_dir.join("src/effects.hlsl");
+        println!("cargo:rerun-if-env-changed=VN_EFFECTS_GENERATED_DIR");
+        println!("cargo:rerun-if-changed={}", vertex_path.display());
+
+        let output_file = format!("{}/effect_vs.h", out_dir);
+        compile_shader_impl(
+            fxc_path,
+            "effect_vertex",
+            &output_file,
+            "EFFECT_VERTEX_BYTES",
+            vertex_path.to_str().unwrap(),
+            "vs_5_0",
+        );
+        generate_rust_binding("EFFECT_VERTEX_BYTES", &output_file, rust_binding_path);
+
+        // Keep in sync with `EffectShader::ALL` and `gpui::effect_id`.
+        for effect in ["frost", "noise", "glow"] {
+            let source = generated.join(format!("{effect}.hlsl"));
+            println!("cargo:rerun-if-changed={}", source.display());
+            if !source.exists() {
+                println!(
+                    "cargo::error=missing generated effect shader {} — run `bun shaders.ts` in \
+                     packages/vue-native, or point VN_EFFECTS_GENERATED_DIR at the directory",
+                    source.display()
+                );
+                process::exit(1);
+            }
+            let output_file = format!("{}/effect_{}_ps.h", out_dir, effect);
+            let const_name = format!("EFFECT_{}_FRAGMENT_BYTES", effect.to_uppercase());
+            compile_shader_impl(
+                fxc_path,
+                "effect_fragment",
+                &output_file,
+                &const_name,
+                source.to_str().unwrap(),
+                "ps_5_0",
+            );
+            generate_rust_binding(&const_name, &output_file, rust_binding_path);
+        }
     }
 
     /// Locate `binary` in the newest installed Windows SDK.

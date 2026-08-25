@@ -679,6 +679,13 @@ impl MetalRenderer {
                     // DirectX is the only backend with backdrop blur support.
                     true
                 }
+                PrimitiveBatch::EffectQuads { .. } => {
+                    // …and the only one with `--shading` effect pipelines. The
+                    // `.slang` sources retarget (`-target wgsl` / SPIR-V), but
+                    // the engine-owned vertex stage and the pipeline table are
+                    // per-backend, so this is a real port rather than a flag.
+                    true
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();

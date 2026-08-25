@@ -7,6 +7,7 @@ use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlurRect, Background, BorderStyle,
+    EffectQuad, EffectSpec,
     Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
@@ -4215,6 +4216,86 @@ impl Window {
             blur_radius,
             opacity,
             tint: effect.tint,
+        });
+    }
+
+    /// Paint a custom-shaded rounded rect into the scene at the current
+    /// z-index — the primitive behind the `--shading` CSS property.
+    ///
+    /// `spec.id` selects one of the built-in fragment pipelines and `params`
+    /// are its positional arguments. Parameters the schema marks as lengths
+    /// arrive in LOGICAL pixels and are scaled here, exactly like every other
+    /// length in a primitive.
+    ///
+    /// An effect that reads the backdrop ([`EFFECT_FLAG_NEEDS_BACKDROP`])
+    /// samples the render target as it exists at its paint position, so — like
+    /// [`Self::paint_backdrop_blur_rect`] — renderers break the current pass
+    /// when they meet one, and the scene forces everything painted afterwards
+    /// to draw above it. An effect that does not is an ordinary blended quad
+    /// and costs nothing extra.
+    ///
+    /// Renderers without effect support (or on hardware below D3D feature
+    /// level 11) ignore this primitive entirely.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_effect_quad(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        spec: EffectSpec,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        if !spec.is_some() {
+            return;
+        }
+        let opacity = self.element_opacity();
+        if opacity <= 0. {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        let bleed = px(spec.bleed());
+        // An outer glow needs somewhere to land, so the drawn quad is the
+        // border box dilated by `bleed` — with the corner radii dilated to
+        // match, which keeps the dilated shape a true Minkowski offset and
+        // therefore keeps the SDF relationship the shader relies on exact.
+        let draw_bounds = bounds.dilate(bleed);
+        let draw_radii = Corners {
+            top_left: corner_radii.top_left + bleed,
+            top_right: corner_radii.top_right + bleed,
+            bottom_right: corner_radii.bottom_right + bleed,
+            bottom_left: corner_radii.bottom_left + bleed,
+        };
+
+        let mut params = spec.params;
+        for (index, param) in params.iter_mut().enumerate() {
+            if spec.length_mask & (1 << index) != 0 {
+                *param *= scale_factor;
+            }
+        }
+
+        if spec.animated {
+            // Nothing else in the frame is going to ask for the next one.
+            self.request_animation_frame();
+        }
+
+        self.next_frame.scene.insert_primitive(EffectQuad {
+            order: 0,
+            effect_id: spec.id,
+            bounds: self.snap_bounds(draw_bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: draw_radii.scale(scale_factor),
+            params0: [params[0], params[1], params[2], params[3]],
+            params1: [params[4], params[5], params[6], params[7]],
+            opacity,
+            time: crate::effect_clock_seconds(),
+            bleed: bleed.scale(scale_factor),
+            backdrop_blur_radius: px(spec.backdrop_blur_radius()).scale(scale_factor),
+            scale: scale_factor,
+            flags: spec.flags,
+            pad: [0; 4],
         });
     }
 
