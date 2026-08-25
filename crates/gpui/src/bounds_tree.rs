@@ -122,6 +122,17 @@ where
         let max_intersecting = self.find_max_ordering(&new_bounds);
         let ordering = max_intersecting + 1;
 
+        self.insert_with_order(new_bounds, ordering)
+    }
+
+    /// Inserts bounds into the tree with an explicit ordering, instead of one
+    /// derived from the bounds it intersects.
+    ///
+    /// Used by primitives that must be ordered against something other than
+    /// their own overlap set — a backdrop blur, for instance, has to be able to
+    /// push every primitive painted after it above itself so that the blur's
+    /// render-target snapshot is taken at the right moment.
+    pub fn insert_with_order(&mut self, new_bounds: Bounds<U>, ordering: u32) -> u32 {
         // Insert the new leaf
         let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
 

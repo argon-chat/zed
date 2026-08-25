@@ -1450,6 +1450,10 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::BackdropBlurRects(_) => {
+                        // DirectX is the only backend with backdrop blur support.
+                        true
+                    }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,

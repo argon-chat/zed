@@ -748,6 +748,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blurs everything already painted behind this element's border box,
+    /// clipped to its corner radii — CSS `backdrop-filter: blur(<length>)`.
+    fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
