@@ -34,6 +34,11 @@ log.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 raw-window-handle.workspace = true
+# `--shading`: an app's own effects arrive as HLSL + an `effects.json` schema in
+# $VN_EFFECTS_DIR and are compiled into pipelines at startup, so the renderer
+# has to read that manifest. Built-in effects need none of this.
+serde.workspace = true
+serde_json.workspace = true
 smallvec.workspace = true
 uuid.workspace = true
 windows.workspace = true
