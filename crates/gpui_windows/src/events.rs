@@ -289,6 +289,11 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
+        // A Present that blocks on the compositor inside this modal loop
+        // stalls the loop's own message pumping — the window "teleports"
+        // after the cursor. Drop frames instead while the loop runs (see
+        // DirectXRenderer::present_no_wait).
+        self.state.renderer.borrow_mut().set_present_no_wait(true);
         unsafe {
             let ret = SetTimer(
                 Some(handle),
@@ -307,9 +312,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
+        self.state.renderer.borrow_mut().set_present_no_wait(false);
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
+        // A frame dropped by the no-wait mode may have left stale content on
+        // screen; the vsync thread re-invalidates every window each vsync, so
+        // the next normal draw catches it up — nothing to do here.
         None
     }
 

@@ -57,6 +57,15 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// While the interactive size/move loop runs, `Present` must never block:
+    /// DWM holds swapchain buffers longer while it composes a moving window
+    /// (longer still for Mica/Acrylic backdrops, which re-sample the desktop
+    /// behind the window every step), and a Present stalled inside the modal
+    /// loop's WM_TIMER stops the loop from pumping its own mouse messages —
+    /// the window then jumps after the cursor instead of tracking it. In this
+    /// mode a busy compositor costs us the frame, not the drag.
+    present_no_wait: bool,
 }
 
 /// Direct3D objects
@@ -229,6 +238,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            present_no_wait: false,
         })
     }
 
@@ -276,15 +286,29 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// See [`DirectXRenderer::present_no_wait`].
+    pub(crate) fn set_present_no_wait(&mut self, on: bool) {
+        self.present_no_wait = on;
+    }
+
     #[inline]
     fn present(&mut self) -> Result<()> {
+        let flags = if self.present_no_wait {
+            DXGI_PRESENT_DO_NOT_WAIT
+        } else {
+            DXGI_PRESENT(0)
+        };
         let result = unsafe {
             self.resources
                 .as_ref()
                 .expect("resources missing")
                 .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+                .Present(0, flags)
         };
+        if self.present_no_wait && result == DXGI_ERROR_WAS_STILL_DRAWING {
+            // Compositor busy mid-drag: drop this frame, keep the loop live.
+            return Ok(());
+        }
         result.ok().context("Presenting swap chain failed")
     }
 
