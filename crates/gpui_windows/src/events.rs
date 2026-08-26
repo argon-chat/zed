@@ -978,6 +978,13 @@ impl WindowsWindowInner {
                 WindowControlArea::Min if self.is_minimizable => Some(HTMINBUTTON as _),
                 WindowControlArea::Min if self.is_movable => Some(HTCAPTION as _),
                 WindowControlArea::Min => Some(HTNOWHERE as _),
+                // Ordinary client content that happens to be nested inside a
+                // `Drag` ancestor. Answering `HTCLIENT` (rather than `None`,
+                // which would fall through to the resize-border test and then
+                // to `DefWindowProcW`) is what makes the area behave like the
+                // rest of the content: the mouse goes to the client area, not
+                // to the non-client caption.
+                WindowControlArea::NoDrag => Some(HTCLIENT as _),
             })
         } else {
             None

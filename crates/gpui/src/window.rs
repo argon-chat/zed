@@ -747,6 +747,15 @@ pub enum WindowControlArea {
     Max,
     /// An area that allows minimizing of the platform window.
     Min,
+    /// An area that is explicitly NOT a window control: ordinary client
+    /// content, even when an ancestor declared [`WindowControlArea::Drag`].
+    ///
+    /// This is what makes CSS `window-drag: none` (`-webkit-app-region:
+    /// no-drag`) expressible: without a positive "not a control" answer, a
+    /// descendant can only opt out of an ancestor's drag region by blocking
+    /// the mouse entirely (`.occlude()`), which also swallows every event
+    /// meant for content painted behind it.
+    NoDrag,
 }
 
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
@@ -1758,8 +1767,27 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+                        // TOPMOST-FIRST. `mouse_hit_test.ids` is built by
+                        // `hit_test`, which walks `hitboxes.iter().rev()` — so
+                        // it is ordered innermost/topmost first, while
+                        // `window_control_hitboxes` is in PAINT order, i.e.
+                        // ancestor first. Driving the loop from the paint list
+                        // therefore let an ancestor's `Drag` beat a
+                        // descendant's `Close`, and the only escape was
+                        // `.occlude()` on every caption button (which zed does,
+                        // and which blocks the mouse for everything behind it).
+                        //
+                        // Driving it from the hit-test order instead gives the
+                        // CSS rule — the innermost element that declares a
+                        // control area wins — for free, and is what makes
+                        // `WindowControlArea::NoDrag` meaningful at all.
+                        for id in &window.mouse_hit_test.ids {
+                            if let Some((area, _)) = window
+                                .rendered_frame
+                                .window_control_hitboxes
+                                .iter()
+                                .find(|(_, hitbox)| hitbox.id == *id)
+                            {
                                 return Some(*area);
                             }
                         }
