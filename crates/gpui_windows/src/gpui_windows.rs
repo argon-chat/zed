@@ -38,5 +38,9 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+/// vue-native: the renderer's D3D11 device, so `<video>` can hand it to Media
+/// Foundation and have decoded frames land in VRAM the renderer already owns.
+/// See `directx_devices.rs`.
+pub use directx_devices::renderer_d3d11_device;
 
 pub(crate) use windows::Win32::Foundation::HWND;
