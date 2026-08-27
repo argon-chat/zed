@@ -525,6 +525,12 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
+    // gpui/src/scene.rs IS this layout, so the field must stay last and in
+    // sync. Only the DirectX backend APPLIES it today (gpui_windows'
+    // shaders.hlsl); here it keeps the record size right so nothing else is
+    // read at the wrong offset.
+    transformation: TransformationMatrix,
 }
 
 struct QuadVarying {
@@ -962,6 +968,12 @@ struct Shadow {
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
     pad: u32, // align to 8 bytes
+    // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
+    // gpui/src/scene.rs IS this layout, so the field must stay last and in
+    // sync. Only the DirectX backend APPLIES it today (gpui_windows'
+    // shaders.hlsl); here it keeps the record size right so nothing else is
+    // read at the wrong offset.
+    transformation: TransformationMatrix,
 }
 
 struct ShadowVarying {
@@ -1154,6 +1166,12 @@ struct Underline {
     color: Hsla,
     thickness: f32,
     wavy: u32,
+    // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
+    // gpui/src/scene.rs IS this layout, so the field must stay last and in
+    // sync. Only the DirectX backend APPLIES it today (gpui_windows'
+    // shaders.hlsl); here it keeps the record size right so nothing else is
+    // read at the wrong offset.
+    transformation: TransformationMatrix,
 }
 
 
@@ -1268,6 +1286,12 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
+    // gpui/src/scene.rs IS this layout, so the field must stay last and in
+    // sync. Only the DirectX backend APPLIES it today (gpui_windows'
+    // shaders.hlsl); here it keeps the record size right so nothing else is
+    // read at the wrong offset.
+    transformation: TransformationMatrix,
 }
 
 

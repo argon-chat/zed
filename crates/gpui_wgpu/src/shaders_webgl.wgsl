@@ -136,7 +136,8 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 }
 
 fn load_quad(instance_id: u32) -> Quad {
-    var cursor = instance_cursor(instance_id * 40u);
+    // 46 words: 40 + the 6 of the vue-native `transformation` field.
+    var cursor = instance_cursor(instance_id * 46u);
     return Quad(
         read_word(&cursor),
         read_word(&cursor),
@@ -146,11 +147,12 @@ fn load_quad(instance_id: u32) -> Quad {
         read_hsla(&cursor),
         read_corners(&cursor),
         read_edges(&cursor),
+        read_transformation(&cursor),
     );
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 34u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
@@ -162,6 +164,7 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_corners(&cursor),
         read_word(&cursor),
         read_word(&cursor),
+        read_transformation(&cursor),
     );
 }
 
@@ -181,7 +184,7 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 16u);
+    var cursor = instance_cursor(instance_id * 22u);
     return Underline(
         read_word(&cursor),
         read_word(&cursor),
@@ -190,6 +193,7 @@ fn load_underline(instance_id: u32) -> Underline {
         read_hsla(&cursor),
         read_f32(&cursor),
         read_word(&cursor),
+        read_transformation(&cursor),
     );
 }
 
@@ -207,7 +211,7 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 24u);
+    var cursor = instance_cursor(instance_id * 30u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -217,5 +221,6 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_corners(&cursor),
         read_atlas_tile(&cursor),
+        read_transformation(&cursor),
     );
 }

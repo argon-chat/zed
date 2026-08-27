@@ -840,6 +840,15 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The composed CSS `transform` in force when the hitbox was inserted, in
+    /// DEVICE space (the same matrix the primitives carry).
+    ///
+    /// `bounds` stays the UNTRANSFORMED rect, because that is the frame the
+    /// element and everything that reads a hitbox (autoscroll, tooltip
+    /// placement, `Hitbox::bounds`) thinks in. Hit-testing therefore maps the
+    /// pointer BACKWARDS through this rather than mapping the rect forwards —
+    /// see [`Frame::hit_test`].
+    pub transformation: TransformationMatrix,
 }
 
 impl Hitbox {
@@ -1095,6 +1104,23 @@ impl Frame {
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
+            // A transformed element keeps its untransformed `bounds`, so the
+            // POINTER is mapped back into the element's own frame rather than
+            // the rect being mapped forward into a polygon. That keeps the test
+            // a rectangle containment (exact for rotation and scale alike) and
+            // costs nothing at all when there is no transform.
+            //
+            // A singular matrix (`scale(0)`) has no inverse, which is the right
+            // answer: an element scaled to nothing is not hittable, exactly as
+            // in a browser.
+            let position = if hitbox.transformation.is_unit() {
+                position
+            } else {
+                match hitbox.transformation.inverse() {
+                    Some(inverse) => inverse.apply(position),
+                    None => continue,
+                }
+            };
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -1166,6 +1192,14 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// The composed CSS `transform` of every ancestor currently being painted,
+    /// in DEVICE space. Identity outside a `Style::vn_transform`.
+    ///
+    /// A field rather than a stack, for the same reason `element_opacity` is:
+    /// every push already has to compose with what is above it, so the "stack"
+    /// is one saved value per frame of the paint recursion and lives on the
+    /// Rust stack instead.
+    pub(crate) element_transform: TransformationMatrix,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1878,6 +1912,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: TransformationMatrix::unit(),
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3650,6 +3685,44 @@ impl Window {
         result
     }
 
+    /// Paints everything `f` paints — this element's own quads, shadows, text
+    /// and its whole subtree — through `transformation`, which is composed on
+    /// top of whatever an ancestor already pushed.
+    ///
+    /// This is CSS `transform`'s propagation rule: a transform applies to the
+    /// element's rendering and to all of its descendants, and to none of the
+    /// layout. Nothing here touches taffy, `bounds`, or the content mask; the
+    /// primitives are still emitted in layout coordinates and carry the matrix
+    /// for the vertex shader to apply.
+    ///
+    /// Hitboxes inserted under it record the same matrix, so hit-testing
+    /// follows the picture (see [`Frame::hit_test`]).
+    ///
+    /// The identity is free — it early-returns without touching the field.
+    pub fn with_element_transform<R>(
+        &mut self,
+        transformation: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if transformation.is_unit() {
+            return f(self);
+        }
+        let previous = self.element_transform;
+        // `compose(other)` applies `other` first: the child's own transform
+        // runs before the ancestors' — which is what nesting means.
+        self.element_transform = previous.compose(transformation);
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
+    /// The composed transform of the element currently being painted. Identity
+    /// unless an ancestor pushed one with [`Window::with_element_transform`].
+    #[inline]
+    pub fn element_transform(&self) -> TransformationMatrix {
+        self.element_transform
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -4034,6 +4107,7 @@ impl Window {
                 element_corner_radii,
                 inset: 0,
                 pad: 0,
+                transformation: self.element_transform,
             });
         }
     }
@@ -4079,6 +4153,7 @@ impl Window {
                 element_corner_radii,
                 inset: 1,
                 pad: 0,
+                transformation: self.element_transform,
             });
         }
     }
@@ -4146,9 +4221,21 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            transformation: self.element_transform,
         };
 
         if !quad.background.is_transparent() {
+            self.next_frame.scene.insert_primitive(quad);
+            return;
+        }
+
+        // The strip split below carves the quad into four AXIS-ALIGNED pieces
+        // and clips each with an axis-aligned content mask. Under a rotation
+        // those masks no longer correspond to the pieces they are clipping, so
+        // the optimisation is skipped rather than made wrong — a transformed
+        // border-only quad shades its transparent interior, which is what it
+        // did before the split existed.
+        if !quad.transformation.is_unit() {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4377,6 +4464,7 @@ impl Window {
             color: style.color.unwrap_or_default().opacity(element_opacity),
             thickness,
             wavy: style.wavy.into(),
+            transformation: self.element_transform,
         });
     }
 
@@ -4407,6 +4495,7 @@ impl Window {
             thickness: self.snap_stroke(style.thickness),
             color: style.color.unwrap_or_default().opacity(opacity),
             wavy: false.into(),
+            transformation: self.element_transform,
         });
     }
 
@@ -4479,7 +4568,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: self.element_transform,
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -4489,7 +4578,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: self.element_transform,
                 });
             }
         }
@@ -4572,6 +4661,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: self.element_transform,
             });
         }
         Ok(())
@@ -4636,7 +4726,9 @@ impl Window {
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            // The caller's own matrix (gpui's `Svg::with_transformation`)
+            // composed under whatever CSS `transform` an ancestor pushed.
+            transformation: self.element_transform.compose(transformation),
         });
 
         Ok(())
@@ -4744,6 +4836,7 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            transformation: self.element_transform,
         });
         Ok(())
     }
@@ -4936,6 +5029,10 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            // Whatever CSS `transform` the paint walk is inside. Prepaint
+            // pushes the same matrix paint does, so a rotated element's hitbox
+            // knows it is rotated (see `Frame::hit_test`).
+            transformation: self.element_transform,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox

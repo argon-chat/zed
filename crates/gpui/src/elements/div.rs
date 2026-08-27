@@ -2268,22 +2268,30 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
-                            } else {
-                                None
-                            };
+                // CSS `transform` is pushed in PREPAINT as well as in
+                // `Style::paint`: this is where hitboxes are inserted, and a
+                // hitbox that did not know its element was rotated would be
+                // clickable where nothing is drawn. Same matrix, from the same
+                // `Style`, so the picture and the hit test cannot drift.
+                let transformation = style.transform_matrix(bounds, window.scale_factor());
+                window.with_element_transform(transformation, |window| {
+                    window.with_text_style(style.text_style().cloned(), |window| {
+                        window.with_content_mask(
+                            style.overflow_mask(bounds, window.rem_size()),
+                            |window| {
+                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                    Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                } else {
+                                    None
+                                };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = f(&style, scroll_offset, hitbox, window, cx);
-                            (result, element_state)
-                        },
-                    )
+                                let scroll_offset =
+                                    self.clamp_scroll_position(bounds, &style, window, cx);
+                                let result = f(&style, scroll_offset, hitbox, window, cx);
+                                (result, element_state)
+                            },
+                        )
+                    })
                 })
             },
         )

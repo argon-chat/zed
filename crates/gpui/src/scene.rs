@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, px,
 };
 use std::{
     fmt::Debug,
@@ -708,6 +708,11 @@ impl PrimitiveBatch {
     }
 }
 
+/// Keep the field order in sync with `struct Quad` in
+/// `gpui_windows/src/shaders.hlsl` (46 words / 184 bytes) — the DirectX
+/// renderer uploads this straight into a `StructuredBuffer` and
+/// `StructureByteStride` is `size_of::<Quad>()`, so the Rust layout IS the
+/// shader layout.
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -720,6 +725,16 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    /// A paint-time transformation of the quad about its own centre — CSS
+    /// `transform`.
+    ///
+    /// `bounds` stays the UNTRANSFORMED rect and is still what the scene sorts
+    /// and culls by; the vertex shader applies this on top and the fragment
+    /// shader keeps doing its SDF work in the untransformed local frame. That
+    /// split is deliberate: it is what lets the rounded corners, the border
+    /// widths and the dash phase stay correct under rotation without any of
+    /// them learning about the matrix.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Quad> for Primitive {
@@ -840,6 +855,161 @@ pub mod effect_id {
 /// renderer must snapshot the render target, run the blur pyramid, bind t0/t2
 /// and draw with blending disabled.
 pub const EFFECT_FLAG_NEEDS_BACKDROP: u32 = 1;
+
+/// CSS `transform`, as the cascade computed it, carried on [`crate::Style`]
+/// and turned into a [`TransformationMatrix`] at paint time by
+/// [`crate::Style::paint`].
+///
+/// Deliberately the CSS *components* rather than a finished matrix, for two
+/// reasons. The matrix needs the element's box to know where its centre is —
+/// CSS's initial `transform-origin: 50% 50%` — and layout only settles at
+/// paint. And an interpolable `transform` interpolates its components (a
+/// browser lerps `rotate(0deg)` → `rotate(90deg)` through 45°, not through the
+/// matrix entries), so a transition wants these numbers, not their product.
+///
+/// The rendering rule is CSS's: a transform moves the element's **painted
+/// output and its whole subtree**, and changes no layout at all. `translate`
+/// here is therefore *not* the same thing as a margin offset — siblings do not
+/// move out of the way.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TransformSpec {
+    /// `translate()`, per axis, in the unit it was authored in — see
+    /// [`TransformLength`]. Kept unresolved because a percentage resolves
+    /// against the element's OWN border box, which is only known at paint.
+    pub translate: (TransformLength, TransformLength),
+    /// `rotate()` about the element's centre, in RADIANS, clockwise — which is
+    /// the direction a positive CSS angle turns on screen.
+    pub rotate: f32,
+    /// `scale()` about the element's centre. `(1.0, 1.0)` is no scale.
+    pub scale: (f32, f32),
+}
+
+/// One axis of a [`TransformSpec`]'s `translate()`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum TransformLength {
+    /// An absolute length in LOGICAL (CSS) pixels.
+    Pixels(f32),
+    /// A fraction of the element's own border box on this axis: `-50%` is
+    /// `-0.5`. This is the unit `translate(-50%, -50%)` centring idiom is
+    /// written in, and it cannot be resolved before layout.
+    Fraction(f32),
+}
+
+impl TransformLength {
+    /// Zero, in either unit — the identity translate.
+    pub const ZERO: Self = Self::Pixels(0.0);
+
+    /// Resolves against the element's own size along this axis.
+    pub fn resolve(self, own: f32) -> f32 {
+        match self {
+            Self::Pixels(v) => v,
+            Self::Fraction(f) => f * own,
+        }
+    }
+
+    /// Is this zero, whatever unit it is written in?
+    pub fn is_zero(self) -> bool {
+        match self {
+            Self::Pixels(v) | Self::Fraction(v) => v == 0.0,
+        }
+    }
+
+    /// Interpolates between two authored lengths.
+    ///
+    /// Same units interpolate. Mixed units cannot without knowing the box, and
+    /// CSS would produce a `calc()` there — except when one side is zero, which
+    /// is the same length in both units and so adopts the other's. Anything
+    /// else snaps at the halfway point, which is the discrete behaviour the
+    /// rest of this animator already uses for uninterpolable pairs.
+    pub fn interpolate(self, other: Self, t: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        match (self, other) {
+            (Self::Pixels(a), Self::Pixels(b)) => Self::Pixels(lerp(a, b)),
+            (Self::Fraction(a), Self::Fraction(b)) => Self::Fraction(lerp(a, b)),
+            (a, b) if a.is_zero() => match b {
+                Self::Pixels(v) => Self::Pixels(lerp(0.0, v)),
+                Self::Fraction(v) => Self::Fraction(lerp(0.0, v)),
+            },
+            (a, b) if b.is_zero() => match a {
+                Self::Pixels(v) => Self::Pixels(lerp(v, 0.0)),
+                Self::Fraction(v) => Self::Fraction(lerp(v, 0.0)),
+            },
+            (a, b) => {
+                if t < 0.5 {
+                    a
+                } else {
+                    b
+                }
+            }
+        }
+    }
+}
+
+impl Default for TransformSpec {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl TransformSpec {
+    /// `transform: none`.
+    pub const IDENTITY: Self = Self {
+        translate: (TransformLength::ZERO, TransformLength::ZERO),
+        rotate: 0.0,
+        scale: (1.0, 1.0),
+    };
+
+    /// Is this `transform: none` — nothing to apply, nothing to pay for?
+    pub fn is_identity(&self) -> bool {
+        self.rotate == 0.0
+            && self.scale == (1.0, 1.0)
+            && self.translate.0.is_zero()
+            && self.translate.1.is_zero()
+    }
+
+    /// Componentwise interpolation, which is what a browser does when both
+    /// sides are the same function list: `rotate(0deg)` → `rotate(90deg)`
+    /// sweeps through 45°, not through the matrix entries (which would shear).
+    pub fn interpolate(self, other: Self, t: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        Self {
+            translate: (
+                self.translate.0.interpolate(other.translate.0, t),
+                self.translate.1.interpolate(other.translate.1, t),
+            ),
+            rotate: lerp(self.rotate, other.rotate),
+            scale: (
+                lerp(self.scale.0, other.scale.0),
+                lerp(self.scale.1, other.scale.1),
+            ),
+        }
+    }
+
+    /// The device-space matrix for an element whose border box is `bounds`.
+    ///
+    /// Read bottom-up, as matrix products are: move the centre to the origin,
+    /// scale, rotate, then move back — plus the translate, which rides on the
+    /// recentring so it is applied in the element's own frame.
+    ///
+    /// The origin is the box's centre because that is CSS's initial
+    /// `transform-origin: 50% 50%`; a declared `transform-origin` is not
+    /// modelled.
+    pub fn to_matrix(self, bounds: Bounds<Pixels>, scale_factor: f32) -> TransformationMatrix {
+        let centre = bounds.center();
+        let translate = Point::new(
+            px(self.translate.0.resolve(bounds.size.width.0)),
+            px(self.translate.1.resolve(bounds.size.height.0)),
+        );
+        TransformationMatrix::unit()
+            .translate((centre + translate).scale(scale_factor))
+            .rotate(Radians(self.rotate))
+            .scale(Size {
+                width: self.scale.0,
+                height: self.scale.1,
+            })
+            .translate(centre.scale(-scale_factor))
+    }
+}
 
 /// The `--shading` value that came out of the cascade, carried on
 /// [`crate::Style`] and painted by [`crate::Style::paint`].
@@ -986,6 +1156,21 @@ impl From<EffectQuad> for Primitive {
 
 const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
 
+// The four primitives that carry a CSS `transform`. Their Rust layout IS the
+// shader layout on every backend — the DirectX renderer uses
+// `size_of::<T>()` as the structured buffer's `StructureByteStride`, and
+// `gpui_wgpu/src/shaders_webgl.wgsl` hardcodes the same numbers as word
+// strides. A field added without updating the shaders reads the next record's
+// bytes and produces garbage rather than an error, so the sizes are asserted
+// here where a mismatch is a compile failure.
+//
+// Word counts, for the shader side: 46 / 34 / 22 / 30.
+const _: () = assert!(std::mem::size_of::<Quad>() == 46 * 4);
+const _: () = assert!(std::mem::size_of::<Shadow>() == 34 * 4);
+const _: () = assert!(std::mem::size_of::<Underline>() == 22 * 4);
+const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 30 * 4);
+const _: () = assert!(std::mem::size_of::<TransformationMatrix>() == 6 * 4);
+
 /// Seconds since the first effect was painted — the clock [`EffectQuad::time`]
 /// carries.
 ///
@@ -1012,6 +1197,9 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    /// See [`Quad::transformation`]. An underline rides along with the text it
+    /// decorates, so it takes the same ambient transform the glyph sprites do.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Underline> for Primitive {
@@ -1035,6 +1223,10 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    /// See [`Quad::transformation`]. A shadow is part of the element's own
+    /// painted content, so a `transform: rotate()` turns the shadow with the
+    /// box — which is what a browser does.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<Shadow> for Primitive {
@@ -1149,6 +1341,41 @@ impl TransformationMatrix {
         }
         Point::new(output[0].into(), output[1].into())
     }
+
+    /// The inverse transformation, or `None` when the matrix is singular
+    /// (`scale(0)` collapses the element to nothing, and nothing has no
+    /// interior to map a point back into).
+    ///
+    /// This is what hit-testing needs: a hitbox stores its untransformed
+    /// `bounds`, so testing a pointer against a *transformed* element means
+    /// mapping the pointer back into the element's own frame rather than
+    /// mapping four corners forward and testing a polygon.
+    pub fn inverse(&self) -> Option<TransformationMatrix> {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        let det = a * d - b * c;
+        if det.abs() < f32::EPSILON {
+            return None;
+        }
+        let inv = [[d / det, -b / det], [-c / det, a / det]];
+        let [tx, ty] = self.translation;
+        Some(TransformationMatrix {
+            rotation_scale: inv,
+            translation: [
+                -(inv[0][0] * tx + inv[0][1] * ty),
+                -(inv[1][0] * tx + inv[1][1] * ty),
+            ],
+        })
+    }
+
+    /// Is this the identity — i.e. is there nothing to apply?
+    ///
+    /// Worth asking before every push, because the whole point of the paint
+    /// path is that an untransformed element costs exactly what it did before
+    /// transforms existed.
+    #[inline]
+    pub fn is_unit(&self) -> bool {
+        *self == Self::unit()
+    }
 }
 
 impl Default for TransformationMatrix {
@@ -1207,6 +1434,11 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    /// See [`Quad::transformation`]. The monochrome and subpixel sprites have
+    /// carried one since gpui's SVG element; this is the one that was missing,
+    /// and it is what makes an `<img>` (or a colour emoji) inside a rotated box
+    /// rotate with it.
+    pub transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {

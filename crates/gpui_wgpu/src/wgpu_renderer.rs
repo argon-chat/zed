@@ -2243,13 +2243,17 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
+        // vue-native fork: Quad, Shadow, Underline and PolychromeSprite each
+        // grew a 6-word `transformation` (CSS `transform`), so every stride
+        // below moved by 6. `shaders_webgl.wgsl`'s `load_*` cursors must move
+        // with them or the loader reads the next record's bytes.
+        assert_eq!(std::mem::size_of::<Quad>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 34 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
     }
 }

@@ -10,7 +10,7 @@ use crate::{
     EffectSpec, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
     PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    TransformSpec, TransformationMatrix, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -315,6 +315,27 @@ pub struct Style {
     /// every descendant is never what an author means, and a browser ignores
     /// the property entirely anyway, so nothing renders differently there.
     pub vn_effect: Option<EffectSpec>,
+
+    /// CSS `transform`: rotate, scale and translate this element's PAINTED
+    /// output — its background, borders, shadows, text and its whole subtree —
+    /// about its own centre, changing no layout at all.
+    ///
+    /// `None` means the property was never declared; [`TransformSpec::IDENTITY`]
+    /// is `transform: none`, a *value*, because a refinement cannot spell
+    /// "explicitly nothing" and that is what has to cancel a transform declared
+    /// by an earlier rule in the cascade. Same shape as `vn_effect` above, and
+    /// as `backdrop-filter: none` mapping to a 0px radius.
+    ///
+    /// Layout is untouched on purpose, and that is the browser's rule rather
+    /// than a shortcut: a transformed element still occupies exactly the box it
+    /// laid out in, its siblings do not move, and its scroll container does not
+    /// grow. It also means `translate()` here is NOT interchangeable with a
+    /// margin offset — which is the divergence this field exists to retire.
+    ///
+    /// Hit-testing follows the picture: a hitbox records the matrix in force
+    /// when it was inserted and the pointer is mapped back through the inverse,
+    /// so a rotated button is clickable where it is *drawn*.
+    pub vn_transform: Option<TransformSpec>,
 
     /// The text style of this element
     #[refineable]
@@ -709,8 +730,43 @@ impl Style {
         }
     }
 
+    /// The device-space matrix this style's CSS `transform` produces for an
+    /// element laid out at `bounds`, or the identity when there is none.
+    ///
+    /// Shared by paint (which pushes it onto the primitives) and prepaint
+    /// (which records it on the hitbox), so the picture and the hit test can
+    /// never disagree about where the element is.
+    pub fn transform_matrix(&self, bounds: Bounds<Pixels>, scale_factor: f32) -> TransformationMatrix
+    {
+        self.vn_transform
+            .filter(|t| !t.is_identity())
+            .map(|t| t.to_matrix(bounds, scale_factor))
+            .unwrap_or_else(TransformationMatrix::unit)
+    }
+
     /// Paints the background of an element styled with this style.
     pub fn paint(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        // CSS `transform` applies to this element's whole painted output AND
+        // to its subtree, so it is pushed around everything below — including
+        // `continuation`, which is where the children paint. Layout has already
+        // happened at this point and is deliberately not consulted again: a
+        // transform never moves a box, only its picture.
+        let transformation = self.transform_matrix(bounds, window.scale_factor());
+        if !transformation.is_unit() {
+            return window.with_element_transform(transformation, |window| {
+                self.paint_untransformed(bounds, window, cx, continuation)
+            });
+        }
+        self.paint_untransformed(bounds, window, cx, continuation)
+    }
+
+    fn paint_untransformed(
         &self,
         bounds: Bounds<Pixels>,
         window: &mut Window,
@@ -880,6 +936,7 @@ impl Default for Style {
             box_shadow: Default::default(),
             backdrop_blur: None,
             vn_effect: None,
+            vn_transform: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
