@@ -1331,9 +1331,65 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
+    /// Fill the tile for `key` from a texture that is ALREADY in the renderer's
+    /// own GPU memory, with no CPU round trip — the tile is allocated on the
+    /// first call and overwritten in place on every call after it.
+    ///
+    /// This is the escape hatch for producers that decode straight onto the
+    /// renderer's device (a hardware video decoder, a compute pass). The
+    /// ordinary [`PlatformAtlas::get_or_insert_with`] path can only accept
+    /// `Cow<[u8]>`, which for such a producer means GPU → system memory → GPU
+    /// for pixels that never needed to leave VRAM.
+    ///
+    /// Unlike `get_or_insert_with` this is **not** memoised on the key: a
+    /// caller that keeps ONE key per element and calls this once per frame gets
+    /// one stable tile updated in place, which is the point — a fresh key per
+    /// frame would allocate and free an atlas tile every frame.
+    ///
+    /// Returns `Ok(None)` when the backend has no GPU path, when the handle is
+    /// null, or when the texture is not one this atlas can copy from (wrong
+    /// device, wrong format, too small). `None` is not an error: the caller is
+    /// expected to have a CPU fallback, and the reason is logged once.
+    ///
+    /// # Contract
+    ///
+    /// `texture` is BORROWED for the duration of the call. On Windows it must
+    /// be an `ID3D11Texture2D` created on the device that
+    /// `gpui_windows::renderer_d3d11_device()` publishes, in
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM`, at least `size` in each dimension.
+    fn upload_from_gpu(
+        &self,
+        _key: &AtlasKey,
+        _size: Size<DevicePixels>,
+        _texture: GpuTextureHandle,
+    ) -> Result<Option<AtlasTile>> {
+        Ok(None)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
+    }
+}
+
+/// A borrowed, platform-defined handle to a texture that already lives in the
+/// GPU memory of the renderer's own device. See
+/// [`PlatformAtlas::upload_from_gpu`].
+///
+/// Deliberately a raw pointer rather than a typed COM/Metal object: the
+/// producer is usually a different crate compiled against a different version
+/// of the platform bindings, and a COM interface pointer is an ABI, not a type.
+/// Same reasoning as `gpui_windows::renderer_d3d11_device`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GpuTextureHandle(pub *mut std::ffi::c_void);
+
+impl GpuTextureHandle {
+    /// The null handle — "there is no texture", which every backend rejects.
+    pub const NULL: Self = Self(std::ptr::null_mut());
+
+    /// Is this the null handle?
+    pub fn is_null(&self) -> bool {
+        self.0.is_null()
     }
 }
 

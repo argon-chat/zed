@@ -12,6 +12,7 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    GpuTextureHandle,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
@@ -4764,6 +4765,43 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Fills the sprite-atlas tile that backs `data` from a texture that is
+    /// already in the renderer's own GPU memory, with no CPU round trip.
+    ///
+    /// `data` is used for its **identity and its size only** — its pixel buffer
+    /// is never read on this path, so a producer that decodes onto the GPU can
+    /// keep one zero-filled `RenderImage` alive for the life of the element and
+    /// overwrite its tile every frame. `paint_image` then finds the tile
+    /// already populated and never runs its `build` closure.
+    ///
+    /// Returns `Ok(false)` when the platform has no GPU path or refused the
+    /// texture (wrong device, wrong format, too small) — the caller is expected
+    /// to fall back to a `RenderImage` carrying real bytes. This is not a paint
+    /// method: call it from a frame pump, before the draw that paints the image.
+    ///
+    /// # Contract
+    ///
+    /// See [`PlatformAtlas::upload_from_gpu`]. On Windows `texture` must be an
+    /// `ID3D11Texture2D` on the device `gpui_windows::renderer_d3d11_device()`
+    /// publishes, in `DXGI_FORMAT_B8G8R8A8_UNORM`, at least as large as
+    /// `data.size(frame_index)`.
+    pub fn upload_image_from_gpu(
+        &mut self,
+        data: &RenderImage,
+        frame_index: usize,
+        texture: GpuTextureHandle,
+    ) -> Result<bool> {
+        let params = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        };
+        let size = data.size(frame_index);
+        Ok(self
+            .sprite_atlas
+            .upload_from_gpu(&params.into(), size, texture)?
+            .is_some())
     }
 
     /// Removes an image from the sprite atlas.

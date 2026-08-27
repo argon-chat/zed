@@ -1,6 +1,7 @@
 use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
+use windows::core::Interface;
 use windows::Win32::Graphics::{
     Direct3D11::{
         D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
@@ -11,7 +12,7 @@ use windows::Win32::Graphics::{
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    GpuTextureHandle, PlatformAtlas, Point, Size,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
@@ -93,6 +94,94 @@ impl PlatformAtlas for DirectXAtlas {
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
+    }
+
+    /// The zero-copy path: `CopySubresourceRegion` from a texture that already
+    /// lives on this renderer's device straight into the tile.
+    ///
+    /// Written for `<video>` (`crates/vn-video`), whose Media Foundation
+    /// backend decodes onto the device `renderer_d3d11_device()` publishes and
+    /// hands us the result already in `DXGI_FORMAT_B8G8R8A8_UNORM` — which is
+    /// exactly the Polychrome atlas format. Before this, the frame went GPU →
+    /// `Map(D3D11_MAP_READ)` → `Vec<u8>` → `UpdateSubresource` → GPU, and the
+    /// readback alone [measured] 1.71 ms per 1080p frame.
+    ///
+    /// The tile is allocated on the first call for a key and **reused in
+    /// place** afterwards. That is why this is not `get_or_insert_with`-shaped:
+    /// the caller keeps one key for the whole life of the element, so a playing
+    /// video costs one allocation, not one per frame.
+    ///
+    /// Rejections are `Ok(None)`, not `Err` — the caller has a CPU fallback and
+    /// a wrong-device texture is a recoverable state (it is what a device-lost
+    /// leaves behind for one frame). Each reason is logged once per size.
+    fn upload_from_gpu(
+        &self,
+        key: &AtlasKey,
+        size: Size<DevicePixels>,
+        texture: GpuTextureHandle,
+    ) -> anyhow::Result<Option<AtlasTile>> {
+        if texture.is_null() || size.width.0 <= 0 || size.height.0 <= 0 {
+            return Ok(None);
+        }
+        // SAFETY: the contract on `PlatformAtlas::upload_from_gpu` is that this
+        // is a live `ID3D11Texture2D` owned by the caller for the duration of
+        // the call. `from_raw_borrowed` does not AddRef and does not Release.
+        let Some(source) = (unsafe { ID3D11Texture2D::from_raw_borrowed(&texture.0) }) else {
+            return Ok(None);
+        };
+
+        let mut lock = self.0.lock();
+
+        // Reuse the tile unless it is the wrong size (the element resized), in
+        // which case the old one is freed and a new one taken. A tile that is
+        // merely stale is exactly what we are about to overwrite.
+        let existing = lock.tiles_by_key.get(key).copied();
+        let tile = match existing {
+            Some(tile) if tile.bounds.size == size => tile,
+            _ => {
+                if !lock.can_copy_from(source, size) {
+                    return Ok(None);
+                }
+                if existing.is_some() {
+                    drop(lock);
+                    self.remove(key);
+                    lock = self.0.lock();
+                }
+                let Some(tile) = lock.allocate(size, key.texture_kind()) else {
+                    log::error!(
+                        "DirectXAtlas::upload_from_gpu: could not allocate a {}x{} tile",
+                        size.width.0,
+                        size.height.0,
+                    );
+                    return Ok(None);
+                };
+                lock.tiles_by_key.insert(key.clone(), tile);
+                tile
+            }
+        };
+
+        let destination = lock.texture(tile.texture_id).texture.clone();
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: size.width.0 as u32,
+            bottom: size.height.0 as u32,
+            back: 1,
+        };
+        unsafe {
+            lock.device_context.CopySubresourceRegion(
+                &destination,
+                0,
+                tile.bounds.left().0 as u32,
+                tile.bounds.top().0 as u32,
+                0,
+                source,
+                0,
+                Some(&region),
+            );
+        }
+        Ok(Some(tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -245,6 +334,54 @@ impl DirectXAtlasState {
         }
     }
 
+    /// Is `source` a texture this atlas can `CopySubresourceRegion` from?
+    ///
+    /// Three things have to hold, and each one fails silently in D3D11 if it
+    /// does not — a cross-device copy is a no-op with a debug-layer message
+    /// nobody reads, and a format mismatch produces garbage rather than an
+    /// error. Checked only when a tile is allocated (i.e. once per element and
+    /// once more after a device-lost, which is exactly when the answer can
+    /// change), so the per-frame path pays nothing.
+    fn can_copy_from(&self, source: &ID3D11Texture2D, size: Size<DevicePixels>) -> bool {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut desc) };
+
+        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            log::error!(
+                "DirectXAtlas::upload_from_gpu: source texture is format {:?}, and the polychrome \
+                 atlas is DXGI_FORMAT_B8G8R8A8_UNORM — refusing the copy",
+                desc.Format,
+            );
+            return false;
+        }
+        if desc.Width < size.width.0 as u32 || desc.Height < size.height.0 as u32 {
+            log::error!(
+                "DirectXAtlas::upload_from_gpu: source texture is {}x{} but {}x{} was asked for",
+                desc.Width,
+                desc.Height,
+                size.width.0,
+                size.height.0,
+            );
+            return false;
+        }
+
+        // COM identity: `GetDevice` hands back the device the resource was
+        // created on, and `ID3D11Device` is not aggregated, so a raw pointer
+        // compare is the identity test.
+        match unsafe { source.GetDevice() } {
+            Ok(owner) if owner.as_raw() == self.device.as_raw() => true,
+            _ => {
+                log::error!(
+                    "DirectXAtlas::upload_from_gpu: the source texture belongs to a different \
+                     D3D11 device than the renderer's — refusing the copy (a producer must use \
+                     the device gpui_windows::renderer_d3d11_device() publishes, and must rebuild \
+                     when its generation changes)",
+                );
+                false
+            }
+        }
+    }
+
     fn texture(&self, id: AtlasTextureId) -> &DirectXAtlasTexture {
         match id.kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures[id.index as usize]
@@ -352,7 +489,7 @@ mod tests {
         },
     };
 
-    fn create_atlas() -> Option<DirectXAtlas> {
+    fn create_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
         let mut device: Option<ID3D11Device> = None;
         let mut device_context: Option<ID3D11DeviceContext> = None;
         unsafe {
@@ -369,7 +506,33 @@ mod tests {
             )
         }
         .ok()?;
-        Some(DirectXAtlas::new(&device?, &device_context?))
+        Some((device?, device_context?))
+    }
+
+    fn create_atlas() -> Option<DirectXAtlas> {
+        let (device, context) = create_device()?;
+        Some(DirectXAtlas::new(&device, &context))
+    }
+
+    /// A BGRA texture of `size`, in the shape `upload_from_gpu` accepts.
+    fn create_source(device: &ID3D11Device, size: Size<DevicePixels>) -> Option<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: size.width.0 as u32,
+            Height: size.height.0 as u32,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.ok()?;
+        texture
     }
 
     fn make_image_key(image_id: usize) -> AtlasKey {
@@ -416,5 +579,121 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, &big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    /// The property `<video>` depends on: repeated uploads under ONE key reuse
+    /// ONE tile. A key per frame would allocate (and have to free) atlas space
+    /// sixty times a second, which is the leak `<lottie>`'s two-generation
+    /// retire exists to plug — the GPU path avoids needing it at all.
+    #[test]
+    fn gpu_upload_reuses_one_tile_and_follows_a_resize() {
+        let Some((device, context)) = create_device() else {
+            return;
+        };
+        let atlas = DirectXAtlas::new(&device, &context);
+
+        let size = Size {
+            width: DevicePixels(320),
+            height: DevicePixels(180),
+        };
+        let Some(source) = create_source(&device, size) else {
+            return;
+        };
+        let handle = GpuTextureHandle(source.as_raw());
+        let key = make_image_key(10);
+
+        let first = atlas
+            .upload_from_gpu(&key, size, handle)
+            .expect("upload should not error")
+            .expect("a same-device BGRA texture is acceptable");
+        for _ in 0..8 {
+            let again = atlas
+                .upload_from_gpu(&key, size, handle)
+                .unwrap()
+                .expect("the tile is reused, not reallocated");
+            assert_eq!(again.tile_id, first.tile_id);
+            assert_eq!(again.bounds, first.bounds);
+        }
+
+        // A resize takes a new tile of the new size and frees the old one.
+        let bigger = Size {
+            width: DevicePixels(640),
+            height: DevicePixels(360),
+        };
+        let Some(bigger_source) = create_source(&device, bigger) else {
+            return;
+        };
+        let resized = atlas
+            .upload_from_gpu(&key, bigger, GpuTextureHandle(bigger_source.as_raw()))
+            .unwrap()
+            .expect("a resize is still acceptable");
+        assert_eq!(resized.bounds.size, bigger);
+    }
+
+    /// The three refusals, each of which D3D11 would otherwise turn into
+    /// silence (a cross-device copy is a no-op; a format mismatch is garbage).
+    /// `<video>`'s fallback to the CPU readback path hangs off exactly this.
+    #[test]
+    fn gpu_upload_refuses_null_wrong_device_and_wrong_format() {
+        let Some((device, context)) = create_device() else {
+            return;
+        };
+        let atlas = DirectXAtlas::new(&device, &context);
+        let size = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+
+        assert!(
+            atlas
+                .upload_from_gpu(&make_image_key(20), size, GpuTextureHandle::NULL)
+                .unwrap()
+                .is_none(),
+            "a null handle is not a texture"
+        );
+
+        // A texture on a DIFFERENT device — what a device-lost recovery leaves
+        // every already-decoding producer holding.
+        let Some((other_device, _other_context)) = create_device() else {
+            return;
+        };
+        let Some(foreign) = create_source(&other_device, size) else {
+            return;
+        };
+        assert!(
+            atlas
+                .upload_from_gpu(&make_image_key(21), size, GpuTextureHandle(foreign.as_raw()))
+                .unwrap()
+                .is_none(),
+            "a texture from another device must be refused, not silently copied"
+        );
+
+        // Wrong format: the polychrome atlas is BGRA8 and nothing else.
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 64,
+            Height: 64,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let mut rgba: Option<ID3D11Texture2D> = None;
+        if unsafe { device.CreateTexture2D(&desc, None, Some(&mut rgba)) }.is_ok()
+            && let Some(rgba) = rgba
+        {
+            assert!(
+                atlas
+                    .upload_from_gpu(&make_image_key(22), size, GpuTextureHandle(rgba.as_raw()))
+                    .unwrap()
+                    .is_none(),
+                "RGBA into a BGRA atlas would swap the channels silently"
+            );
+        }
     }
 }
