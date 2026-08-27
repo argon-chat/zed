@@ -487,6 +487,26 @@ impl WindowsWindow {
                 WS_EX_APPWINDOW
             };
 
+            // OS-drawn chrome. `TitlebarOptions::appears_transparent == false`
+            // means "the OS owns the caption", but until now nothing acted on
+            // that for a normal window: `WS_CAPTION` appeared only in the
+            // Dialog branch, so `appears_transparent: false` produced a thick
+            // resize frame with NO titlebar at all — strictly worse than either
+            // real mode.
+            //
+            // The rest of the plumbing was already conditional on
+            // `hide_title_bar` and already does the right thing here:
+            // `handle_calc_client_size` falls through to `DefWindowProcW` (so
+            // the caption gets its own non-client band), and
+            // `handle_hit_test_msg` stops synthesising the top resize strip and
+            // lets `DefWindowProcW` answer HTCAPTION / HTMINBUTTON /
+            // HTMAXBUTTON / HTCLOSE. `WindowBorderOffset::update` measures
+            // `GetWindowRect - GetClientRect` at runtime, so the caption band
+            // is accounted for in the bounds without a constant anywhere.
+            if !hide_title_bar {
+                dwstyle |= WS_CAPTION;
+            }
+
             (dwexstyle, dwstyle)
         };
         if !disable_direct_composition {
@@ -881,25 +901,58 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
 
-        // using Dwm APIs for Mica and MicaAlt backdrops.
-        // others follow the set_window_composition_attribute approach
+        // Mica and MicaAlt are DWM system backdrops
+        // (`DWMWA_SYSTEMBACKDROP_TYPE`); the other three are the older
+        // undocumented accent policy (`SetWindowCompositionAttribute`).
+        //
+        // Those are two INDEPENDENT mechanisms, and each branch below therefore
+        // sets BOTH of them. Setting only the one it needs makes this function
+        // order-dependent: acrylic leaves `ACCENT_ENABLE_ACRYLICBLURBEHIND`
+        // armed, so a later `MicaBackdrop` — which only writes the DWM
+        // attribute — keeps compositing acrylic's noise onto the window's own
+        // surface, and the window never returns to Mica. (Going through
+        // `Opaque` cleared it, because that is the one branch that used to
+        // write accent state 0, which is why the bug looked intermittent.)
+        //
+        // `DWMSBT_NONE` (1) is the explicit "no system backdrop", as opposed to
+        // `DWMSBT_AUTO` (0) which lets DWM pick; it is what the three accent
+        // materials want behind them.
+        const DWMSBT_NONE: u32 = 1;
+        const DWMSBT_MAINWINDOW: u32 = 2; // Mica
+        const DWMSBT_TABBEDWINDOW: u32 = 4; // MicaAlt
+        const ACCENT_DISABLED: u32 = 0;
+        const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
+        const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
-                set_window_composition_attribute(hwnd, None, 0);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_NONE);
+                set_window_composition_attribute(hwnd, None, ACCENT_DISABLED);
             }
             WindowBackgroundAppearance::Transparent => {
-                set_window_composition_attribute(hwnd, None, 2);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_NONE);
+                set_window_composition_attribute(
+                    hwnd,
+                    None,
+                    ACCENT_ENABLE_TRANSPARENTGRADIENT,
+                );
             }
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_NONE);
+                set_window_composition_attribute(
+                    hwnd,
+                    Some((0, 0, 0, 0)),
+                    ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                );
             }
             WindowBackgroundAppearance::MicaBackdrop => {
-                // DWMSBT_MAINWINDOW => MicaBase
-                dwm_set_window_composition_attribute(hwnd, 2);
+                // Clear the accent policy FIRST: it paints on the window's own
+                // surface, in front of anything DWM composites behind it.
+                set_window_composition_attribute(hwnd, None, ACCENT_DISABLED);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_MAINWINDOW);
             }
             WindowBackgroundAppearance::MicaAltBackdrop => {
-                // DWMSBT_TABBEDWINDOW => MicaAlt
-                dwm_set_window_composition_attribute(hwnd, 4);
+                set_window_composition_attribute(hwnd, None, ACCENT_DISABLED);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_TABBEDWINDOW);
             }
         }
     }
