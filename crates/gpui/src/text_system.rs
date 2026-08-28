@@ -231,6 +231,11 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    // `layout_width` measures ONE character for the wrapper's
+                    // per-character cache; the wrapper adds its own tracking on
+                    // top, so adding it here too would double it.
+                    tracking: px(0.),
+                    word_spacing: px(0.),
                 }],
             )
             .width
@@ -319,16 +324,26 @@ impl TextSystem {
         }
     }
 
-    /// Returns a handle to a line wrapper, for the given font and font size.
-    pub fn line_wrapper(self: &Arc<Self>, font: Font, font_size: Pixels) -> LineWrapperHandle {
+    /// Returns a handle to a line wrapper, for the given font, font size and
+    /// CSS `letter-spacing`.
+    pub fn line_wrapper(
+        self: &Arc<Self>,
+        font: Font,
+        font_size: Pixels,
+        tracking: Pixels,
+    ) -> LineWrapperHandle {
         let lock = &mut self.wrapper_pool.lock();
         let font_id = self.resolve_font(&font);
         let wrappers = lock
-            .entry(FontIdWithSize { font_id, font_size })
+            .entry(FontIdWithSize {
+                font_id,
+                font_size,
+                tracking,
+            })
             .or_default();
         let wrapper = wrappers
             .pop()
-            .unwrap_or_else(|| LineWrapper::new(font_id, font_size, self.clone()));
+            .unwrap_or_else(|| LineWrapper::new(font_id, font_size, tracking, self.clone()));
 
         LineWrapperHandle {
             wrapper: Some(wrapper),
@@ -573,12 +588,16 @@ impl WindowTextSystem {
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && !decoration_changed
+                    && font_run.tracking == run.tracking
+                    && font_run.word_spacing == run.word_spacing
                 {
                     font_run.len += run_len_within_line;
                 } else {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        tracking: run.tracking,
+                        word_spacing: run.word_spacing,
                     });
                 }
 
@@ -687,12 +706,16 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
+                && font_run.tracking == run.tracking
+                && font_run.word_spacing == run.word_spacing
             {
                 font_run.len += run.len;
             } else {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    tracking: run.tracking,
+                    word_spacing: run.word_spacing,
                 });
             }
         }
@@ -720,6 +743,11 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    // `layout_width` measures ONE character for the wrapper's
+                    // per-character cache; the wrapper adds its own tracking on
+                    // top, so adding it here too would double it.
+                    tracking: px(0.),
+                    word_spacing: px(0.),
                 }],
                 None,
             )
@@ -769,12 +797,16 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
+                && font_run.tracking == run.tracking
+                && font_run.word_spacing == run.word_spacing
             {
                 font_run.len += run.len;
             } else {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    tracking: run.tracking,
+                    word_spacing: run.word_spacing,
                 });
             }
         }
@@ -831,12 +863,16 @@ impl WindowTextSystem {
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
+                && font_run.tracking == run.tracking
+                && font_run.word_spacing == run.word_spacing
             {
                 font_run.len += run.len;
             } else {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    tracking: run.tracking,
+                    word_spacing: run.word_spacing,
                 });
             }
         }
@@ -860,6 +896,9 @@ impl WindowTextSystem {
 struct FontIdWithSize {
     font_id: FontId,
     font_size: Pixels,
+    /// Part of the pool key: a wrapper carries its tracking, so handing back
+    /// one built for a different `letter-spacing` would wrap to the wrong width.
+    tracking: Pixels,
 }
 
 /// A handle into the text system, which can be used to compute the wrapped layout of text
@@ -876,6 +915,7 @@ impl Drop for LineWrapperHandle {
             .get_mut(&FontIdWithSize {
                 font_id: wrapper.font_id,
                 font_size: wrapper.font_size,
+                tracking: wrapper.tracking,
             })
             .unwrap()
             .push(wrapper);
@@ -1013,6 +1053,13 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// Extra space after each typographic character unit — CSS
+    /// `letter-spacing`. Applied to the shaped line rather than to the shaper,
+    /// so it costs no platform-specific work; see
+    /// `line_layout::apply_spacing_to_layout`.
+    pub tracking: Pixels,
+    /// Extra space after each word separator — CSS `word-spacing`.
+    pub word_spacing: Pixels,
 }
 
 #[cfg(all(target_os = "macos", test))]

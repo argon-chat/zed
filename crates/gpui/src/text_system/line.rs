@@ -465,12 +465,16 @@ fn paint_line(
                             current_underline.get_or_insert((
                                 point(
                                     glyph_origin.x,
-                                    glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
+                                    glyph_origin.y
+                                        + baseline_offset.y
+                                        + (layout.descent * 0.618)
+                                        + run_underline.offset,
                                 ),
                                 UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
                                     thickness: run_underline.thickness,
                                     wavy: run_underline.wavy,
+                                    offset: run_underline.offset,
                                 },
                             ));
                         }

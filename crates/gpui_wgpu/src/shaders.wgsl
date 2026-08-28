@@ -130,19 +130,42 @@ struct LinearColorStop {
     percentage: f32,
 }
 
+// Mirrors `Background` in `gpui/src/color.rs` — 57 words. `params` and `tile`
+// are `array<f32, 4>` rather than `vec4<f32>` on purpose: a vec4 would be
+// 16-byte aligned and the struct would gain padding the Rust `#[repr(C)]`
+// layout does not have.
+const GRADIENT_STOPS: u32 = 8u;
+const BG_REPEATING: u32 = 1u;
+const BG_TILED: u32 = 2u;
+const BG_CORNER: u32 = 4u;
+const BG_NO_REPEAT_X: u32 = 8u;
+const BG_NO_REPEAT_Y: u32 = 16u;
+const BG_CENTER_PX: u32 = 32u;
+const BG_RADIUS_PX: u32 = 64u;
+const BG_TILE_W_FRACTION: u32 = 128u;
+const BG_TILE_H_FRACTION: u32 = 256u;
+const BG_TILE_X_FRACTION: u32 = 512u;
+const BG_TILE_Y_FRACTION: u32 = 1024u;
+const BG_STOP_PX_SHIFT: u32 = 16u;
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is RadialGradient
+    // 5u is ConicGradient
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
     color_space: u32,
     solid: Hsla,
     gradient_angle_or_pattern_height: f32,
-    colors: array<LinearColorStop, 2>,
-    pad: u32,
+    colors: array<LinearColorStop, 8>,
+    stop_count: u32,
+    flags: u32,
+    params: array<f32, 4>,
+    tile: array<f32, 4>,
 }
 
 struct AtlasTextureId {
@@ -401,82 +424,241 @@ struct GradientColor {
     color1: vec4<f32>,
 }
 
-fn prepare_gradient_color(tag: u32, color_space: u32,
-    solid: Hsla, colors: array<LinearColorStop, 2>) -> GradientColor {
+// Only the SOLID colour can still be resolved in the vertex shader: which pair
+// of stops a fragment falls between is a per-fragment question once a gradient
+// carries up to GRADIENT_STOPS of them. `color0`/`color1` keep carrying the
+// first and last stop for callers that still read them.
+fn prepare_gradient_color(background: Background) -> GradientColor {
     var result = GradientColor();
-
-    if (tag == 0u || tag == 2u || tag == 3u) {
-        result.solid = hsla_to_rgba(solid);
-    } else if (tag == 1u) {
-        // The hsla_to_rgba is returns a linear sRGB color
-        result.color0 = hsla_to_rgba(colors[0].color);
-        result.color1 = hsla_to_rgba(colors[1].color);
-
-        // Prepare color space in vertex for avoid conversion
-        // in fragment shader for performance reasons
-        if (color_space == 0u) {
-            // sRGB
-            result.color0 = linear_to_srgba(result.color0);
-            result.color1 = linear_to_srgba(result.color1);
-        } else if (color_space == 1u) {
-            // Oklab
-            result.color0 = linear_srgb_to_oklab(result.color0);
-            result.color1 = linear_srgb_to_oklab(result.color1);
-        }
+    var stops = background.colors;
+    result.solid = hsla_to_rgba(background.solid);
+    result.color0 = hsla_to_rgba(stops[0].color);
+    result.color1 = hsla_to_rgba(stops[GRADIENT_STOPS - 1u].color);
+    if (background.color_space == 0u) {
+        result.color0 = linear_to_srgba(result.color0);
+        result.color1 = linear_to_srgba(result.color1);
+    } else if (background.color_space == 1u) {
+        result.color0 = linear_srgb_to_oklab(result.color0);
+        result.color1 = linear_srgb_to_oklab(result.color1);
     }
-
     return result;
 }
 
-fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
+// One colour stop, in the interpolation colour space.
+fn gradient_stop_color(background: Background, i: u32) -> vec4<f32> {
+    var stops = background.colors;
+    var c = hsla_to_rgba(stops[i].color);
+    if (background.color_space == 1u) {
+        return linear_srgb_to_oklab(c);
+    }
+    return linear_to_srgba(c);
+}
+
+// One colour stop's position, as a fraction of the gradient line. A stop
+// flagged BG_STOP_PX carries an absolute length instead — `white 1px,
+// transparent 1px` has no percentage form and the line's length is only known
+// here.
+fn gradient_stop_position(background: Background, i: u32, line_length: f32) -> f32 {
+    var stops = background.colors;
+    let p = stops[i].percentage;
+    if ((background.flags & (1u << (BG_STOP_PX_SHIFT + i))) != 0u) {
+        if (line_length > 1e-6) {
+            return p / line_length;
+        }
+        return 0.0;
+    }
+    return p;
+}
+
+// Evaluates the ramp at `t`, a position along the gradient line expressed as a
+// fraction of it. See the HLSL twin for the reasoning; coincident stops (a hard
+// stop) fall out of the same arithmetic.
+fn gradient_ramp(background: Background, t_in: f32, line_length: f32) -> vec4<f32> {
+    let n = min(background.stop_count, GRADIENT_STOPS);
+    if (n == 0u) {
+        return vec4<f32>(0.0);
+    }
+    var t = t_in;
+    let first = gradient_stop_position(background, 0u, line_length);
+    let last = gradient_stop_position(background, n - 1u, line_length);
+    if ((background.flags & BG_REPEATING) != 0u) {
+        let span = last - first;
+        if (span > 1e-6) {
+            t = first + fract((t - first) / span) * span;
+        }
+    }
+
+    var color = gradient_stop_color(background, 0u);
+    var prev = first;
+    for (var i = 1u; i < GRADIENT_STOPS; i = i + 1u) {
+        if (i >= n) {
+            break;
+        }
+        let p = gradient_stop_position(background, i, line_length);
+        if (t > prev) {
+            let seg = p - prev;
+            var local = 0.0;
+            if (seg > 1e-6) {
+                local = saturate((t - prev) / seg);
+            } else if (t >= p) {
+                local = 1.0;
+            }
+            color = mix(color, gradient_stop_color(background, i), local);
+        }
+        prev = p;
+    }
+
+    if (background.color_space == 1u) {
+        return oklab_to_linear_srgb(color);
+    }
+    return srgba_to_linear(color);
+}
+
+// CSS aims a `to <corner>` gradient's line at the actual corner, so its angle
+// depends on the box's aspect ratio. 0 top right, 1 bottom right, 2 bottom
+// left, 3 top left.
+fn gradient_corner_angle(corner: u32, size: vec2<f32>) -> f32 {
+    let a = degrees(atan2(size.x, size.y));
+    if (corner == 0u) { return a; }
+    if (corner == 1u) { return 180.0 - a; }
+    if (corner == 2u) { return 180.0 + a; }
+    return 360.0 - a;
+}
+
+// A radial or conic gradient's centre.
+fn gradient_center(background: Background, box: Bounds) -> vec2<f32> {
+    var p = background.params;
+    let c = vec2<f32>(p[0], p[1]);
+    if ((background.flags & BG_CENTER_PX) != 0u) {
+        return box.origin + c;
+    }
+    return box.origin + c * box.size;
+}
+
+// Resolves a radial gradient's two radii, honouring CSS's four extent keywords.
+fn radial_radii(background: Background, center: vec2<f32>, bounds: Bounds) -> vec2<f32> {
+    var p = background.params;
+    if (p[2] >= 0.0) {
+        let r = vec2<f32>(p[2], p[3]);
+        if ((background.flags & BG_RADIUS_PX) != 0u) {
+            return r;
+        }
+        return r * bounds.size;
+    }
+    let keyword = u32(-p[2] + 0.5);
+    let ellipse = p[3] > 0.5;
+    let to_start = abs(center - bounds.origin);
+    let to_end = abs(bounds.origin + bounds.size - center);
+    let nearest = min(to_start, to_end);
+    let farthest = max(to_start, to_end);
+
+    if (keyword == 1u) {
+        if (ellipse) { return nearest; }
+        return vec2<f32>(min(nearest.x, nearest.y));
+    }
+    if (keyword == 2u) {
+        if (ellipse) { return farthest; }
+        return vec2<f32>(max(farthest.x, farthest.y));
+    }
+    var corner = farthest;
+    if (keyword == 3u) { corner = nearest; }
+    if (!ellipse) {
+        return vec2<f32>(length(corner));
+    }
+    let sides = max(corner, vec2<f32>(1e-6));
+    let scale = sqrt(dot(corner / sides, corner / sides));
+    return sides * scale;
+}
+
+// Dither to reduce banding in gradients (especially dark/alpha).
+fn gradient_dither(color_in: vec4<f32>, position: vec2<f32>) -> vec4<f32> {
+    // A stop list can resolve to EXACTLY transparent — that is how a gradient
+    // split into layered bands masks the part another band owns — and dithering
+    // that would spray faint noise over the whole box.
+    if (color_in.a <= 0.0) {
+        return color_in;
+    }
+    var color = color_in;
+    let seed = position * 0.6180339887;
+    let r1 = fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    let r2 = fract(sin(dot(seed, vec2<f32>(39.3460, 11.135))) * 24634.6345);
+    let tri = r1 + r2 - 1.0;
+    color = vec4<f32>(color.rgb + tri * 2.0 / 255.0, color.a + tri * 3.0 / 255.0);
+    return color;
+}
+
+fn gradient_color(background: Background, position_in: vec2<f32>, bounds_in: Bounds,
     solid_color: vec4<f32>, color0: vec4<f32>, color1: vec4<f32>) -> vec4<f32> {
     var background_color = vec4<f32>(0.0);
+
+    // `background-size` / `background-position` / `background-repeat`: the
+    // gradient is measured against ONE tile and the box is paved with copies.
+    var position = position_in;
+    var bounds = bounds_in;
+    var box = bounds_in;
+    if ((background.flags & BG_TILED) != 0u) {
+        var t = background.tile;
+        var raw_size = vec2<f32>(t[0], t[1]);
+        if ((background.flags & BG_TILE_W_FRACTION) != 0u) { raw_size.x *= bounds_in.size.x; }
+        if ((background.flags & BG_TILE_H_FRACTION) != 0u) { raw_size.y *= bounds_in.size.y; }
+        let tile_size = max(raw_size, vec2<f32>(1e-3));
+        var tile_offset = vec2<f32>(t[2], t[3]);
+        // A PERCENTAGE background-position aligns the tile inside the space it
+        // leaves — 50% centres it — rather than translating by a fraction of
+        // the box.
+        if ((background.flags & BG_TILE_X_FRACTION) != 0u) {
+            tile_offset.x *= (bounds_in.size.x - tile_size.x);
+        }
+        if ((background.flags & BG_TILE_Y_FRACTION) != 0u) {
+            tile_offset.y *= (bounds_in.size.y - tile_size.y);
+        }
+        let relative = position_in - bounds_in.origin - tile_offset;
+        // `background-repeat: no-repeat` on an axis: outside the single tile
+        // there is nothing, rather than another copy of it.
+        if (((background.flags & BG_NO_REPEAT_X) != 0u &&
+             (relative.x < 0.0 || relative.x >= tile_size.x)) ||
+            ((background.flags & BG_NO_REPEAT_Y) != 0u &&
+             (relative.y < 0.0 || relative.y >= tile_size.y))) {
+            return vec4<f32>(0.0);
+        }
+        position = bounds_in.origin + (relative - tile_size * floor(relative / tile_size));
+        box.size = tile_size;
+    }
 
     switch (background.tag) {
         default: {
             return solid_color;
         }
         case 1u: {
-            // Linear gradient background.
-            // -90 degrees to match the CSS gradient angle.
-            let angle = background.gradient_angle_or_pattern_height;
-            let radians = (angle % 360.0 - 90.0) * M_PI_F / 180.0;
-            var direction = vec2<f32>(cos(radians), sin(radians));
-            let stop0_percentage = background.colors[0].percentage;
-            let stop1_percentage = background.colors[1].percentage;
-
-            // Expand the short side to be the same as the long side
-            if (bounds.size.x > bounds.size.y) {
-                direction.y *= bounds.size.y / bounds.size.x;
-            } else {
-                direction.x *= bounds.size.x / bounds.size.y;
+            var angle = background.gradient_angle_or_pattern_height;
+            if ((background.flags & BG_CORNER) != 0u) {
+                angle = gradient_corner_angle(u32(angle), box.size);
             }
-
-            // Get the t value for the linear gradient with the color stop percentages.
-            let half_size = bounds.size / 2.0;
-            let center = bounds.origin + half_size;
-            let center_to_point = position - center;
-            var t = dot(center_to_point, direction) / length(direction);
-            // Check the direct to determine the use x or y
-            if (abs(direction.x) > abs(direction.y)) {
-                t = (t + half_size.x) / bounds.size.x;
-            } else {
-                t = (t + half_size.y) / bounds.size.y;
-            }
-
-            // Adjust t based on the stop percentages
-            t = (t - stop0_percentage) / (stop1_percentage - stop0_percentage);
-            t = clamp(t, 0.0, 1.0);
-
-            switch (background.color_space) {
-                default: {
-                    background_color = srgba_to_linear(mix(color0, color1, t));
-                }
-                case 1u: {
-                    let oklab_color = mix(color0, color1, t);
-                    background_color = oklab_to_linear_srgb(oklab_color);
-                }
-            }
+            // CSS: 0deg points at the top and the angle turns clockwise; the
+            // window's y axis points down, so "to top" is (0, -1).
+            let radians = (angle % 360.0) * M_PI_F / 180.0;
+            let direction = vec2<f32>(sin(radians), -cos(radians));
+            let line_length =
+                abs(box.size.x * sin(radians)) + abs(box.size.y * cos(radians));
+            let center = box.origin + box.size * 0.5;
+            let t = dot(position - center, direction) / max(line_length, 1e-6) + 0.5;
+            background_color =
+                gradient_dither(gradient_ramp(background, t, line_length), position);
+        }
+        case 4u: {
+            let center = gradient_center(background, box);
+            let radii = max(radial_radii(background, center, box), vec2<f32>(1e-6));
+            let t = length((position - center) / radii);
+            background_color = gradient_dither(
+                gradient_ramp(background, t, max(radii.x, radii.y)), position);
+        }
+        case 5u: {
+            let center = gradient_center(background, box);
+            let spoke = position - center;
+            let angle = atan2(spoke.x, -spoke.y);
+            let from = background.gradient_angle_or_pattern_height * M_PI_F / 180.0;
+            let t = fract((angle - from) / (2.0 * M_PI_F) + 1.0);
+            background_color = gradient_dither(gradient_ramp(background, t, 1.0), position);
         }
         case 2u: {
             // pattern slash
@@ -552,12 +734,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     var out = QuadVarying();
     out.position = to_device_position(unit_vertex, quad.bounds);
 
-    let gradient = prepare_gradient_color(
-        quad.background.tag,
-        quad.background.color_space,
-        quad.background.solid,
-        quad.background.colors
-    );
+    let gradient = prepare_gradient_color(quad.background);
     out.background_solid = gradient.solid;
     out.background_color0 = gradient.color0;
     out.background_color1 = gradient.color1;
@@ -1110,12 +1287,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         let distance = f / length(gradient);
         alpha = saturate(0.5 - distance);
     }
-    let prepared_gradient = prepare_gradient_color(
-        background.tag,
-        background.color_space,
-        background.solid,
-        background.colors,
-    );
+    let prepared_gradient = prepare_gradient_color(background);
     let color = gradient_color(background, input.position.xy, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);

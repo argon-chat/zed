@@ -671,6 +671,10 @@ impl LineLayoutCache {
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
 
+            // Spacing first: `force_width` assigns each cluster an ABSOLUTE
+            // cell, so it has to see the positions it is going to overwrite,
+            // not ones already widened by tracking.
+            apply_spacing_to_layout(&mut layout, &text, runs);
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
             }
@@ -820,6 +824,7 @@ impl LineLayoutCache {
             .platform_text_system
             .layout_line(&text, font_size, runs);
 
+        apply_spacing_to_layout(&mut layout, &text, runs);
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
         }
@@ -839,6 +844,76 @@ impl LineLayoutCache {
         current_frame.used_lines_by_hash.push(key);
         layout
     }
+}
+
+/// CSS `letter-spacing` and `word-spacing`, applied to an already-shaped line.
+///
+/// A post-pass rather than a shaper feature, and deliberately so: every
+/// platform text system gpui has (DirectWrite, CoreText, cosmic-text) hands
+/// back absolute glyph POSITIONS, so widening the gaps between them is the same
+/// arithmetic on all three and needs no per-backend work at all. Painting,
+/// hit-testing, alignment, `split_at` and `compute_wrap_boundaries` read those
+/// same positions and `LineLayout::width`, so they all follow for free.
+///
+/// The unit CSS spaces is the *typographic character unit*, not the glyph: a
+/// combining mark or a ligature component must not be pushed away from what it
+/// belongs to. `ShapedGlyph::index` is the cluster's start offset and every
+/// glyph in a cluster shares it, so a change of `index` IS a cluster boundary.
+///
+/// Tracking is added AFTER each unit, including the last, which is what Chrome
+/// does and what makes a tracked run measure `n * tracking` wider.
+fn apply_spacing_to_layout(layout: &mut LineLayout, text: &str, runs: &[FontRun]) {
+    if runs
+        .iter()
+        .all(|run| run.tracking == px(0.) && run.word_spacing == px(0.))
+    {
+        return;
+    }
+
+    // `runs` are byte spans over `text`, and a shaped run is not necessarily
+    // the same span (the platform may split one on a font fallback), so the
+    // spacing in force is looked up by the glyph's own byte offset.
+    let spacing_at = |offset: usize| {
+        let mut start = 0;
+        for run in runs {
+            if offset < start + run.len {
+                return (run.tracking, run.word_spacing);
+            }
+            start += run.len;
+        }
+        runs.last()
+            .map(|run| (run.tracking, run.word_spacing))
+            .unwrap_or((px(0.), px(0.)))
+    };
+
+    let mut extra = px(0.);
+    let mut previous_index: Option<usize> = None;
+    for run in layout.runs.iter_mut() {
+        for glyph in run.glyphs.iter_mut() {
+            if previous_index != Some(glyph.index) {
+                if let Some(previous) = previous_index {
+                    let (tracking, word_spacing) = spacing_at(previous);
+                    extra += tracking;
+                    // CSS adds word spacing at each word-separator character,
+                    // which for every script gpui shapes is U+0020.
+                    if text[previous..].starts_with(' ') {
+                        extra += word_spacing;
+                    }
+                }
+                previous_index = Some(glyph.index);
+            }
+            glyph.position.x += extra;
+        }
+    }
+
+    if let Some(previous) = previous_index {
+        let (tracking, word_spacing) = spacing_at(previous);
+        extra += tracking;
+        if text[previous..].starts_with(' ') {
+            extra += word_spacing;
+        }
+    }
+    layout.width += extra;
 }
 
 // Combining marks (e.g. Thai vowel signs, Arabic diacritics) are shaped by
@@ -877,6 +952,13 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    /// Extra space after each typographic character unit — CSS
+    /// `letter-spacing`. Part of the run, and therefore part of every layout
+    /// CACHE KEY, because two runs that differ only in tracking are two
+    /// different layouts.
+    pub tracking: Pixels,
+    /// Extra space after each word separator — CSS `word-spacing`.
+    pub word_spacing: Pixels,
 }
 
 trait AsCacheKeyRef {

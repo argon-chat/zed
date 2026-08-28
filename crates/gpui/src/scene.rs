@@ -737,7 +737,7 @@ impl PrimitiveBatch {
 }
 
 /// Keep the field order in sync with `struct Quad` in
-/// `gpui_windows/src/shaders.hlsl` (46 words / 184 bytes) — the DirectX
+/// `gpui_windows/src/shaders.hlsl` (85 words / 340 bytes) — the DirectX
 /// renderer uploads this straight into a `StructuredBuffer` and
 /// `StructureByteStride` is `size_of::<Quad>()`, so the Rust layout IS the
 /// shader layout.
@@ -1219,8 +1219,14 @@ const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
 // bytes and produces garbage rather than an error, so the sizes are asserted
 // here where a mismatch is a compile failure.
 //
-// Word counts, for the shader side: 46 / 34 / 22 / 30.
-const _: () = assert!(std::mem::size_of::<Quad>() == 46 * 4);
+// Word counts, for the shader side: 85 / 34 / 22 / 30.
+//
+// `Quad` carries a `Background`, which is 57 words since it grew from a
+// two-stop linear ramp to an eight-stop linear / radial / conic one with
+// repeat and tiling (`color.rs`). `PathRasterizationVertex` carries one too
+// and is asserted next to the WebGL word strides in `gpui_wgpu`.
+const _: () = assert!(std::mem::size_of::<Quad>() == 85 * 4);
+const _: () = assert!(std::mem::size_of::<Background>() == 57 * 4);
 const _: () = assert!(std::mem::size_of::<Shadow>() == 34 * 4);
 const _: () = assert!(std::mem::size_of::<Underline>() == 22 * 4);
 const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 30 * 4);

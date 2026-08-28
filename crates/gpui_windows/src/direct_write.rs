@@ -1787,15 +1787,25 @@ fn apply_font_features(
     features: &FontFeatures,
 ) -> Result<()> {
     let tag_values = features.tag_value_list();
+    // An EMPTY typography object leaves DirectWrite's own default feature set
+    // in force, so a caller that asked for nothing is better served by not
+    // touching it at all — measured: adding the four features below to an empty
+    // typography changes no advance on this host. It also matters for scripts
+    // this app does not use: the default set for Arabic or Devanagari carries
+    // `rlig`/`mark`/`mkmk`, and listing four Latin features would drop them.
     if tag_values.is_empty() {
         return Ok(());
     }
 
-    // All of these features are enabled by default by DirectWrite.
-    // If you want to (and can) peek into the source of DirectWrite
+    // `SetTypography` REPLACES the default feature set for the range it covers,
+    // which is why `liga`, `clig` and `calt` are re-added below even though
+    // nothing asked for them. `kern` belongs in that list for exactly the same
+    // reason and was missing, so an app that wrote ANY `font-feature-settings`
+    // lost kerning as a side effect.
     let mut feature_liga = make_direct_write_feature("liga", 1);
     let mut feature_clig = make_direct_write_feature("clig", 1);
     let mut feature_calt = make_direct_write_feature("calt", 1);
+    let mut feature_kern = make_direct_write_feature("kern", 1);
 
     for (tag, value) in tag_values {
         if tag.as_str() == "liga" && *value == 0 {
@@ -1810,6 +1820,10 @@ fn apply_font_features(
             feature_calt.parameter = 0;
             continue;
         }
+        if tag.as_str() == "kern" && *value == 0 {
+            feature_kern.parameter = 0;
+            continue;
+        }
 
         unsafe {
             direct_write_features.AddFontFeature(make_direct_write_feature(tag, *value))?;
@@ -1819,6 +1833,7 @@ fn apply_font_features(
         direct_write_features.AddFontFeature(feature_liga)?;
         direct_write_features.AddFontFeature(feature_clig)?;
         direct_write_features.AddFontFeature(feature_calt)?;
+        direct_write_features.AddFontFeature(feature_kern)?;
     }
 
     Ok(())

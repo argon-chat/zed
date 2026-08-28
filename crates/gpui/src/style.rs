@@ -365,6 +365,20 @@ pub struct Style {
     /// The fill color of this element
     pub background: Option<Fill>,
 
+    /// Extra background layers painted OVER [`Style::background`], bottom layer
+    /// first — CSS's `background-image` stack, which sits above
+    /// `background-color`.
+    ///
+    /// One quad per layer rather than a layer array inside the quad: painter's
+    /// order already composites them in the right sequence, the scene's sort
+    /// and cull need no new concept, and nothing about the shader changes. The
+    /// cost is one extra primitive per layer, which is why a caller is expected
+    /// to keep the stack short.
+    ///
+    /// CSS lists layers top-first; this vector is bottom-first, so the mapper
+    /// reverses.
+    pub background_layers: Vec<Background>,
+
     /// The border color of this element
     pub border_color: Option<Hsla>,
 
@@ -646,6 +660,14 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// Extra space after each typographic character unit — CSS
+    /// `letter-spacing`. Already resolved to pixels: `em`-relative tracking is
+    /// a function of the font size, which the caller has and this does not.
+    pub letter_spacing: Pixels,
+
+    /// Extra space after each word separator — CSS `word-spacing`.
+    pub word_spacing: Pixels,
 }
 
 impl Default for TextStyle {
@@ -667,6 +689,8 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
         }
     }
 }
@@ -736,6 +760,8 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            tracking: self.letter_spacing,
+            word_spacing: self.word_spacing,
         }
     }
 }
@@ -779,6 +805,24 @@ impl Hash for HighlightStyle {
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
+    }
+}
+
+/// The one colour that best stands in for a background — the fill itself when
+/// it is solid, and a gradient's first live stop otherwise. Used for the
+/// transparent border that keeps a fill's antialiased corner from seaming.
+fn representative_color(background: &Background) -> Hsla {
+    match background.tag {
+        BackgroundTag::Solid | BackgroundTag::PatternSlash | BackgroundTag::Checkerboard => {
+            background.solid
+        }
+        BackgroundTag::LinearGradient
+        | BackgroundTag::RadialGradient
+        | BackgroundTag::ConicGradient => background
+            .live_stops()
+            .first()
+            .map(|stop| stop.color)
+            .unwrap_or_default(),
     }
 }
 
@@ -954,25 +998,34 @@ impl Style {
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
-            let mut border_color = match background_color {
-                Some(color) => match color.tag {
-                    BackgroundTag::Solid
-                    | BackgroundTag::PatternSlash
-                    | BackgroundTag::Checkerboard => color.solid,
-
-                    BackgroundTag::LinearGradient => color
-                        .colors
-                        .first()
-                        .map(|stop| stop.color)
-                        .unwrap_or_default(),
-                },
-                None => Hsla::default(),
-            };
+            let color = background_color.unwrap_or_default();
+            let mut border_color = representative_color(&color);
             border_color.a = 0.;
             window.paint_quad(quad(
                 bounds,
                 corner_radii,
-                background_color.unwrap_or_default(),
+                color,
+                Edges::default(),
+                border_color,
+                self.border_style,
+            ));
+        }
+
+        // The `background-image` stack, bottom layer first, each one its own
+        // quad over the colour below it. The AA-matching transparent border
+        // trick above is deliberately NOT repeated per layer: it exists to stop
+        // the bottom fill's antialiased corner showing a seam against the
+        // border, and a second quad carrying it would double-blend that seam.
+        for layer in &self.background_layers {
+            if layer.is_transparent() {
+                continue;
+            }
+            let mut border_color = representative_color(layer);
+            border_color.a = 0.;
+            window.paint_quad(quad(
+                bounds,
+                corner_radii,
+                *layer,
                 Edges::default(),
                 border_color,
                 self.border_style,
@@ -1084,6 +1137,7 @@ impl Default for Style {
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
             background: None,
+            background_layers: Vec::new(),
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
@@ -1125,6 +1179,11 @@ pub struct UnderlineStyle {
 
     /// Whether the underline should be wavy, like in a spell checker.
     pub wavy: bool,
+
+    /// How far BELOW its default position the line sits — CSS
+    /// `text-underline-offset`. Zero keeps the position the font's own metrics
+    /// put it at, which is what every existing caller gets.
+    pub offset: Pixels,
 }
 
 /// The properties that can be applied to a strikethrough.

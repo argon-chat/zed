@@ -18,6 +18,12 @@ pub struct LineWrapper {
     text_system: Arc<TextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
+    /// CSS `letter-spacing`. The wrapper sums PER-CHARACTER widths from its own
+    /// cache rather than measuring a shaped line, so tracking has to be added
+    /// here as well as in `line_layout::apply_spacing_to_layout` — otherwise a
+    /// tracked line wraps as if it were untracked and then paints wider than
+    /// the wrap width.
+    pub(crate) tracking: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
 }
@@ -26,11 +32,17 @@ impl LineWrapper {
     /// The maximum indent that can be applied to a line.
     pub const MAX_INDENT: u32 = 256;
 
-    pub(crate) fn new(font_id: FontId, font_size: Pixels, text_system: Arc<TextSystem>) -> Self {
+    pub(crate) fn new(
+        font_id: FontId,
+        font_size: Pixels,
+        tracking: Pixels,
+        text_system: Arc<TextSystem>,
+    ) -> Self {
         Self {
             text_system,
             font_id,
             font_size,
+            tracking,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
         }
@@ -491,6 +503,11 @@ impl LineWrapper {
 
     #[inline(always)]
     fn width_for_char(&mut self, c: char) -> Pixels {
+        self.shaped_width_for_char(c) + self.tracking
+    }
+
+    #[inline(always)]
+    fn shaped_width_for_char(&mut self, c: char) -> Pixels {
         if (c as u32) < 128 {
             if let Some(cached_width) = self.cached_ascii_char_widths[c as usize] {
                 cached_width

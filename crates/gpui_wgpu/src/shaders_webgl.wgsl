@@ -96,17 +96,39 @@ fn read_color_stop(cursor: ptr<function, InstanceCursor>) -> LinearColorStop {
     return LinearColorStop(read_hsla(cursor), read_f32(cursor));
 }
 
+fn read_f32x4(cursor: ptr<function, InstanceCursor>) -> array<f32, 4> {
+    return array<f32, 4>(
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+        read_f32(cursor),
+    );
+}
+
+// 57 words: 2 + 4 + 1 + 8*5 + 1 + 1 + 4 + 4. This is the ONE place in the
+// renderer where a stride mistake is silent rather than a compile error — the
+// cursor would simply start reading the next record's bytes — so it moves in
+// the same commit as `Background` in `gpui/src/color.rs`.
 fn read_background(cursor: ptr<function, InstanceCursor>) -> Background {
     return Background(
         read_word(cursor),
         read_word(cursor),
         read_hsla(cursor),
         read_f32(cursor),
-        array<LinearColorStop, 2>(
+        array<LinearColorStop, 8>(
+            read_color_stop(cursor),
+            read_color_stop(cursor),
+            read_color_stop(cursor),
+            read_color_stop(cursor),
+            read_color_stop(cursor),
+            read_color_stop(cursor),
             read_color_stop(cursor),
             read_color_stop(cursor),
         ),
         read_word(cursor),
+        read_word(cursor),
+        read_f32x4(cursor),
+        read_f32x4(cursor),
     );
 }
 
@@ -136,8 +158,9 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 }
 
 fn load_quad(instance_id: u32) -> Quad {
-    // 46 words: 40 + the 6 of the vue-native `transformation` field.
-    var cursor = instance_cursor(instance_id * 46u);
+    // 85 words: 22 + the 57 of `Background` + the 6 of the vue-native
+    // `transformation` field.
+    var cursor = instance_cursor(instance_id * 85u);
     return Quad(
         read_word(&cursor),
         read_word(&cursor),
@@ -169,7 +192,8 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 26u);
+    // 65 words: 8 + the 57 of `Background`.
+    var cursor = instance_cursor(vertex_id * 65u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),

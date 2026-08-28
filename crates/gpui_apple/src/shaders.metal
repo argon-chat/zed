@@ -84,7 +84,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
     quad.background.color_space,
     quad.background.solid,
     quad.background.colors[0].color,
-    quad.background.colors[1].color
+    quad.background.colors[7].color
   );
 
   return QuadVertexOutput{
@@ -797,7 +797,7 @@ fragment float4 path_rasterization_fragment(
     background.color_space,
     background.solid,
     background.colors[0].color,
-    background.colors[1].color
+    background.colors[7].color
   );
 
   float4 color = fill_color(
@@ -1150,25 +1150,151 @@ float4 over(float4 below, float4 above) {
   return result;
 }
 
+// Only the SOLID colour can still be resolved in the vertex shader: which pair
+// of stops a fragment falls between is a per-fragment question once a gradient
+// carries up to eight of them (`GRADIENT_STOPS` in `gpui/src/color.rs`; the
+// literal is spelled out here so it cannot clash with cbindgen's own constant).
+// `color0`/`color1` keep carrying the first and last stop.
 GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid,
                                      Hsla color0, Hsla color1) {
   GradientColor out;
-  if (tag == 0 || tag == 2 || tag == 3) {
-    out.solid = hsla_to_rgba(solid);
-  } else if (tag == 1) {
-    out.color0 = hsla_to_rgba(color0);
-    out.color1 = hsla_to_rgba(color1);
+  out.solid = hsla_to_rgba(solid);
+  out.color0 = hsla_to_rgba(color0);
+  out.color1 = hsla_to_rgba(color1);
+  if (color_space == 1) {
+    out.color0 = srgb_to_oklab(out.color0);
+    out.color1 = srgb_to_oklab(out.color1);
+  }
+  return out;
+}
 
-    // Prepare color space in vertex for avoid conversion
-    // in fragment shader for performance reasons
-    if (color_space == 1) {
-      // Oklab
-      out.color0 = srgb_to_oklab(out.color0);
-      out.color1 = srgb_to_oklab(out.color1);
+// Background::flags
+#define BG_REPEATING      1u
+#define BG_TILED          2u
+#define BG_CORNER         4u
+#define BG_NO_REPEAT_X    8u
+#define BG_NO_REPEAT_Y    16u
+#define BG_CENTER_PX        32u
+#define BG_RADIUS_PX        64u
+#define BG_TILE_W_FRACTION  128u
+#define BG_TILE_H_FRACTION  256u
+#define BG_TILE_X_FRACTION  512u
+#define BG_TILE_Y_FRACTION  1024u
+#define BG_STOP_PX_SHIFT    16u
+
+float4 gradient_stop_color(Background background, uint i) {
+  float4 c = hsla_to_rgba(background.colors[i].color);
+  if (background.color_space == 1) {
+    c = srgb_to_oklab(c);
+  }
+  return c;
+}
+
+// A stop flagged BG_STOP_PX carries an absolute length along the gradient line
+// rather than a fraction of it — `white 1px, transparent 1px` has no percentage
+// form and the line's length is only known here.
+float gradient_stop_position(Background background, uint i, float line_length) {
+  float p = background.colors[i].percentage;
+  if (background.flags & (1u << (BG_STOP_PX_SHIFT + i))) {
+    p = (line_length > 1e-6) ? (p / line_length) : 0.0;
+  }
+  return p;
+}
+
+// See the HLSL twin in `gpui_windows/src/shaders.hlsl` for the reasoning; a
+// coincident pair of stops (a hard stop) falls out of the same arithmetic.
+float4 gradient_ramp(Background background, float t, float line_length) {
+  uint n = min(background.stop_count, 8u);
+  if (n == 0u) {
+    return float4(0.0);
+  }
+
+  float first = gradient_stop_position(background, 0u, line_length);
+  float last = gradient_stop_position(background, n - 1u, line_length);
+  if (background.flags & BG_REPEATING) {
+    float span = last - first;
+    if (span > 1e-6) {
+      t = first + fract((t - first) / span) * span;
     }
   }
 
-  return out;
+  float4 color = gradient_stop_color(background, 0u);
+  float prev = first;
+  for (uint i = 1u; i < 8u; i++) {
+    if (i >= n) {
+      break;
+    }
+    float p = gradient_stop_position(background, i, line_length);
+    if (t > prev) {
+      float seg = p - prev;
+      float local = (seg > 1e-6) ? saturate((t - prev) / seg) : ((t >= p) ? 1.0 : 0.0);
+      color = mix(color, gradient_stop_color(background, i), local);
+    }
+    prev = p;
+  }
+
+  if (background.color_space == 1) {
+    color = oklab_to_srgb(color);
+  }
+  return color;
+}
+
+float2 gradient_center(Background background, float2 box_origin, float2 box_size) {
+  float2 c = float2(background.params[0], background.params[1]);
+  return box_origin + ((background.flags & BG_CENTER_PX) ? c : (c * box_size));
+}
+
+float4 gradient_dither(float4 color, float2 position) {
+  // A stop list can resolve to EXACTLY transparent — that is how a gradient
+  // split into layered bands masks the part another band owns — and dithering
+  // that would spray faint noise over the whole box.
+  if (color.a <= 0.0) {
+    return color;
+  }
+  float2 seed = position * 0.6180339887;
+  float r1 = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+  float r2 = fract(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
+  float tri = r1 + r2 - 1.0;
+  color.rgb += tri * 2.0 / 255.0;
+  color.a   += tri * 3.0 / 255.0;
+  return color;
+}
+
+// CSS aims a `to <corner>` gradient's line at the actual corner, so its angle
+// depends on the box's aspect ratio.
+float gradient_corner_angle(uint corner, float2 size) {
+  float a = (atan2(size.x, size.y)) * (180.0 / M_PI_F);
+  if (corner == 0u) return a;
+  if (corner == 1u) return 180.0 - a;
+  if (corner == 2u) return 180.0 + a;
+  return 360.0 - a;
+}
+
+float2 radial_radii(Background background, float2 center, float2 origin, float2 size) {
+  if (background.params[2] >= 0.0) {
+    float2 r = float2(background.params[2], background.params[3]);
+    return (background.flags & BG_RADIUS_PX) ? r : (r * size);
+  }
+  uint keyword = (uint)(-background.params[2] + 0.5);
+  bool ellipse = background.params[3] > 0.5;
+  float2 to_start = abs(center - origin);
+  float2 to_end = abs(origin + size - center);
+  float2 nearest = min(to_start, to_end);
+  float2 farthest = max(to_start, to_end);
+
+  if (keyword == 1u) {
+    return ellipse ? nearest : float2(min(nearest.x, nearest.y));
+  }
+  if (keyword == 2u) {
+    return ellipse ? farthest : float2(max(farthest.x, farthest.y));
+  }
+  float2 corner = (keyword == 3u) ? nearest : farthest;
+  if (!ellipse) {
+    return float2(length(corner));
+  }
+  float2 sides = max(corner, float2(1e-6));
+  float scale = sqrt(dot(corner / sides, corner / sides));
+  return sides * scale;
 }
 
 float2x2 rotate2d(float angle) {
@@ -1183,65 +1309,68 @@ float4 fill_color(Background background,
                       float4 solid_color, float4 color0, float4 color1) {
   float4 color;
 
+  // `background-size` / `background-position` / `background-repeat`: the
+  // gradient is measured against ONE tile and the box is paved with copies of
+  // it, so every tag below works in tile space without knowing about tiling.
+  float2 box_origin = float2(bounds.origin.x, bounds.origin.y);
+  float2 box_size = float2(bounds.size.width, bounds.size.height);
+  if (background.flags & BG_TILED) {
+    float2 tile_size = float2(background.tile[0], background.tile[1]);
+    if (background.flags & BG_TILE_W_FRACTION) tile_size.x *= box_size.x;
+    if (background.flags & BG_TILE_H_FRACTION) tile_size.y *= box_size.y;
+    tile_size = max(tile_size, float2(1e-3));
+    float2 tile_offset = float2(background.tile[2], background.tile[3]);
+    // A PERCENTAGE background-position aligns the tile inside the space it
+    // leaves — 50% centres it — rather than translating by a fraction of the
+    // box.
+    if (background.flags & BG_TILE_X_FRACTION) tile_offset.x *= (box_size.x - tile_size.x);
+    if (background.flags & BG_TILE_Y_FRACTION) tile_offset.y *= (box_size.y - tile_size.y);
+    float2 relative = position - box_origin - tile_offset;
+    // `background-repeat: no-repeat` on an axis: outside the single tile there
+    // is nothing, rather than another copy of it.
+    if (((background.flags & BG_NO_REPEAT_X) &&
+         (relative.x < 0.0 || relative.x >= tile_size.x)) ||
+        ((background.flags & BG_NO_REPEAT_Y) &&
+         (relative.y < 0.0 || relative.y >= tile_size.y))) {
+      return float4(0.0);
+    }
+    position = box_origin + (relative - tile_size * floor(relative / tile_size));
+    box_size = tile_size;
+  }
+
   switch (background.tag) {
     case 0:
       color = solid_color;
       break;
     case 1: {
-      // -90 degrees to match the CSS gradient angle.
       float gradient_angle = background.gradient_angle_or_pattern_height;
-      float radians = (fmod(gradient_angle, 360.0) - 90.0) * (M_PI_F / 180.0);
-      float2 direction = float2(cos(radians), sin(radians));
-
-      // Expand the short side to be the same as the long side
-      if (bounds.size.width > bounds.size.height) {
-          direction.y *= bounds.size.height / bounds.size.width;
-      } else {
-          direction.x *=  bounds.size.width / bounds.size.height;
+      if (background.flags & BG_CORNER) {
+        gradient_angle = gradient_corner_angle((uint)gradient_angle, box_size);
       }
-
-      // Get the t value for the linear gradient with the color stop percentages.
-      float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.;
-      float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
-      float2 center_to_point = position - center;
-      float t = dot(center_to_point, direction) / length(direction);
-      // Check the direction to determine whether to use x or y
-      if (abs(direction.x) > abs(direction.y)) {
-          t = (t + half_size.x) / bounds.size.width;
-      } else {
-          t = (t + half_size.y) / bounds.size.height;
-      }
-
-      // Adjust t based on the stop percentages
-      t = (t - background.colors[0].percentage)
-        / (background.colors[1].percentage
-        - background.colors[0].percentage);
-      t = clamp(t, 0.0, 1.0);
-
-      switch (background.color_space) {
-        case 0:
-          color = mix(color0, color1, t);
-          break;
-        case 1: {
-          float4 oklab_color = mix(color0, color1, t);
-          color = oklab_to_srgb(oklab_color);
-          break;
-        }
-      }
-
-      // Dither to reduce banding in gradients (especially dark/alpha).
-      // Triangular-distributed noise breaks up 8-bit quantization steps.
-      // ±2/255 for RGB (enough for dark-on-dark compositing),
-      // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
-      {
-        float2 seed = position * 0.6180339887; // golden ratio spread
-        float r1 = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-        float r2 = fract(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-        float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
-        color.rgb += tri * 2.0 / 255.0;
-        color.a   += tri * 3.0 / 255.0;
-      }
-
+      // CSS: 0deg points at the top and the angle turns clockwise. The
+      // window's y axis points down, so "to top" is (0, -1).
+      float rad = fmod(gradient_angle, 360.0) * (M_PI_F / 180.0);
+      float2 direction = float2(sin(rad), -cos(rad));
+      float line_length = abs(box_size.x * sin(rad)) + abs(box_size.y * cos(rad));
+      float2 center = box_origin + box_size * 0.5;
+      float t = dot(position - center, direction) / max(line_length, 1e-6) + 0.5;
+      color = gradient_dither(gradient_ramp(background, t, line_length), position);
+      break;
+    }
+    case 4: {
+      float2 center = gradient_center(background, box_origin, box_size);
+      float2 radii = max(radial_radii(background, center, box_origin, box_size), float2(1e-6));
+      float t = length((position - center) / radii);
+      color = gradient_dither(gradient_ramp(background, t, max(radii.x, radii.y)), position);
+      break;
+    }
+    case 5: {
+      float2 center = gradient_center(background, box_origin, box_size);
+      float2 spoke = position - center;
+      float angle = atan2(spoke.x, -spoke.y);
+      float from = background.gradient_angle_or_pattern_height * (M_PI_F / 180.0);
+      float t = fract((angle - from) / (2.0 * M_PI_F) + 1.0);
+      color = gradient_dither(gradient_ramp(background, t, 1.0), position);
       break;
     }
     case 2: {

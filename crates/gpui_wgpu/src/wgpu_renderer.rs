@@ -2247,9 +2247,14 @@ mod tests {
         // grew a 6-word `transformation` (CSS `transform`), so every stride
         // below moved by 6. `shaders_webgl.wgsl`'s `load_*` cursors must move
         // with them or the loader reads the next record's bytes.
-        assert_eq!(std::mem::size_of::<Quad>(), 46 * 4);
+        //
+        // `Background` then grew from 18 words to 57 (eight colour stops,
+        // radial and conic geometry, repeat and tiling), which moved `Quad` and
+        // `PathRasterizationVertex` by another 39 each.
+        assert_eq!(std::mem::size_of::<Background>(), 57 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 85 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 34 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 65 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);

@@ -747,7 +747,63 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    RadialGradient = 4,
+    ConicGradient = 5,
 }
+
+/// How many colour stops a gradient [`Background`] carries inline.
+///
+/// The stops live IN the `Background` rather than behind an index into a side
+/// buffer, because a side buffer would need a second binding on DirectX, a
+/// second storage buffer on wgpu, a second `[[buffer(n)]]` on Metal and — the
+/// expensive one — a second instance TEXTURE on WebGL2, where instance data is
+/// unpacked by hand. Eight is the smallest power of two that covers everything
+/// real CSS in this tree asks for (the widest is a seven-stop hue wheel), and
+/// a caller with more stops splits the gradient into layered bands instead
+/// (`vn_css`'s `gradient_layers`), which is exact rather than approximate.
+pub const GRADIENT_STOPS: usize = 8;
+
+/// `Background::flags` — the ramp restarts every period instead of clamping at
+/// the ends (`repeating-linear-gradient()` and friends).
+pub(crate) const BG_REPEATING: u32 = 1 << 0;
+/// `Background::flags` — `tile` holds a `background-size` / `background-position`
+/// pair, and the gradient is evaluated in TILE space rather than box space.
+pub(crate) const BG_TILED: u32 = 1 << 1;
+/// `Background::flags` — `gradient_angle_or_pattern_height` holds a CORNER index
+/// (0 = to top right, 1 = to bottom right, 2 = to bottom left, 3 = to top left)
+/// rather than an angle. CSS aims a corner gradient's line at the actual corner,
+/// so the angle depends on the box's aspect ratio, which only the shader knows.
+pub(crate) const BG_CORNER: u32 = 1 << 2;
+/// `Background::flags` — with [`BG_TILED`], the tile does NOT repeat along x
+/// (`background-repeat: no-repeat` / `repeat-y`): everything outside the one
+/// tile is transparent rather than another copy of it.
+pub(crate) const BG_NO_REPEAT_X: u32 = 1 << 3;
+/// `Background::flags` — as [`BG_NO_REPEAT_X`], along y.
+pub(crate) const BG_NO_REPEAT_Y: u32 = 1 << 4;
+/// `Background::flags` — `params[0..2]` is an offset in PIXELS from the box's
+/// top left corner rather than a fraction of the box.
+pub(crate) const BG_CENTER_PX: u32 = 1 << 5;
+/// `Background::flags` — `params[2..4]` is a pair of radii in PIXELS rather
+/// than fractions of the box.
+pub(crate) const BG_RADIUS_PX: u32 = 1 << 6;
+/// `Background::flags` — the tile's WIDTH is a fraction of the box's rather
+/// than a length (`background-size: 50% …`).
+pub(crate) const BG_TILE_W_FRACTION: u32 = 1 << 7;
+/// `Background::flags` — as [`BG_TILE_W_FRACTION`], for the tile's height.
+pub(crate) const BG_TILE_H_FRACTION: u32 = 1 << 8;
+/// `Background::flags` — the tile's x OFFSET is a fraction of the space the
+/// tile leaves in the box, which is how CSS defines a percentage
+/// `background-position` (`50%` centres the tile, it does not move it by half
+/// the box).
+pub(crate) const BG_TILE_X_FRACTION: u32 = 1 << 9;
+/// `Background::flags` — as [`BG_TILE_X_FRACTION`], for the y offset.
+pub(crate) const BG_TILE_Y_FRACTION: u32 = 1 << 10;
+/// `Background::flags` — bit `BG_STOP_PX_SHIFT + i` marks stop `i`'s
+/// `percentage` as an ABSOLUTE length in pixels along the gradient line rather
+/// than a fraction of it. `linear-gradient(white 1px, transparent 1px)` — the
+/// hard-stop idiom every CSS grid pattern is built from — has no percentage
+/// form, and the gradient line's length is a shader-side quantity.
+pub(crate) const BG_STOP_PX_SHIFT: u32 = 16;
 
 /// A color space for color interpolation.
 ///
@@ -773,27 +829,58 @@ impl Display for ColorSpace {
     }
 }
 
-/// A background color, which can be either a solid color or a linear gradient.
+/// A background: a solid colour, one of the two procedural patterns, or a
+/// linear / radial / conic gradient of up to [`GRADIENT_STOPS`] stops,
+/// optionally repeating and optionally tiled across the box.
+///
+/// The layout is the GPU layout — see the `Quad` word map in `scene.rs` and the
+/// hand-mirrored `struct Background` in each backend's shader. Adding a field
+/// here is a six-file change; the checklist is on `Quad`.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub struct Background {
     pub(crate) tag: BackgroundTag,
     pub(crate) color_space: ColorSpace,
     pub(crate) solid: Hsla,
+    /// The gradient line's angle in degrees for a linear gradient (or a corner
+    /// index when [`BG_CORNER`] is set), the start angle for a conic gradient,
+    /// and the pattern period for the two procedural tags.
     pub(crate) gradient_angle_or_pattern_height: f32,
-    pub(crate) colors: [LinearColorStop; 2],
-    /// Padding for alignment for repr(C) layout.
-    pad: u32,
+    pub(crate) colors: [LinearColorStop; GRADIENT_STOPS],
+    /// How many of `colors` are live. Zero for a non-gradient tag.
+    pub(crate) stop_count: u32,
+    /// `BG_*` bits above.
+    pub(crate) flags: u32,
+    /// Radial: `[cx, cy, rx, ry]`. The centre is a FRACTION of the box; the
+    /// radii are fractions too when `rx >= 0`, and when `rx < 0` the pair is an
+    /// extent keyword instead — `-rx` is 1 `closest-side`, 2 `farthest-side`,
+    /// 3 `closest-corner`, 4 `farthest-corner`, and `ry` is 0 for a circle and
+    /// 1 for an ellipse. Conic: `[cx, cy, _, _]`. Unused otherwise.
+    pub(crate) params: [f32; 4],
+    /// `[width, height, offset_x, offset_y]` in pixels when [`BG_TILED`] is
+    /// set: `background-size` and `background-position`.
+    pub(crate) tile: [f32; 4],
 }
 
 impl std::fmt::Debug for Background {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let stops = &self.colors[..(self.stop_count as usize).min(GRADIENT_STOPS)];
         match self.tag {
             BackgroundTag::Solid => write!(f, "Solid({:?})", self.solid),
             BackgroundTag::LinearGradient => write!(
                 f,
-                "LinearGradient({}, {:?}, {:?})",
-                self.gradient_angle_or_pattern_height, self.colors[0], self.colors[1]
+                "LinearGradient({}, {:?}, flags {:#x}, tile {:?})",
+                self.gradient_angle_or_pattern_height, stops, self.flags, self.tile
+            ),
+            BackgroundTag::RadialGradient => write!(
+                f,
+                "RadialGradient({:?}, {:?}, flags {:#x}, tile {:?})",
+                self.params, stops, self.flags, self.tile
+            ),
+            BackgroundTag::ConicGradient => write!(
+                f,
+                "ConicGradient({}, {:?}, {:?}, flags {:#x}, tile {:?})",
+                self.gradient_angle_or_pattern_height, self.params, stops, self.flags, self.tile
             ),
             BackgroundTag::PatternSlash => write!(
                 f,
@@ -817,8 +904,11 @@ impl Default for Background {
             solid: Hsla::default(),
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
-            colors: [LinearColorStop::default(), LinearColorStop::default()],
-            pad: 0,
+            colors: [LinearColorStop::default(); GRADIENT_STOPS],
+            stop_count: 0,
+            flags: 0,
+            params: [0.0; 4],
+            tile: [0.0; 4],
         }
     }
 }
@@ -867,10 +957,57 @@ pub fn linear_gradient(
     from: impl Into<LinearColorStop>,
     to: impl Into<LinearColorStop>,
 ) -> Background {
+    gradient_with_stops(
+        BackgroundTag::LinearGradient,
+        angle,
+        &[from.into(), to.into()],
+    )
+}
+
+/// A linear gradient with up to [`GRADIENT_STOPS`] stops. Extra stops are
+/// dropped from the middle rather than the ends, so the ramp always starts and
+/// finishes on the colours the caller asked for.
+pub fn linear_gradient_stops(angle: f32, stops: &[LinearColorStop]) -> Background {
+    gradient_with_stops(BackgroundTag::LinearGradient, angle, stops)
+}
+
+/// A radial gradient, centred on the box and reaching its farthest corner —
+/// CSS's defaults. [`Background::at`], [`Background::with_radii`] and
+/// [`Background::with_extent`] change each of those.
+pub fn radial_gradient(stops: &[LinearColorStop]) -> Background {
+    let mut background = gradient_with_stops(BackgroundTag::RadialGradient, 0.0, stops);
+    background.params = [0.5, 0.5, -4.0, 1.0];
+    background
+}
+
+/// A conic gradient. `from_angle` is in degrees clockwise from twelve o'clock;
+/// the centre defaults to the middle of the box.
+pub fn conic_gradient(from_angle: f32, stops: &[LinearColorStop]) -> Background {
+    let mut background = gradient_with_stops(BackgroundTag::ConicGradient, from_angle, stops);
+    background.params = [0.5, 0.5, 0.0, 0.0];
+    background
+}
+
+fn gradient_with_stops(tag: BackgroundTag, angle: f32, stops: &[LinearColorStop]) -> Background {
+    let mut colors = [LinearColorStop::default(); GRADIENT_STOPS];
+    let n = stops.len().min(GRADIENT_STOPS);
+    if stops.len() <= GRADIENT_STOPS {
+        colors[..n].copy_from_slice(&stops[..n]);
+    } else {
+        // Keep both ends and spread the rest evenly through the middle. A
+        // caller that cannot afford the loss splits into bands instead.
+        colors[0] = stops[0];
+        colors[GRADIENT_STOPS - 1] = stops[stops.len() - 1];
+        for (i, slot) in colors[1..GRADIENT_STOPS - 1].iter_mut().enumerate() {
+            let t = (i + 1) as f32 / (GRADIENT_STOPS - 1) as f32;
+            *slot = stops[((t * (stops.len() - 1) as f32).round() as usize).min(stops.len() - 1)];
+        }
+    }
     Background {
-        tag: BackgroundTag::LinearGradient,
+        tag,
         gradient_angle_or_pattern_height: angle,
-        colors: [from.into(), to.into()],
+        colors,
+        stop_count: n as u32,
         ..Default::default()
     }
 }
@@ -929,21 +1066,141 @@ impl Background {
     pub fn opacity(&self, factor: f32) -> Self {
         let mut background = *self;
         background.solid = background.solid.opacity(factor);
-        background.colors = [
-            self.colors[0].opacity(factor),
-            self.colors[1].opacity(factor),
-        ];
+        for stop in &mut background.colors {
+            *stop = stop.opacity(factor);
+        }
         background
     }
 
     /// Returns whether the background color is transparent.
     pub fn is_transparent(&self) -> bool {
         match self.tag {
-            BackgroundTag::Solid => self.solid.is_transparent(),
-            BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
-            BackgroundTag::PatternSlash => self.solid.is_transparent(),
-            BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::Solid | BackgroundTag::PatternSlash | BackgroundTag::Checkerboard => {
+                self.solid.is_transparent()
+            }
+            BackgroundTag::LinearGradient
+            | BackgroundTag::RadialGradient
+            | BackgroundTag::ConicGradient => self.live_stops()
+                .iter()
+                .all(|c| c.color.is_transparent()),
         }
+    }
+
+    /// The stops that actually take part in the ramp.
+    pub fn live_stops(&self) -> &[LinearColorStop] {
+        &self.colors[..(self.stop_count as usize).min(GRADIENT_STOPS)]
+    }
+
+    /// Restarts the ramp every period instead of clamping at the ends —
+    /// `repeating-linear-gradient()` and its radial and conic siblings.
+    pub fn repeating(mut self, on: bool) -> Self {
+        set_flag(&mut self.flags, BG_REPEATING, on);
+        self
+    }
+
+    /// Evaluates the gradient inside one tile and paves the box with copies of
+    /// it — CSS's `background-size` + `background-position` +
+    /// `background-repeat`.
+    ///
+    /// Each of the four numbers is a length in pixels unless its `*_fraction`
+    /// flag is set, when a SIZE is a fraction of the box and an OFFSET is a
+    /// fraction of the space the tile leaves in it (which is what a percentage
+    /// `background-position` means). A zero or negative size clears the tiling.
+    pub fn tiled(
+        mut self,
+        size: (f32, f32),
+        size_fraction: (bool, bool),
+        offset: (f32, f32),
+        offset_fraction: (bool, bool),
+        repeat: (bool, bool),
+    ) -> Self {
+        let on = size.0 > 0.0 && size.1 > 0.0;
+        set_flag(&mut self.flags, BG_TILED, on);
+        set_flag(&mut self.flags, BG_NO_REPEAT_X, on && !repeat.0);
+        set_flag(&mut self.flags, BG_NO_REPEAT_Y, on && !repeat.1);
+        set_flag(&mut self.flags, BG_TILE_W_FRACTION, on && size_fraction.0);
+        set_flag(&mut self.flags, BG_TILE_H_FRACTION, on && size_fraction.1);
+        set_flag(&mut self.flags, BG_TILE_X_FRACTION, on && offset_fraction.0);
+        set_flag(&mut self.flags, BG_TILE_Y_FRACTION, on && offset_fraction.1);
+        self.tile = if on {
+            [size.0, size.1, offset.0, offset.1]
+        } else {
+            [0.0; 4]
+        };
+        self
+    }
+
+    /// Whether this background is painted as a repeated tile.
+    pub fn is_tiled(&self) -> bool {
+        self.flags & BG_TILED != 0
+    }
+
+    /// Aims a linear gradient's line at one of the box's corners the way CSS
+    /// does — `0` top right, `1` bottom right, `2` bottom left, `3` top left.
+    /// The angle then depends on the box's aspect ratio, so it is resolved in
+    /// the shader rather than here.
+    pub fn to_corner(mut self, corner: u8) -> Self {
+        set_flag(&mut self.flags, BG_CORNER, true);
+        self.gradient_angle_or_pattern_height = corner as f32;
+        self
+    }
+
+    /// Marks stop `index`'s position as an absolute length in pixels along the
+    /// gradient line rather than a fraction of it.
+    pub fn stop_in_pixels(mut self, index: usize) -> Self {
+        if index < GRADIENT_STOPS {
+            self.flags |= 1 << (BG_STOP_PX_SHIFT + index as u32);
+        }
+        self
+    }
+
+    /// Moves a radial or conic gradient's centre — `at <position>`. The pair is
+    /// a fraction of the box unless `in_pixels`, when it is an offset from the
+    /// box's top left corner.
+    pub fn at(mut self, center: (f32, f32), in_pixels: bool) -> Self {
+        self.params[0] = center.0;
+        self.params[1] = center.1;
+        set_flag(&mut self.flags, BG_CENTER_PX, in_pixels);
+        self
+    }
+
+    /// Gives a radial gradient explicit radii — a fraction of the box unless
+    /// `in_pixels`. Replaces any [`Background::with_extent`].
+    pub fn with_radii(mut self, radii: (f32, f32), in_pixels: bool) -> Self {
+        self.params[2] = radii.0.max(0.0);
+        self.params[3] = radii.1.max(0.0);
+        set_flag(&mut self.flags, BG_RADIUS_PX, in_pixels);
+        self
+    }
+
+    /// Sizes a radial gradient by one of CSS's four extent keywords: `keyword`
+    /// is 1 `closest-side`, 2 `farthest-side`, 3 `closest-corner`, 4
+    /// `farthest-corner`. Replaces any [`Background::with_radii`].
+    pub fn with_extent(mut self, keyword: u8, ellipse: bool) -> Self {
+        self.params[2] = -(keyword.clamp(1, 4) as f32);
+        self.params[3] = if ellipse { 1.0 } else { 0.0 };
+        set_flag(&mut self.flags, BG_RADIUS_PX, false);
+        self
+    }
+
+    /// Replaces the colour stops, keeping every other property. Stops beyond
+    /// [`GRADIENT_STOPS`] are thinned from the middle.
+    pub fn with_stops(mut self, stops: &[LinearColorStop]) -> Self {
+        let replacement = gradient_with_stops(self.tag, 0.0, stops);
+        self.colors = replacement.colors;
+        self.stop_count = replacement.stop_count;
+        // A stop list is packed together with its units, so any previous
+        // per-stop pixel flags belong to the list being replaced.
+        self.flags &= !(0xffu32 << BG_STOP_PX_SHIFT);
+        self
+    }
+}
+
+fn set_flag(flags: &mut u32, bit: u32, on: bool) {
+    if on {
+        *flags |= bit;
+    } else {
+        *flags &= !bit;
     }
 }
 
