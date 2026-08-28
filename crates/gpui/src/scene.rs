@@ -108,9 +108,17 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        // The content mask is a WINDOW-space rect and `bounds` is the
+        // element's own, untransformed one — the shader is what brings them
+        // into the same frame. Comparing them directly culls a transformed
+        // element against a region it never claimed to be in: a dialog centred
+        // with `translate(-50%, -50%)` lost every glyph whose untransformed box
+        // fell outside its (transformed) clip, which is most of them.
+        let device_bounds = match primitive.transformation() {
+            Some(matrix) if !matrix.is_unit() => transformed_bounds(*primitive.bounds(), matrix),
+            _ => *primitive.bounds(),
+        };
+        let clipped_bounds = device_bounds.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             return;
@@ -354,6 +362,26 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// The CSS `transform` this primitive carries, if its kind has one.
+    ///
+    /// `bounds` is the UNTRANSFORMED rect — the shader applies the matrix — so
+    /// anything comparing a primitive's rectangle with a window-space rect (the
+    /// content mask, the draw-order tree) has to map it first.
+    pub fn transformation(&self) -> Option<TransformationMatrix> {
+        match self {
+            Primitive::Shadow(shadow) => Some(shadow.transformation),
+            Primitive::Quad(quad) => Some(quad.transformation),
+            Primitive::Underline(underline) => Some(underline.transformation),
+            Primitive::MonochromeSprite(sprite) => Some(sprite.transformation),
+            Primitive::SubpixelSprite(sprite) => Some(sprite.transformation),
+            Primitive::PolychromeSprite(sprite) => Some(sprite.transformation),
+            Primitive::BackdropBlurRect(_)
+            | Primitive::EffectQuad(_)
+            | Primitive::Path(_)
+            | Primitive::Surface(_) => None,
         }
     }
 
@@ -1403,6 +1431,32 @@ impl TransformationMatrix {
     pub fn is_unit(&self) -> bool {
         *self == Self::unit()
     }
+}
+
+/// The axis-aligned bounding box of `bounds` after `matrix`, in the same
+/// (device) space both are already expressed in.
+///
+/// Exact for a translation; a superset for a rotation or a scale, which is the
+/// safe direction for a culling test.
+pub(crate) fn transformed_bounds(
+    bounds: Bounds<ScaledPixels>,
+    matrix: TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    let map = |x: ScaledPixels, y: ScaledPixels| {
+        let p = matrix.apply(crate::point(px(x.0), px(y.0)));
+        (ScaledPixels(p.x.0), ScaledPixels(p.y.0))
+    };
+    let (x0, y0) = (bounds.origin.x, bounds.origin.y);
+    let (x1, y1) = (x0 + bounds.size.width, y0 + bounds.size.height);
+    let corners = [map(x0, y0), map(x1, y0), map(x0, y1), map(x1, y1)];
+    let min_x = corners.iter().map(|c| c.0.0).fold(f32::MAX, f32::min);
+    let max_x = corners.iter().map(|c| c.0.0).fold(f32::MIN, f32::max);
+    let min_y = corners.iter().map(|c| c.1.0).fold(f32::MAX, f32::min);
+    let max_y = corners.iter().map(|c| c.1.0).fold(f32::MIN, f32::max);
+    Bounds::from_corners(
+        crate::point(ScaledPixels(min_x), ScaledPixels(min_y)),
+        crate::point(ScaledPixels(max_x), ScaledPixels(max_y)),
+    )
 }
 
 impl Default for TransformationMatrix {

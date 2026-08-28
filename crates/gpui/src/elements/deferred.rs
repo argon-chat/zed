@@ -8,6 +8,7 @@ pub fn deferred(child: impl IntoElement) -> Deferred {
     Deferred {
         child: Some(child.into_any_element()),
         priority: 0,
+        clip_to_ancestors: false,
     }
 }
 
@@ -16,6 +17,7 @@ pub fn deferred(child: impl IntoElement) -> Deferred {
 pub struct Deferred {
     child: Option<AnyElement>,
     priority: usize,
+    clip_to_ancestors: bool,
 }
 
 impl Deferred {
@@ -24,6 +26,23 @@ impl Deferred {
     /// with higher values being drawn on top.
     pub fn with_priority(mut self, priority: usize) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Keep the CONTENT MASK in force where the element was deferred from.
+    ///
+    /// A deferred draw is replayed at the top of the frame, so by default it
+    /// escapes every ancestor's `overflow` clip along with their paint order —
+    /// which is what a popover or a context menu wants. CSS says something
+    /// narrower: a positioned element with a `z-index` escapes its siblings'
+    /// PAINT ORDER but is still clipped by the overflow of the ancestors it is
+    /// laid out inside. This opts into that reading.
+    ///
+    /// (Without it, a `z-index`ed page section inside a scrolling viewport
+    /// paints its overflow outside the viewport entirely — over whatever the
+    /// host draws below it.)
+    pub fn clip_to_ancestors(mut self, clip: bool) -> Self {
+        self.clip_to_ancestors = clip;
         self
     }
 }
@@ -62,7 +81,8 @@ impl Element for Deferred {
     ) {
         let child = self.child.take().unwrap();
         let element_offset = window.element_offset();
-        window.defer_draw(child, element_offset, self.priority, None)
+        let mask = self.clip_to_ancestors.then(|| window.content_mask());
+        window.defer_draw(child, element_offset, self.priority, mask)
     }
 
     fn paint(

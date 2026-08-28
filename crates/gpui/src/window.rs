@@ -3438,6 +3438,7 @@ impl Window {
                     rem_size,
                     absolute_offset,
                     element_transform,
+                    content_mask,
                     prepaint_range,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
@@ -3452,6 +3453,7 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.element_transform,
+                        deferred_draw.content_mask,
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -3461,10 +3463,19 @@ impl Window {
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
-                            window.with_absolute_element_transform(element_transform, |window| {
-                                window.with_absolute_element_offset(absolute_offset, |window| {
-                                    element.prepaint(window, cx);
-                                });
+                            // The mask BEFORE the transform: it was captured in
+                            // window space, and `with_content_mask` maps what it
+                            // is given through whatever transform is in force.
+                            window.with_content_mask(content_mask, |window| {
+                                window.with_absolute_element_transform(
+                                    element_transform,
+                                    |window| {
+                                        window.with_absolute_element_offset(
+                                            absolute_offset,
+                                            |window| element.prepaint(window, cx),
+                                        );
+                                    },
+                                );
                             });
                         });
                     });
@@ -3507,8 +3518,9 @@ impl Window {
             let element_transform = deferred_draw.element_transform;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_transform(element_transform, |window| {
-                        window.with_content_mask(content_mask, |window| {
+                    // Mask first, transform second — see the prepaint side.
+                    window.with_content_mask(content_mask, |window| {
+                        window.with_absolute_element_transform(element_transform, |window| {
                             window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                                 element.paint(window, cx);
                             });
@@ -3838,6 +3850,30 @@ impl Window {
         let result = f(self);
         self.element_transform = previous;
         result
+    }
+
+    /// The current content mask, expressed in the frame the CALLER is drawing in
+    /// — i.e. mapped BACK through the CSS `transform` in force.
+    ///
+    /// Painting code computes a primitive's rectangle in the element's own,
+    /// untransformed space (the shader is what applies the matrix), while
+    /// [`Window::content_mask`] is a window-space rect. Anything that decides
+    /// whether to emit a primitive at all by comparing the two has to bring
+    /// them into one frame first, and this is the cheap end to move.
+    ///
+    /// A singular matrix (`scale(0)`) has no inverse; the element is drawn to
+    /// nothing, so the mask is empty and everything is culled.
+    pub fn content_mask_in_element_space(&self) -> ContentMask<Pixels> {
+        let mask = self.content_mask();
+        if self.element_transform.is_unit() {
+            return mask;
+        }
+        match self.element_transform.inverse() {
+            Some(inverse) => ContentMask {
+                bounds: transform_bounds(inverse, mask.bounds, self.scale_factor),
+            },
+            None => ContentMask { bounds: Bounds::default() },
+        }
     }
 
     /// The composed transform of the element currently being painted. Identity

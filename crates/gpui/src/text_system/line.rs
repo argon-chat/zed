@@ -531,7 +531,11 @@ fn paint_line(
                     size: max_glyph_size,
                 };
 
-                let content_mask = window.content_mask();
+                // `max_glyph_bounds` is in the element's own space and the
+                // mask is in the window's; under a CSS `transform` those are
+                // different frames, and comparing them culls the glyphs of a
+                // transformed element against a region it does not live in.
+                let content_mask = window.content_mask_in_element_space();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
