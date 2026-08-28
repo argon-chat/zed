@@ -2516,7 +2516,16 @@ impl Window {
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    //
+    // vue-native: upstream gates this on `test`/`test-support`. Our devtools
+    // screenshot command is a first-class *product* feature that an agent
+    // drives against a normal (non-test) build, and a headless readback of the
+    // render target is strictly better than `PrintWindow` for it — it is the
+    // client area exactly, needs no invisible-border correction, and does not
+    // depend on DWM holding a live composition. So the gate is dropped rather
+    // than widened to another feature flag: a feature would have to be plumbed
+    // through `gpui`, `gpui_windows`, `gpui_macos` and `gpui_apple`, which is
+    // four more merge surfaces than deleting four attributes.
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)

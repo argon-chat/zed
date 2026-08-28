@@ -418,7 +418,7 @@ impl PlatformWindow for TestWindow {
         self.0.lock().sprite_atlas.clone()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    // vue-native: ungated, see `Window::render_to_image`.
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();

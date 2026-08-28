@@ -2139,7 +2139,7 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    // vue-native: ungated, see `Window::render_to_image`.
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
