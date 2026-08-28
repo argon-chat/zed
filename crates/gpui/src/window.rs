@@ -827,6 +827,42 @@ impl HitboxId {
     }
 }
 
+/// The axis-aligned bounding box of `bounds` after `matrix`.
+///
+/// `matrix` is a DEVICE-space transform (that is what the primitives carry)
+/// and `bounds` are logical pixels, so the corners are scaled in and back
+/// out again; at scale 1 the two cancel. Exact for a translation, a
+/// superset for a rotation — see the caller in
+/// [`Window::with_content_mask`].
+#[inline]
+fn transform_bounds(
+    matrix: TransformationMatrix,
+    bounds: Bounds<Pixels>,
+    scale_factor: f32,
+) -> Bounds<Pixels> {
+    if matrix.is_unit() {
+        return bounds;
+    }
+    // `TransformationMatrix::apply` is unit-agnostic (it multiplies the raw
+    // floats), so the conversion is explicit: logical in, device through the
+    // matrix, logical out.
+    let map = |p: Point<Pixels>| {
+        let d = matrix.apply(Point::new(px(p.x.0 * scale_factor), px(p.y.0 * scale_factor)));
+        Point::new(px(d.x.0 / scale_factor), px(d.y.0 / scale_factor))
+    };
+    let corners = [
+        map(bounds.origin),
+        map(bounds.top_right()),
+        map(bounds.bottom_left()),
+        map(bounds.bottom_right()),
+    ];
+    let min_x = corners.iter().map(|p| p.x).fold(Pixels::MAX, Pixels::min);
+    let max_x = corners.iter().map(|p| p.x).fold(Pixels::MIN, Pixels::max);
+    let min_y = corners.iter().map(|p| p.y).fold(Pixels::MAX, Pixels::min);
+    let max_y = corners.iter().map(|p| p.y).fold(Pixels::MIN, Pixels::max);
+    Bounds::from_corners(Point::new(min_x, min_y), Point::new(max_x, max_y))
+}
+
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [Window::insert_hitbox] for more details.
 #[derive(Clone, Debug, Deref)]
@@ -980,6 +1016,15 @@ pub(crate) struct DeferredDraw {
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
+    /// The CSS `transform` in force where the element was deferred FROM.
+    ///
+    /// A deferred draw is replayed at the top of the frame, where the transform
+    /// stack is empty — so without this, an element that escapes its siblings'
+    /// paint order (`position: fixed`, `z-index`) also escapes its ancestors'
+    /// transforms and paints somewhere nobody asked for. A `z-10` sticky header
+    /// inside a `translate(-50%, -50%)` dialog landed half the window away from
+    /// the dialog it belongs to.
+    element_transform: TransformationMatrix,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -1099,29 +1144,46 @@ impl Frame {
             .into_inner()
     }
 
-    pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+    pub(crate) fn hit_test(&self, position: Point<Pixels>, scale_factor: f32) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             // A transformed element keeps its untransformed `bounds`, so the
             // POINTER is mapped back into the element's own frame rather than
             // the rect being mapped forward into a polygon. That keeps the test
             // a rectangle containment (exact for rotation and scale alike) and
             // costs nothing at all when there is no transform.
             //
+            // The matrix is in DEVICE space (it is the same one the primitives
+            // carry), so the pointer goes there and back; at scale 1 the two
+            // conversions cancel and this is what it always was.
+            //
             // A singular matrix (`scale(0)`) has no inverse, which is the right
             // answer: an element scaled to nothing is not hittable, exactly as
             // in a browser.
-            let position = if hitbox.transformation.is_unit() {
+            let local = if hitbox.transformation.is_unit() {
                 position
             } else {
                 match hitbox.transformation.inverse() {
-                    Some(inverse) => inverse.apply(position),
+                    Some(inverse) => {
+                        let d = inverse.apply(Point::new(
+                            px(position.x.0 * scale_factor),
+                            px(position.y.0 * scale_factor),
+                        ));
+                        Point::new(px(d.x.0 / scale_factor), px(d.y.0 / scale_factor))
+                    }
                     None => continue,
                 }
             };
-            if bounds.contains(&position) {
+            // The CONTENT MASK is a window-space rect (see
+            // `Window::with_content_mask`, which maps it through the transform
+            // in force when it was pushed), so it is tested against the pointer
+            // as it came in — not against the element-local one. Testing both in
+            // one intersected rect was only right while transforms did not
+            // exist: a `translate(-50%, -50%)` dialog painted 500px to the left
+            // of a clip rect that had not moved, and every clipping element
+            // inside it hit-tested against a region it no longer covered.
+            if hitbox.content_mask.bounds.contains(&position) && hitbox.bounds.contains(&local) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -3221,7 +3283,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, self.scale_factor);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -3369,7 +3431,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    element_transform,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3381,6 +3451,7 @@ impl Window {
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
+                        deferred_draw.element_transform,
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -3390,8 +3461,10 @@ impl Window {
                 if let Some(mut element) = element {
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
-                            window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                            window.with_absolute_element_transform(element_transform, |window| {
+                                window.with_absolute_element_offset(absolute_offset, |window| {
+                                    element.prepaint(window, cx);
+                                });
                             });
                         });
                     });
@@ -3431,12 +3504,15 @@ impl Window {
 
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
+            let element_transform = deferred_draw.element_transform;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
+                    window.with_absolute_element_transform(element_transform, |window| {
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                element.paint(window, cx);
+                            });
+                        })
                     })
                 })
             } else {
@@ -3512,6 +3588,7 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
+                    element_transform: deferred_draw.element_transform,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -3631,6 +3708,28 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
+            // A clip rect is expressed in the element's OWN frame, and the
+            // element may be transformed — so the rect has to be mapped into
+            // window space before it can be intersected with an ancestor's.
+            // Without this a `transform: translate(-50%, -50%)` element paints
+            // its subtree half a box away from the region it clips it to, and
+            // everything that lands outside the old, unmoved rect disappears.
+            // (reka's dialog is exactly that shape: `fixed top-1/2 left-1/2
+            // translate-x-[-50%] translate-y-[-50%]` with a scrolling body
+            // inside, and it came up as a black slab with one stray line of
+            // text in the corner where the two rects happened to overlap.)
+            //
+            // Exact for a translation; a rotation or scale gives the axis-
+            // aligned bounding box of the mapped rect, which is a superset — a
+            // clip that shows a little too much rather than one that hides
+            // content that should be visible.
+            let mask = ContentMask {
+                bounds: transform_bounds(
+                    self.element_transform,
+                    mask.bounds,
+                    self.scale_factor,
+                ),
+            };
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
@@ -3705,6 +3804,25 @@ impl Window {
     /// follows the picture (see [`Frame::hit_test`]).
     ///
     /// The identity is free — it early-returns without touching the field.
+    /// Installs `transformation` as THE transform, discarding whatever is on the
+    /// stack, for the duration of `f`.
+    ///
+    /// The deferred-draw replay needs this rather than
+    /// [`Window::with_element_transform`]: it re-enters a subtree that was
+    /// prepainted somewhere else in the tree, so the transform it has to restore
+    /// is absolute, not something to compose onto the current one. Same
+    /// reasoning as [`Window::with_absolute_element_offset`].
+    pub fn with_absolute_element_transform<R>(
+        &mut self,
+        transformation: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = mem::replace(&mut self.element_transform, transformation);
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
     pub fn with_element_transform<R>(
         &mut self,
         transformation: TransformationMatrix,
@@ -4049,6 +4167,7 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
+            element_transform: self.element_transform,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
@@ -5499,7 +5618,7 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.rendered_frame.hit_test(self.mouse_position(), self.scale_factor);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
