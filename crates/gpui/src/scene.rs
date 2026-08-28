@@ -882,6 +882,16 @@ pub struct TransformSpec {
     pub rotate: f32,
     /// `scale()` about the element's centre. `(1.0, 1.0)` is no scale.
     pub scale: (f32, f32),
+    /// `transform-origin`, per axis, relative to the element's own border box —
+    /// the point `rotate()` and `scale()` act about. CSS's initial value is
+    /// `50% 50%`, i.e. `(Fraction(0.5), Fraction(0.5))`, which is what
+    /// [`TransformSpec::IDENTITY`] carries.
+    ///
+    /// Kept in the same authored unit as `translate` and for the same reason: a
+    /// percentage origin resolves against the element's own box, which is only
+    /// known at paint. Unlike `translate` it is measured from the box's
+    /// TOP-LEFT, not from its centre, because that is how CSS writes it.
+    pub origin: (TransformLength, TransformLength),
 }
 
 /// One axis of a [`TransformSpec`]'s `translate()`.
@@ -957,9 +967,18 @@ impl TransformSpec {
         translate: (TransformLength::ZERO, TransformLength::ZERO),
         rotate: 0.0,
         scale: (1.0, 1.0),
+        origin: Self::CENTRE_ORIGIN,
     };
 
+    /// CSS's initial `transform-origin: 50% 50%`.
+    pub const CENTRE_ORIGIN: (TransformLength, TransformLength) =
+        (TransformLength::Fraction(0.5), TransformLength::Fraction(0.5));
+
     /// Is this `transform: none` — nothing to apply, nothing to pay for?
+    ///
+    /// `transform-origin` is deliberately NOT part of the answer: an origin on
+    /// its own changes nothing, exactly as in CSS, and asking otherwise would
+    /// make every element that merely declares one pay for a matrix.
     pub fn is_identity(&self) -> bool {
         self.rotate == 0.0
             && self.scale == (1.0, 1.0)
@@ -982,6 +1001,10 @@ impl TransformSpec {
                 lerp(self.scale.0, other.scale.0),
                 lerp(self.scale.1, other.scale.1),
             ),
+            origin: (
+                self.origin.0.interpolate(other.origin.0, t),
+                self.origin.1.interpolate(other.origin.1, t),
+            ),
         }
     }
 
@@ -991,23 +1014,27 @@ impl TransformSpec {
     /// scale, rotate, then move back — plus the translate, which rides on the
     /// recentring so it is applied in the element's own frame.
     ///
-    /// The origin is the box's centre because that is CSS's initial
-    /// `transform-origin: 50% 50%`; a declared `transform-origin` is not
-    /// modelled.
+    /// The point rotate/scale act about is `origin`, resolved against the box
+    /// and measured from its top-left — CSS's `transform-origin`, whose initial
+    /// `50% 50%` lands exactly on the centre.
     pub fn to_matrix(self, bounds: Bounds<Pixels>, scale_factor: f32) -> TransformationMatrix {
-        let centre = bounds.center();
+        let anchor = bounds.origin
+            + Point::new(
+                px(self.origin.0.resolve(bounds.size.width.0)),
+                px(self.origin.1.resolve(bounds.size.height.0)),
+            );
         let translate = Point::new(
             px(self.translate.0.resolve(bounds.size.width.0)),
             px(self.translate.1.resolve(bounds.size.height.0)),
         );
         TransformationMatrix::unit()
-            .translate((centre + translate).scale(scale_factor))
+            .translate((anchor + translate).scale(scale_factor))
             .rotate(Radians(self.rotate))
             .scale(Size {
                 width: self.scale.0,
                 height: self.scale.1,
             })
-            .translate(centre.scale(-scale_factor))
+            .translate(anchor.scale(-scale_factor))
     }
 }
 

@@ -175,6 +175,92 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+/// One end of a CSS grid track's sizing function — the `a` or the `b` in
+/// `minmax(a, b)`.
+///
+/// This is the full set taffy can express for a *definite* track. `fit-content()`
+/// and `calc()` are absent: the first has no caller and the second is resolved
+/// before it reaches here.
+#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub enum GridTrackSize {
+    /// `auto`
+    #[default]
+    Auto,
+    /// `min-content`
+    MinContent,
+    /// `max-content`
+    MaxContent,
+    /// An absolute length, in logical pixels.
+    Px(f32),
+    /// A percentage of the container's track-axis size, as a FRACTION (`50%`
+    /// is `0.5`) — taffy's unit, not CSS's.
+    Percent(f32),
+    /// `<flex>` — `1fr` is `Fr(1.0)`. Only valid as the MAX of a track; a `fr`
+    /// minimum is invalid CSS and is normalised to `Auto` by the caller.
+    Fr(f32),
+}
+
+/// One track in a `grid-template-columns` / `grid-template-rows` list.
+///
+/// Always stored in its `minmax()` normal form, which is what CSS says every
+/// track sizing function means: a bare `1fr` is `minmax(auto, 1fr)`, a bare
+/// `200px` is `minmax(200px, 200px)`.
+#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct GridTrack {
+    /// The track's minimum size.
+    pub min: GridTrackSize,
+    /// The track's maximum size.
+    pub max: GridTrackSize,
+}
+
+impl GridTrack {
+    /// `minmax(size, size)` — the normal form of a bare, definite track.
+    pub fn fixed(size: GridTrackSize) -> Self {
+        Self {
+            min: size,
+            max: size,
+        }
+    }
+
+    /// `minmax(auto, <flex>)` — the normal form of a bare `<flex>` track.
+    pub fn fr(flex: f32) -> Self {
+        Self {
+            min: GridTrackSize::Auto,
+            max: GridTrackSize::Fr(flex),
+        }
+    }
+}
+
+/// CSS `grid-auto-flow`: which axis the auto-placement algorithm fills, and
+/// whether it backfills holes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub enum GridAutoFlow {
+    /// Fill each row in turn, adding rows as needed.
+    #[default]
+    Row,
+    /// Fill each column in turn, adding columns as needed.
+    Column,
+    /// `row dense`
+    RowDense,
+    /// `column dense`
+    ColumnDense,
+}
+
+/// CSS `outline`: a ring painted just outside the border box, taking no layout
+/// space. See [`Style::vn_outline`].
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Outline {
+    /// `outline-width`. Zero paints nothing.
+    pub width: Pixels,
+    /// `outline-offset` — the gap between the border box and the ring's INNER
+    /// edge. May be negative, which pulls the ring inside the box.
+    pub offset: Pixels,
+    /// `outline-color`.
+    pub color: Hsla,
+    /// `outline-style`, reduced to what gpui's quad can draw.
+    pub style: BorderStyle,
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -357,6 +443,40 @@ pub struct Style {
 
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,
+
+    /// CSS `grid-template-columns` as an ARBITRARY track list — `1fr auto`,
+    /// `minmax(0, 1fr) 200px`, `repeat(3, 1fr)` (expanded by the caller).
+    ///
+    /// Takes precedence over [`Style::grid_cols`], which stays as the cheap
+    /// `repeat(N, …)` shorthand the `Styled` helpers write. `None` means "this
+    /// element declared no track list", not "no columns".
+    pub vn_grid_cols: Option<Vec<GridTrack>>,
+
+    /// CSS `grid-template-rows` as an arbitrary track list. See
+    /// [`Style::vn_grid_cols`].
+    pub vn_grid_rows: Option<Vec<GridTrack>>,
+
+    /// CSS `grid-auto-flow` — the direction the auto-placement algorithm fills,
+    /// and whether it packs densely.
+    pub vn_grid_auto_flow: Option<GridAutoFlow>,
+
+    /// CSS `justify-items` — the inline-axis alignment this container gives its
+    /// children. (`align_items` is the block axis; taffy honours both, gpui only
+    /// ever exposed the second.)
+    pub vn_justify_items: Option<AlignItems>,
+
+    /// CSS `justify-self` — this item's own inline-axis alignment, overriding
+    /// its container's `justify-items`.
+    pub vn_justify_self: Option<AlignSelf>,
+
+    /// CSS `outline` — a ring painted OUTSIDE the border box that takes no
+    /// layout space at all, which is what makes it (and not a border) the right
+    /// primitive for a focus indicator.
+    ///
+    /// gpui has no outline in its scene; this is painted as one extra
+    /// border-only quad at dilated bounds, after the element's own border, so it
+    /// lands on top of the element and outside it. `None` = never declared.
+    pub vn_outline: Option<Outline>,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -883,6 +1003,40 @@ impl Style {
             ));
         }
 
+        // `outline` LAST, and at dilated bounds: CSS paints it outside the
+        // border box, over everything, and it takes no layout space — so it is
+        // one extra border-only quad rather than anything the box itself knows
+        // about. `dilate` by (offset + width) puts the ring's INNER edge at
+        // `offset` from the border box and its outer edge `width` beyond that,
+        // which is what `outline-offset` means.
+        //
+        // The corner radius grows with the dilation, so the ring stays
+        // concentric with a rounded box — the same rule Chromium applies.
+        if let Some(outline) = self
+            .vn_outline
+            .filter(|o| o.width > px(0.) && !o.color.is_transparent())
+        {
+            let grow = outline.offset + outline.width;
+            let ring = bounds.dilate(grow);
+            // Per corner: a square corner stays square (CSS does not round an
+            // outline the box did not round), a rounded one grows with the ring.
+            let radii = corner_radii.map(|r| {
+                if r.0 <= 0.0 {
+                    px(0.)
+                } else {
+                    px((r.0 + grow.0).max(0.0))
+                }
+            });
+            window.paint_quad(quad(
+                ring,
+                radii,
+                Hsla::transparent_black(),
+                Edges::all(outline.width),
+                outline.color,
+                outline.style,
+            ));
+        }
+
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.remove_global::<DebugBelow>();
@@ -943,6 +1097,12 @@ impl Default for Style {
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
+            vn_grid_cols: None,
+            vn_grid_rows: None,
+            vn_grid_auto_flow: None,
+            vn_justify_items: None,
+            vn_justify_self: None,
+            vn_outline: None,
 
             #[cfg(debug_assertions)]
             debug: false,

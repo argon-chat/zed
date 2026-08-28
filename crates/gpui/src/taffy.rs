@@ -480,6 +480,50 @@ impl ToTaffy<taffy::style::Style> for Style {
             .unwrap_or_default()
         }
 
+        // An ARBITRARY track list (`1fr auto`, `minmax(0,1fr) 200px`), which
+        // `to_grid_repeat`'s one-shape `repeat()` cannot express. Each track is
+        // already in `minmax()` normal form, so this is a straight translation.
+        fn to_track_size_min(size: crate::GridTrackSize) -> taffy::MinTrackSizingFunction {
+            use crate::GridTrackSize as G;
+            use taffy::MinTrackSizingFunction as M;
+            match size {
+                G::Auto => M::auto(),
+                G::MinContent => M::min_content(),
+                G::MaxContent => M::max_content(),
+                G::Px(v) => M::length(v),
+                G::Percent(v) => M::percent(v),
+                // `<flex>` is not a valid track MINIMUM in CSS; it computes to
+                // `auto` there, so it does here.
+                G::Fr(_) => M::auto(),
+            }
+        }
+        fn to_track_size_max(size: crate::GridTrackSize) -> taffy::MaxTrackSizingFunction {
+            use crate::GridTrackSize as G;
+            use taffy::MaxTrackSizingFunction as M;
+            match size {
+                G::Auto => M::auto(),
+                G::MinContent => M::min_content(),
+                G::MaxContent => M::max_content(),
+                G::Px(v) => M::length(v),
+                G::Percent(v) => M::percent(v),
+                G::Fr(v) => M::fr(v),
+            }
+        }
+        fn to_grid_tracks<T: taffy::style::CheapCloneStr>(
+            tracks: &Option<Vec<crate::GridTrack>>,
+        ) -> Option<Vec<taffy::GridTemplateComponent<T>>> {
+            tracks.as_ref().map(|list| {
+                list.iter()
+                    .map(|t| {
+                        taffy::GridTemplateComponent::Single(minmax(
+                            to_track_size_min(t.min),
+                            to_track_size_max(t.max),
+                        ))
+                    })
+                    .collect()
+            })
+        }
+
         taffy::style::Style {
             display: self.display.into(),
             overflow: self.overflow.into(),
@@ -503,8 +547,19 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            // An explicit track list wins over the `repeat(N, …)` shorthand.
+            grid_template_rows: to_grid_tracks(&self.vn_grid_rows)
+                .unwrap_or_else(|| to_grid_repeat(&self.grid_rows)),
+            grid_template_columns: to_grid_tracks(&self.vn_grid_cols)
+                .unwrap_or_else(|| to_grid_repeat(&self.grid_cols)),
+            grid_auto_flow: match self.vn_grid_auto_flow.unwrap_or_default() {
+                crate::GridAutoFlow::Row => taffy::GridAutoFlow::Row,
+                crate::GridAutoFlow::Column => taffy::GridAutoFlow::Column,
+                crate::GridAutoFlow::RowDense => taffy::GridAutoFlow::RowDense,
+                crate::GridAutoFlow::ColumnDense => taffy::GridAutoFlow::ColumnDense,
+            },
+            justify_items: self.vn_justify_items.map(|x| x.into()),
+            justify_self: self.vn_justify_self.map(|x| x.into()),
             grid_row: self
                 .grid_location
                 .as_ref()
