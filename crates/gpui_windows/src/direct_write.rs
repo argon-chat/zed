@@ -33,6 +33,19 @@ struct FontInfo {
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
+    /// The face's own variation-axis coordinates — `wght`, `wdth`, `ital`,
+    /// `slnt` and, when the font has one, `opsz`. DirectWrite reports these for
+    /// a STATIC face too (synthesized from its weight/width/slope), so this is
+    /// non-empty for essentially every face, and it is the exact description of
+    /// "the font that was selected" in axis matching's own vocabulary.
+    axis_values: Vec<DWRITE_FONT_AXIS_VALUE>,
+    /// The resource the face came from, kept so a differently-instanced face
+    /// can be built from it once the used font size is known. `None` for a face
+    /// too old to be an `IDWriteFontFace5`.
+    font_resource: Option<IDWriteFontResource>,
+    /// Does the font declare an `opsz` (optical size) axis? Only such a font
+    /// needs — or notices — the treatment in [`DirectWriteState::axes_for`].
+    has_optical_size: bool,
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -76,6 +89,11 @@ struct DirectWriteState {
     fonts: Vec<FontInfo>,
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
+    /// Faces instanced at an `opsz` other than the font's default, keyed by
+    /// `(FontId, font size bits)`. Filled by `layout_line`, which is the only
+    /// place that knows the used size, and read again by the rasteriser so a
+    /// glyph is DRAWN from the same optical size it was MEASURED at.
+    optical_faces: HashMap<(FontId, u32), IDWriteFontFace5>,
     layout_line_scratch: Vec<u16>,
 }
 
@@ -213,6 +231,7 @@ impl DirectWriteTextSystem {
                 fonts: Vec::new(),
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
+                optical_faces: HashMap::default(),
                 layout_line_scratch: Vec::new(),
             }),
         })
@@ -495,12 +514,23 @@ impl DirectWriteState {
                         .log_err()
                         .flatten()
                 });
+                // `CreateFontFace()` produces the face at its DEFAULT axis
+                // coordinates, so a variable font is shaped at whatever `opsz`
+                // its designer chose (14 for Inter) whatever size the text is,
+                // while CSS's `font-optical-sizing: auto` says the used font
+                // size. Reading the coordinates here is what makes the
+                // correction possible later, when the size is known.
+                let (axis_values, font_resource, has_optical_size) =
+                    unsafe { read_variations(&font_face) };
                 let font_info = FontInfo {
                     font_family_h: font_family_h.clone(),
                     font_face,
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
+                    axis_values,
+                    font_resource,
+                    has_optical_size,
                 };
                 Some(font_info)
             });
@@ -509,6 +539,62 @@ impl DirectWriteState {
             }
         }
         None
+    }
+
+    /// The axis coordinates `font_id` should be shaped at for text of
+    /// `font_size` — the face's own, with `opsz` moved to the used size when
+    /// the font has that axis.
+    ///
+    /// This is the whole of the optical-size fix, and the reason it is stated as
+    /// a FULL axis set rather than as `opsz` alone. Setting axis values on a
+    /// text format switches DirectWrite into axis matching, which is
+    /// all-or-nothing: the weight, stretch and style handed to
+    /// `CreateTextFormat` stop being consulted, and so does a later
+    /// `IDWriteTextLayout::SetFontWeight` on a range. Naming the selected
+    /// face's OWN `wght`/`wdth`/`ital`/`slnt` alongside the corrected `opsz`
+    /// asks axis matching for exactly the font that was already chosen — which
+    /// is why the bold heading stays bold instead of shaping at the family's
+    /// default weight.
+    fn axes_for(&self, font_id: FontId, font_size: f32) -> Vec<DWRITE_FONT_AXIS_VALUE> {
+        let info = &self.fonts[font_id.0];
+        axes_at_optical_size(&info.axis_values, info.has_optical_size, font_size)
+    }
+
+    /// Builds — once per `(font, size)` — the face DirectWrite will shape with,
+    /// so the RASTERISER can draw from the same one.
+    ///
+    /// Layout instances the face itself, from the axis values on the format;
+    /// `create_glyph_run_analysis` cannot, because it runs off a shared
+    /// reference and knows only a `FontId`. Doing it here, where the used size
+    /// is in hand, keeps the two in step — otherwise a glyph would be MEASURED
+    /// at `opsz = 31.5` and DRAWN at `opsz = 14`: right advances, wrong
+    /// outlines.
+    ///
+    /// The instance is also filed in `font_info_cache`, because the face that
+    /// comes back through `DrawGlyphRun` is this very COM object (DirectWrite
+    /// hands out the same instance for the same coordinates) and the reverse
+    /// lookup is by pointer.
+    fn instance_optical_face(&mut self, font_id: FontId, font_size: f32) {
+        let key = (font_id, font_size.to_bits());
+        if self.optical_faces.contains_key(&key) {
+            return;
+        }
+        let info = &self.fonts[font_id.0];
+        if !info.has_optical_size {
+            return;
+        }
+        let Some(resource) = info.font_resource.clone() else {
+            return;
+        };
+        let simulations = unsafe { info.font_face.GetSimulations() };
+        let axes = self.axes_for(font_id, font_size);
+        let Some(face) = unsafe { resource.CreateFontFace(simulations, &axes) }.log_err() else {
+            return;
+        };
+        if let Some(unknown) = face.cast::<IUnknown>().log_err() {
+            self.font_info_cache.insert(unknown.as_raw().addr(), font_id);
+        }
+        self.optical_faces.insert(key, face);
     }
 
     fn layout_line(
@@ -523,6 +609,19 @@ impl DirectWriteState {
                 font_size,
                 ..Default::default()
             });
+        }
+        // CSS `font-optical-sizing: auto` — the initial value, and what every
+        // browser does — instantiates a variable font's `opsz` axis at the USED
+        // font size. Nothing below is entered unless some font on this line
+        // actually has that axis, so a line of Segoe UI or Consolas takes the
+        // exact code path it took before, allocating nothing.
+        let optical = font_runs
+            .iter()
+            .any(|run| self.fonts[run.font_id.0].has_optical_size);
+        if optical {
+            for run in font_runs {
+                self.instance_optical_face(run.font_id, font_size.as_f32());
+            }
         }
         unsafe {
             self.layout_line_scratch.clear();
@@ -549,6 +648,15 @@ impl DirectWriteState {
                     .cast()?;
                 if let Some(ref fallbacks) = font_info.fallbacks {
                     format.SetFontFallback(fallbacks)?;
+                }
+                // The first run's axes go on the FORMAT, which is what the
+                // whole layout inherits; every later run overrides them on its
+                // own range below, because axis matching ignores the
+                // per-range weight/style once axes are in play.
+                if optical {
+                    format
+                        .cast::<IDWriteTextFormat3>()?
+                        .SetFontAxisValues(&self.axes_for(first_run.font_id, font_size.as_f32()))?;
                 }
 
                 let layout = components.factory.CreateTextLayout(
@@ -580,6 +688,9 @@ impl DirectWriteState {
                 )
             };
             let mut break_ligatures = true;
+            // `font_size` is shadowed inside the loop by the ligature-breaking
+            // `next_up()` variant; the axis values must use the line's own.
+            let line_font_size = font_size.as_f32();
             for run in &font_runs[1..] {
                 let font_info = &self.fonts[run.font_id.0];
                 let current_text = &text[utf8_offset..(utf8_offset + run.len)];
@@ -603,6 +714,21 @@ impl DirectWriteState {
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
+                // …and once axes are in play, the two calls above are INERT:
+                // axis matching stops consulting a range's weight and style, so
+                // this run would silently shape at the FIRST run's weight. It
+                // is exactly the failure a bold `<span>` inside a regular
+                // heading shows, and the reason the axis set has to be restated
+                // per range rather than only on the format.
+                if optical {
+                    text_layout.cast::<IDWriteTextLayout4>()?.SetFontAxisValues(
+                        // The line's own size, not the ligature-breaking
+                        // `next_up()` above: the rasteriser is keyed on the
+                        // former, and layout and raster must agree on `opsz`.
+                        &self.axes_for(run.font_id, line_font_size),
+                        text_range,
+                    )?;
+                }
 
                 break_ligatures = !break_ligatures;
             }
@@ -669,11 +795,23 @@ impl DirectWriteState {
         params: &RenderGlyphParams,
     ) -> Result<IDWriteGlyphRunAnalysis> {
         let font = &self.fonts[params.font_id.0];
+        // The face the LINE was measured with. `layout_line` instanced it at
+        // `opsz = used size` and filed it here; without this the glyph would be
+        // drawn from the font's default optical size while being positioned by
+        // advances taken from another one — right spacing, wrong outlines.
+        let shaping_face: &IDWriteFontFace3 = match self
+            .optical_faces
+            .get(&(params.font_id, params.font_size.as_f32().to_bits()))
+        {
+            Some(face) => face,
+            None => &font.font_face,
+        };
+        let run_face: &IDWriteFontFace = shaping_face;
         let glyph_id = [params.glyph_id.0 as u16];
         let advance = [0.0];
         let offset = [DWRITE_GLYPH_OFFSET::default()];
         let glyph_run = DWRITE_GLYPH_RUN {
-            fontFace: ManuallyDrop::new(Some(unsafe { std::ptr::read(&***font.font_face) })),
+            fontFace: ManuallyDrop::new(Some(unsafe { std::ptr::read(run_face) })),
             fontEmSize: params.font_size.as_f32(),
             glyphCount: 1,
             glyphIndices: glyph_id.as_ptr(),
@@ -699,7 +837,7 @@ impl DirectWriteState {
         let mut rendering_mode = DWRITE_RENDERING_MODE1::default();
         let mut grid_fit_mode = DWRITE_GRID_FIT_MODE::default();
         unsafe {
-            font.font_face.GetRecommendedRenderingMode(
+            shaping_face.GetRecommendedRenderingMode(
                 params.font_size.as_f32(),
                 // Using 96 as scale is applied by the transform
                 96.0,
@@ -1718,6 +1856,73 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
+/// `base` with its optical size moved to `font_size` — the arithmetic behind
+/// [`DirectWriteState::axes_for`], on its own so it can be tested without a
+/// device.
+///
+/// Every other axis is carried through UNCHANGED, and that is the whole point:
+/// setting axis values on a text format switches DirectWrite into axis
+/// matching, which is all-or-nothing — the weight, stretch and style handed to
+/// `CreateTextFormat` stop being consulted, and so does a later
+/// `IDWriteTextLayout::SetFontWeight` on a range. Naming the selected face's
+/// own `wght` alongside the corrected `opsz` asks axis matching for exactly the
+/// font that was already chosen, which is why a bold heading stays bold.
+fn axes_at_optical_size(
+    base: &[DWRITE_FONT_AXIS_VALUE],
+    has_optical_size: bool,
+    font_size: f32,
+) -> Vec<DWRITE_FONT_AXIS_VALUE> {
+    let mut axes = base.to_vec();
+    if !has_optical_size {
+        return axes;
+    }
+    match axes.iter_mut().find(|axis| axis.axisTag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE) {
+        Some(axis) => axis.value = font_size,
+        None => axes.push(DWRITE_FONT_AXIS_VALUE {
+            axisTag: DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE,
+            value: font_size,
+        }),
+    }
+    axes
+}
+
+/// Reads a selected face's variation state: its own axis coordinates, the
+/// resource it can be re-instanced from, and whether it has an `opsz` axis.
+///
+/// A face DirectWrite reports no axis values for — anything older than
+/// `IDWriteFontFace5` — comes back empty, and every path below treats that as
+/// "leave this font exactly as it was".
+unsafe fn read_variations(
+    font_face: &IDWriteFontFace3,
+) -> (Vec<DWRITE_FONT_AXIS_VALUE>, Option<IDWriteFontResource>, bool) {
+    let Ok(face) = font_face.cast::<IDWriteFontFace5>() else {
+        return (Vec::new(), None, false);
+    };
+    unsafe {
+        let count = face.GetFontAxisValueCount();
+        let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); count as usize];
+        if count == 0 || face.GetFontAxisValues(&mut values).log_err().is_none() {
+            return (Vec::new(), None, false);
+        }
+        let resource = face.GetFontResource().log_err();
+        // A STATIC face reports axis values too (synthesized from its weight,
+        // width and slope), so the presence of coordinates says nothing. What
+        // decides is whether the RESOURCE declares an `opsz` axis: only then
+        // does moving it change anything, and only then is a font one CSS's
+        // `font-optical-sizing: auto` has an opinion about.
+        let has_optical_size = resource.as_ref().is_some_and(|resource| {
+            let axes = resource.GetFontAxisCount();
+            let mut ranges = vec![DWRITE_FONT_AXIS_RANGE::default(); axes as usize];
+            resource.GetFontAxisRanges(&mut ranges).log_err().is_some()
+                && ranges.iter().any(|range| {
+                    range.axisTag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE
+                        && range.minValue < range.maxValue
+                })
+        });
+        (values, resource, has_optical_size)
+    }
+}
+
 fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {
     match style {
         FontStyle::Normal => DWRITE_FONT_STYLE_NORMAL,
@@ -1982,6 +2187,50 @@ mod tests {
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    /// CSS's `font-optical-sizing: auto` instantiates a variable font's `opsz`
+    /// at the USED font size; `CreateFontFace()` gives the face its designer's
+    /// default (14 for Inter), which is why our hero subtitle shaped 0.9%
+    /// wider than the browser's and wrapped a line early.
+    ///
+    /// The regression this pins is the OTHER half. Setting axis values switches
+    /// the format into axis matching, and axis matching ignores the weight the
+    /// format was created with — so an `opsz`-only list shapes every heading at
+    /// the family's default weight. The fix is to restate the selected face's
+    /// own axes and change only `opsz`.
+    #[test]
+    fn the_optical_size_axis_moves_and_the_others_do_not() {
+        use super::axes_at_optical_size;
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE,
+        };
+
+        let axis = |tag, value| DWRITE_FONT_AXIS_VALUE { axisTag: tag, value };
+        let inter_bold = [
+            axis(DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, 14.0),
+            axis(DWRITE_FONT_AXIS_TAG_WEIGHT, 700.0),
+        ];
+
+        let axes = axes_at_optical_size(&inter_bold, true, 31.5);
+        assert_eq!(axes.len(), 2, "no axis is added or dropped");
+        assert_eq!(axes[0].value, 31.5, "opsz becomes the used size");
+        assert_eq!(axes[1].value, 700.0, "…and the weight survives, or bold is not bold");
+
+        // A font with no optical size is left exactly as it was: a static
+        // family reports synthesized axis values, and rewriting them would be
+        // asking axis matching a question about a font that has no answer.
+        let unchanged = axes_at_optical_size(&inter_bold, false, 31.5);
+        assert_eq!(unchanged[0].value, 14.0);
+        assert_eq!(unchanged[1].value, 700.0);
+
+        // A variable font whose face reports no `opsz` coordinate but whose
+        // resource declares the axis still gets one.
+        let weight_only = [axis(DWRITE_FONT_AXIS_TAG_WEIGHT, 400.0)];
+        let axes = axes_at_optical_size(&weight_only, true, 15.75);
+        assert_eq!(axes.len(), 2);
+        assert_eq!(axes[1].axisTag, DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE);
+        assert_eq!(axes[1].value, 15.75);
+    }
 
     #[test]
     fn test_cluster_map() {
