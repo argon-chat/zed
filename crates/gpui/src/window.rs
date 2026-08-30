@@ -4217,6 +4217,29 @@ impl Window {
     pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
 
+        // `bounds` is the element's OWN rect; the content mask, the scene's
+        // layer stack and the draw-order tree are all in WINDOW space. Under a
+        // CSS `transform` those are different frames, and the layer's bounds
+        // are what `Scene::push_layer` hands the draw-order tree — so an
+        // untransformed rect asks "what am I on top of?" about a region the
+        // layer does not occupy, and every primitive inside it inherits that
+        // wrong answer.
+        //
+        // A glyph run is a layer (`text_system::line::paint_line`), which is
+        // how this shows up: reka's dialog is centred with
+        // `translate(-50%, -50%)`, so a button near its right edge paints its
+        // background from a correctly-mapped rect that overlaps the dialog
+        // panel — order above it — while its label's layer is opened half a
+        // dialog away, overlaps the panel not at all, and comes back with an
+        // order BELOW the button's own background. Same colour, same size,
+        // same mask: the label was painted, underneath its own pill. The
+        // effect is invisible for a small transform (the two rects still
+        // overlap) and total for a large one, which is exactly what
+        // `translate(-50%, -50%)` is.
+        //
+        // `with_content_mask` and `Scene::insert_primitive` already map here;
+        // this is the third rect that had to and did not.
+        let bounds = transform_bounds(self.element_transform, bounds, self.scale_factor);
         let content_mask = self.content_mask();
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
