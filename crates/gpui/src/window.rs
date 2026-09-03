@@ -913,7 +913,11 @@ impl Hitbox {
     /// Checks whether this hitbox would be hovered at `position`, regardless of the current input
     /// modality or mouse position.
     pub fn is_hovered_at(&self, position: Point<Pixels>, window: &Window) -> bool {
-        let hit_test = window.rendered_frame.hit_test(position);
+        // Our hit test maps the pointer back through each hitbox's transform, so
+        // it needs the window's scale factor (see `Frame::hit_test`).
+        let hit_test = window
+            .rendered_frame
+            .hit_test(position, window.scale_factor);
         hit_test
             .ids
             .iter()
