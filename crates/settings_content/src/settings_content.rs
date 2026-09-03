@@ -747,10 +747,10 @@ pub struct GitPanelSettingsContent {
     /// Default: false
     pub file_icons: Option<bool>,
 
-    /// Whether to show folder icons or chevrons for directories in the git panel.
+    /// What to show for directories in the git panel.
     ///
-    /// Default: true
-    pub folder_icons: Option<bool>,
+    /// Default: icon
+    pub folder_indicator: Option<FolderIndicator>,
 
     /// How and when the scrollbar should be displayed.
     ///
@@ -1176,10 +1176,10 @@ pub struct OutlinePanelSettingsContent {
     ///
     /// Default: true
     pub file_icons: Option<bool>,
-    /// Whether to show folder icons or chevrons for directories in the outline panel.
+    /// What to show for directories in the outline panel.
     ///
-    /// Default: true
-    pub folder_icons: Option<bool>,
+    /// Default: icon
+    pub folder_indicator: Option<FolderIndicator>,
     /// Whether to show the git status in the outline panel.
     ///
     /// Default: true
@@ -1210,6 +1210,13 @@ pub struct OutlinePanelSettingsContent {
     ///
     /// Default: 100
     pub expand_outlines_with_depth: Option<usize>,
+    /// Whether to hide symbols, excerpts and search matches in the outline panel
+    /// when a multi-buffer view (e.g. a diff or search results) is active,
+    /// showing only files and directories.
+    /// Does not affect single-file views.
+    ///
+    /// Default: false
+    pub multi_buffer_hide_symbols: Option<bool>,
 }
 
 #[derive(
@@ -1432,13 +1439,15 @@ pub struct ReplSettingsContent {
 /// Settings for configuring the which-key popup behaviour.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct WhichKeySettingsContent {
-    /// Whether to show the which-key popup when holding down key combinations
+    /// Whether to show the which-key popup when holding down key combinations.
+    /// When enabled, the pending keystrokes indicator remains visible, but its binding preview
+    /// popover is disabled.
     ///
     /// Default: false
     pub enabled: Option<bool>,
     /// Delay in milliseconds before showing the which-key popup.
     ///
-    /// Default: 700
+    /// Default: 1000
     pub delay_ms: Option<u64>,
 }
 
