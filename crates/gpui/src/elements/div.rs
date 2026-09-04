@@ -1464,6 +1464,44 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Report this element as disabled - a control, or a group of controls,
+    /// that does not accept input. Maps to AccessKit's `disabled` flag, which
+    /// is what UIA exposes as `IsEnabled = false`.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = Some(disabled);
+        self
+    }
+
+    /// Report this element as read-only: a text widget that allows focus and
+    /// selection but not editing.
+    fn aria_read_only(mut self, read_only: bool) -> Self {
+        self.interactivity().aria.read_only = Some(read_only);
+        self
+    }
+
+    /// Report this element as requiring a value before its form can be
+    /// submitted.
+    fn aria_required(mut self, required: bool) -> Self {
+        self.interactivity().aria.required = Some(required);
+        self
+    }
+
+    /// Report this element as an explicitly modal dialog - assistive
+    /// technology confines the user to its subtree while it is open.
+    fn aria_modal(mut self, modal: bool) -> Self {
+        self.interactivity().aria.modal = Some(modal);
+        self
+    }
+
+    /// Exclude this element and its descendants from the tree presented to
+    /// assistive technology, and from accessibility hit testing. This is the
+    /// web's `aria-hidden="true"`, and it is a stronger statement than simply
+    /// omitting a role: the subtree goes away too.
+    fn aria_hidden(mut self, hidden: bool) -> Self {
+        self.interactivity().aria.hidden = Some(hidden);
+        self
+    }
+
     /// Register a handler for an accessibility action on this element.
     /// The handler is called when a screen reader requests the given action.
     ///
@@ -2102,6 +2140,11 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+    pub(crate) disabled: Option<bool>,
+    pub(crate) read_only: Option<bool>,
+    pub(crate) required: Option<bool>,
+    pub(crate) modal: Option<bool>,
+    pub(crate) hidden: Option<bool>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3579,6 +3622,33 @@ impl Interactivity {
         }
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
+        }
+        // The flag properties. AccessKit models these as set/clear rather than
+        // as an `Option`, so an explicit `false` clears rather than writes.
+        match self.aria.disabled {
+            Some(true) => node.set_disabled(),
+            Some(false) => node.clear_disabled(),
+            None => {}
+        }
+        match self.aria.read_only {
+            Some(true) => node.set_read_only(),
+            Some(false) => node.clear_read_only(),
+            None => {}
+        }
+        match self.aria.required {
+            Some(true) => node.set_required(),
+            Some(false) => node.clear_required(),
+            None => {}
+        }
+        match self.aria.modal {
+            Some(true) => node.set_modal(),
+            Some(false) => node.clear_modal(),
+            None => {}
+        }
+        match self.aria.hidden {
+            Some(true) => node.set_hidden(),
+            Some(false) => node.clear_hidden(),
+            None => {}
         }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
