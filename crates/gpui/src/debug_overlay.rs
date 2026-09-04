@@ -4,7 +4,7 @@
 
 use crate::{
     BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
-    Size, point, rgba, size, transparent_black,
+    Size, TransformationMatrix, point, rgba, size, transparent_black,
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -225,6 +225,10 @@ fn solid_quad(
         border_color: transparent_black(),
         corner_radii: Corners::default(),
         border_widths: Edges::default(),
+        // The overlay paints in device space and never rotates; `unit()` is
+        // what "no transform" spells since the transforms patch made this
+        // field required on `Quad`.
+        transformation: TransformationMatrix::unit(),
     }
 }
 
