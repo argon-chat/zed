@@ -1055,6 +1055,16 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// vue-native fork: the hitboxes inserted while [`Window::hitbox_tag`] was
+    /// non-zero, paired with the tag in force.
+    ///
+    /// An embedder that mirrors its own retained tree into gpui elements has no
+    /// other way to get from one of ITS node ids to the hitbox gpui made for it
+    /// — and without that, `Hitbox::is_hovered_at` (the only public door onto
+    /// gpui's hit test) cannot be asked about a node. Insertion order is
+    /// preserved, and an element's own hitbox is inserted before any of its
+    /// descendants', so the FIRST entry for a tag is that node's own box.
+    pub(crate) vn_tagged_hitboxes: Vec<(u32, Hitbox)>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1101,6 +1111,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            vn_tagged_hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1129,6 +1140,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.vn_tagged_hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1279,6 +1291,15 @@ pub struct Window {
     /// is one saved value per frame of the paint recursion and lives on the
     /// Rust stack instead.
     pub(crate) element_transform: TransformationMatrix,
+    /// vue-native fork: the embedder node id every hitbox inserted from here
+    /// down is recorded under (0 = record nothing). See
+    /// [`Frame::vn_tagged_hitboxes`].
+    vn_hitbox_tag: u32,
+    /// vue-native fork: while set, EVERY element gets a hitbox, not only an
+    /// interactive one — the same thing gpui's own inspector does while it is
+    /// picking, and for the same reason: a hit test can only answer for a node
+    /// that has a hitbox.
+    vn_tag_every_hitbox: bool,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2128,6 +2149,8 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             element_transform: TransformationMatrix::unit(),
+            vn_hitbox_tag: 0,
+            vn_tag_every_hitbox: false,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -5408,7 +5431,51 @@ impl Window {
             transformation: self.element_transform,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
+        // vue-native fork.
+        if self.vn_hitbox_tag != 0 {
+            self.next_frame
+                .vn_tagged_hitboxes
+                .push((self.vn_hitbox_tag, hitbox.clone()));
+        }
         hitbox
+    }
+
+    /// vue-native fork: tag every hitbox inserted from now until the tag is set
+    /// back, with an embedder node id. Returns the previous tag, which the
+    /// caller must restore — the pair brackets one node's prepaint, so a child
+    /// tags itself and hands the parent's tag back on the way out.
+    ///
+    /// `0` disables tagging. See [`Frame::vn_tagged_hitboxes`].
+    pub fn set_hitbox_tag(&mut self, tag: u32) -> u32 {
+        mem::replace(&mut self.vn_hitbox_tag, tag)
+    }
+
+    /// vue-native fork: give EVERY element a hitbox, not only an interactive
+    /// one, so that [`Window::tagged_hitbox`] can answer for any node. Costs
+    /// one `Hitbox` per element per frame and the same number of rectangle
+    /// tests per mouse move, so it is opt-in; a dev host turns it on at boot
+    /// and a shipped one never does.
+    pub fn set_tag_every_hitbox(&mut self, on: bool) {
+        self.vn_tag_every_hitbox = on;
+    }
+
+    /// vue-native fork: is [`Window::set_tag_every_hitbox`] on?
+    pub fn tags_every_hitbox(&self) -> bool {
+        self.vn_tag_every_hitbox
+    }
+
+    /// vue-native fork: the hitbox the RENDERED frame made for the element
+    /// tagged `tag` — the handle [`Hitbox::is_hovered_at`] takes.
+    ///
+    /// The first entry wins: an element's own hitbox is inserted before any box
+    /// its subtree makes, and boxes a node's build produces internally (a
+    /// pseudo-element, a list marker) carry the same tag.
+    pub fn tagged_hitbox(&self, tag: u32) -> Option<&Hitbox> {
+        self.rendered_frame
+            .vn_tagged_hitboxes
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, hitbox)| hitbox)
     }
 
     /// Set a hitbox which will act as a control area of the platform window.

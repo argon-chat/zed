@@ -677,6 +677,17 @@ impl Interactivity {
         self.hover_listener_mode = mode;
     }
 
+    /// vue-native fork: sets how the `hover` / `group_hover` STYLE rungs respond
+    /// to key presses while the mouse is stationary. [`Self::hover_listener_mode`]
+    /// covers the `on_hover` callback; this covers the painted style, which
+    /// `compute_style` decides from the hitbox on its own.
+    pub fn hover_style_mode(&mut self, mode: HoverListenerMode)
+    where
+        Self: Sized,
+    {
+        self.hover_style_mode = mode;
+    }
+
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
     /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip`].
     pub fn tooltip(&mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static)
@@ -1633,6 +1644,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// vue-native fork: the fluent form of [`Interactivity::hover_style_mode`].
+    fn hover_style_mode(mut self, mode: HoverListenerMode) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().hover_style_mode(mode);
+        self
+    }
+
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
     /// The fluent API equivalent to [`Interactivity::tooltip`].
     fn tooltip(mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self
@@ -1703,9 +1723,15 @@ pub enum HoverListenerMode {
 
 impl HoverListenerMode {
     fn is_hovered(self, hitbox: &Hitbox, window: &Window) -> bool {
+        self.is_hovered_id(hitbox.id, window)
+    }
+
+    /// vue-native fork: the same question asked of a bare [`HitboxId`], which is
+    /// all a GROUP hover has (`GroupHitboxes` stores ids, not hitboxes).
+    fn is_hovered_id(self, id: HitboxId, window: &Window) -> bool {
         match self {
-            Self::InputModalityAware => hitbox.is_hovered(window),
-            Self::InputModalityIndependent => hitbox.id.is_hovered_ignoring_last_input(window),
+            Self::InputModalityAware => id.is_hovered(window),
+            Self::InputModalityIndependent => id.is_hovered_ignoring_last_input(window),
         }
     }
 }
@@ -2132,6 +2158,17 @@ pub struct Interactivity {
     pub(crate) drag_listener: Option<DragListener>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) hover_listener_mode: HoverListenerMode,
+    /// vue-native fork. Upstream's `hover_listener_mode` governs the `on_hover`
+    /// CALLBACK only, and says so; this governs the `hover_style` /
+    /// `group_hover_style` RUNGS, which are decided independently in
+    /// `compute_style`. Two fields rather than one widened field so upstream's
+    /// documented contract keeps meaning exactly what it says and the merge
+    /// stays textual.
+    ///
+    /// It exists because CSS `:hover` is pointer geometry and nothing else: a
+    /// browser does not drop a hover highlight because the user typed. See
+    /// vue-native docs/ARCHITECTURE.md §11 item 12.
+    pub(crate) hover_style_mode: HoverListenerMode,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
     pub(crate) window_control: Option<WindowControlArea>,
@@ -2380,6 +2417,9 @@ impl Interactivity {
             || !self.drop_listeners.is_empty()
             || !self.drag_over_styles.is_empty()
             || self.tooltip_builder.is_some()
+            // vue-native fork: an embedder that wants gpui's hit test for every
+            // one of its nodes needs a hitbox on every one of them.
+            || window.tags_every_hitbox()
             || window.is_inspector_picking(cx)
     }
 
@@ -2801,8 +2841,10 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
+            let hover_style_mode = self.hover_style_mode;
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
+                // vue-native fork: agrees with `compute_style` above.
+                let hovered = hover_style_mode.is_hovered(&hitbox, window);
                 let was_hovered = hover_state
                     .as_ref()
                     .is_some_and(|state| state.borrow().element);
@@ -2823,8 +2865,10 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
 
+                let hover_style_mode = self.hover_style_mode;
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    let group_hovered = group_hitbox_id.is_hovered(window);
+                    // vue-native fork: agrees with `compute_style` above.
+                    let group_hovered = hover_style_mode.is_hovered_id(group_hitbox_id, window);
                     let was_group_hovered = hover_state
                         .as_ref()
                         .is_some_and(|state| state.borrow().group);
@@ -3379,7 +3423,9 @@ impl Interactivity {
             if let Some(group_hover) = self.group_hover_style.as_ref() {
                 let is_group_hovered =
                     if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
-                        !window.last_input_was_touch() && group_hitbox_id.is_hovered(window)
+                        // vue-native fork: `hover_style_mode`, not `is_hovered`.
+                        !window.last_input_was_touch()
+                            && self.hover_style_mode.is_hovered_id(group_hitbox_id, window)
                     } else if let Some(element_state) = element_state.as_ref() {
                         !window.last_input_was_touch()
                             && element_state
@@ -3398,7 +3444,9 @@ impl Interactivity {
 
             if let Some(hover_style) = self.hover_style.as_ref() {
                 let is_hovered = if let Some(hitbox) = hitbox {
-                    !window.last_input_was_touch() && hitbox.is_hovered(window)
+                    // vue-native fork: `hover_style_mode`, not `is_hovered`.
+                    !window.last_input_was_touch()
+                        && self.hover_style_mode.is_hovered(hitbox, window)
                 } else if let Some(element_state) = element_state.as_ref() {
                     !window.last_input_was_touch()
                         && element_state
