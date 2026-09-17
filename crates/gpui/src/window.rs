@@ -1082,6 +1082,10 @@ pub(crate) struct Frame {
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
+    /// vue-native fork: the embedder's tagged-hitbox list is a frame structure
+    /// like `hitboxes` beside it, so a reused prepaint span has to carry its
+    /// slice forward too — see [`Window::reuse_prepaint`].
+    vn_tagged_hitboxes_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
@@ -3759,6 +3763,8 @@ impl Window {
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
+            // vue-native fork.
+            vn_tagged_hitboxes_index: self.next_frame.vn_tagged_hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
@@ -3770,6 +3776,17 @@ impl Window {
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                .iter()
+                .cloned(),
+        );
+        // vue-native fork: the tags travel with the hitboxes they name. Without
+        // this line a cached subtree keeps its hitboxes — so it still hovers and
+        // still takes clicks — while `Window::tagged_hitbox` answers `None` for
+        // every node inside it, which is what the embedder's element picker,
+        // highlight overlay and `:hover` reporting are built on.
+        self.next_frame.vn_tagged_hitboxes.extend(
+            self.rendered_frame.vn_tagged_hitboxes
+                [range.start.vn_tagged_hitboxes_index..range.end.vn_tagged_hitboxes_index]
                 .iter()
                 .cloned(),
         );
