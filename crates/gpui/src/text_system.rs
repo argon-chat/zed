@@ -62,6 +62,28 @@ pub fn underline_y_offset(line_height: Pixels, ascent: Pixels, descent: Pixels) 
 
 const MAX_REPORTED_MISSING_GLYPHS: usize = 1024;
 
+/// vue-native fork: the font a letter-spaced run is shaped with.
+///
+/// CSS Text 3 §8.2: when letter-spacing makes the space between two characters
+/// non-zero, user agents should not apply optional ligatures. Since zed#62338
+/// DirectWrite gets `liga`/`clig` on every run, and `apply_spacing_to_layout`
+/// adds tracking once per glyph cluster — so an `fi` ligature would take ONE
+/// gap where its two letters take two. An explicit `liga`/`clig` in the run's
+/// own features (`font-feature-settings`) is left to win, as it does in Chrome.
+fn spacing_font(font: &Font, tracking: Pixels) -> Cow<'_, Font> {
+    let features = font.features.tag_value_list();
+    if tracking == px(0.) || features.iter().any(|(tag, _)| tag == "liga" || tag == "clig") {
+        return Cow::Borrowed(font);
+    }
+    let mut features = features.to_vec();
+    features.push(("liga".into(), 0));
+    features.push(("clig".into(), 0));
+    Cow::Owned(Font {
+        features: FontFeatures(Arc::new(features)),
+        ..font.clone()
+    })
+}
+
 /// The spacing behavior required of a fallback font.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FallbackFontClass {
@@ -809,7 +831,7 @@ impl WindowTextSystem {
                     true
                 };
 
-                let font_id = self.resolve_font(&run.font);
+                let font_id = self.resolve_font(&spacing_font(&run.font, run.tracking));
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && !decoration_changed
@@ -927,7 +949,7 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font(&spacing_font(&run.font, run.tracking));
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
@@ -1018,7 +1040,7 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font(&spacing_font(&run.font, run.tracking));
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
@@ -1084,7 +1106,7 @@ impl WindowTextSystem {
                 true
             };
 
-            let font_id = self.resolve_font(&run.font);
+            let font_id = self.resolve_font(&spacing_font(&run.font, run.tracking));
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed

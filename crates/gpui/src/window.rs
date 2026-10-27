@@ -4511,6 +4511,9 @@ impl Window {
         result
     }
 
+    /// vue-native fork: composes `transformation` onto the current element
+    /// transform (the child's own transform applied first) for the duration of
+    /// `f`. A unit transform is free.
     pub fn with_element_transform<R>(
         &mut self,
         transformation: TransformationMatrix,
