@@ -1,7 +1,7 @@
 @group(1) @binding(0) var t_instances: texture_2d<u32>;
 
-// Each texel of `t_instances` packs four 32-bit words of instance data. Records
-// are read strictly front to back, so all readers share a cursor that keeps the
+// Each texel of `t_instances` packs four 32-bit words of instance data. Most
+// records are read strictly front to back through a cursor that keeps the
 // most recently fetched texel and only touches the texture again when the next
 // word crosses a texel boundary. This fetches each texel exactly once per
 // record load instead of once per word. The `read_*` functions must therefore
@@ -160,6 +160,10 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 fn load_quad(instance_id: u32) -> Quad {
     // 85 words: 22 + the 57 of `Background` + the 6 of the vue-native
     // `transformation` field.
+    //
+    // vue-native fork: upstream (zed#64337) replaced this with a fixed
+    // 10-texel decoder for ITS 40-word quad. Our quad is 85 words with an
+    // 8-stop `Background`, so the cursor stays; gpui_web is not in our build.
     var cursor = instance_cursor(instance_id * 85u);
     return Quad(
         read_word(&cursor),
@@ -226,10 +230,10 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
+        read_atlas_tile(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_hsla(&cursor),
-        read_atlas_tile(&cursor),
         read_transformation(&cursor),
     );
 }
@@ -239,12 +243,12 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
+        read_atlas_tile(&cursor),
         read_word(&cursor),
         read_f32(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
-        read_atlas_tile(&cursor),
         read_transformation(&cursor),
     );
 }

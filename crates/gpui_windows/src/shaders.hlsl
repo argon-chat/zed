@@ -164,12 +164,12 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
 
 // Convert linear RGB to sRGB
 float3 linear_to_srgb(float3 color) {
-    return pow(color, float3(2.2, 2.2, 2.2));
+    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
 // Convert sRGB to linear RGB
 float3 srgb_to_linear(float3 color) {
-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    return pow(color, float3(2.2, 2.2, 2.2));
 }
 
 /// Hsla to linear RGBA conversion.
@@ -1502,10 +1502,10 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 struct MonochromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
     Hsla color;
-    AtlasTile tile;
     TransformationMatrix transformation;
 };
 
@@ -1575,15 +1575,16 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 struct PolychromeSprite {
     uint order;
     uint pad;
+    AtlasTile tile;
     uint grayscale;
     float opacity;
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
-    AtlasTile tile;
     // See `struct Quad`. The monochrome and subpixel sprites have carried one
     // since gpui's SVG element; this is the one that was missing, and it is
-    // what rotates an <img> (or a colour emoji) with its box.
+    // what rotates an <img> (or a colour emoji) with its box. Kept last; must
+    // mirror `gpui::PolychromeSprite` field for field (zed#65814 moved `tile`).
     TransformationMatrix transformation;
 };
 

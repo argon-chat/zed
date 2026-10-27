@@ -83,7 +83,9 @@ struct GPUState {
 }
 
 struct DirectWriteState {
-    gpu_state: GPUState,
+    /// Used to rasterize color glyphs. `None` while the platform is headless: shaping and
+    /// layout don't need a GPU, and nothing is drawn.
+    gpu_state: Option<GPUState>,
     system_font_collection: IDWriteFontCollection1,
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
@@ -181,7 +183,8 @@ impl GPUState {
 }
 
 impl DirectWriteTextSystem {
-    pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
+    /// Creates the text system, able to rasterize color glyphs once it has `directx_devices`.
+    pub(crate) fn new(directx_devices: Option<&DirectXDevices>) -> Result<Self> {
         let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
         // Windows 10 Creators Update, which consequently requires the entire
@@ -194,7 +197,7 @@ impl DirectWriteTextSystem {
         let locale = HSTRING::from_wide(&locale);
         let text_renderer = TextRendererWrapper::new(locale.clone());
 
-        let gpu_state = GPUState::new(directx_devices)?;
+        let gpu_state = directx_devices.map(GPUState::new).transpose()?;
 
         let system_subpixel_rendering = get_system_subpixel_rendering();
         let system_ui_font_name = get_system_ui_font_name();
@@ -237,8 +240,15 @@ impl DirectWriteTextSystem {
         })
     }
 
+    /// Uses `directx_devices` to rasterize color glyphs, replacing any previous devices, for
+    /// example after the device was lost.
     pub(crate) fn handle_gpu_lost(&self, directx_devices: &DirectXDevices) -> Result<()> {
         self.state.write().handle_gpu_lost(directx_devices)
+    }
+
+    /// Releases the GPU state, when the platform switches to headless mode.
+    pub(crate) fn release_gpu(&self) {
+        self.state.write().gpu_state = None;
     }
 }
 
@@ -1023,6 +1033,10 @@ impl DirectWriteState {
         // (`Map`/`Unmap`/`Draw`/`CopyResource`), which `DirectXRenderer` and `DirectXAtlas` also
         // touch. An immediate `ID3D11DeviceContext` is not thread-safe, so this must only run on
         // the main UI thread (which it always is; text rasterization never leaves that thread).
+        let gpu_state = self
+            .gpu_state
+            .as_ref()
+            .context("rasterizing color glyphs needs a GPU, which headless mode has none of")?;
         let bitmap_size = glyph_bounds.size;
         let subpixel_shift = params
             .subpixel_variant
@@ -1119,7 +1133,7 @@ impl DirectWriteState {
                     };
                     let bounds = bounds(point(color_bounds.left, color_bounds.top), color_size);
                     glyph_layers.push(GlyphLayerTexture::new(
-                        &self.gpu_state,
+                        gpu_state,
                         run_color,
                         bounds,
                         &alpha_data,
@@ -1134,8 +1148,6 @@ impl DirectWriteState {
                 break;
             }
         }
-
-        let gpu_state = &self.gpu_state;
 
         let render_target_texture = {
             let mut texture = None;
@@ -1422,7 +1434,7 @@ impl DirectWriteState {
         try_to_recover_from_device_lost(|| {
             GPUState::new(directx_devices).context("Recreating GPU state for DirectWrite")
         })
-        .map(|gpu_state| self.gpu_state = gpu_state)
+        .map(|gpu_state| self.gpu_state = Some(gpu_state))
     }
 }
 
@@ -1992,21 +2004,21 @@ fn apply_font_features(
     features: &FontFeatures,
 ) -> Result<()> {
     let tag_values = features.tag_value_list();
-    // An EMPTY typography object leaves DirectWrite's own default feature set
-    // in force, so a caller that asked for nothing is better served by not
-    // touching it at all — measured: adding the four features below to an empty
-    // typography changes no advance on this host. It also matters for scripts
-    // this app does not use: the default set for Arabic or Devanagari carries
-    // `rlig`/`mark`/`mkmk`, and listing four Latin features would drop them.
-    if tag_values.is_empty() {
-        return Ok(());
-    }
 
     // `SetTypography` REPLACES the default feature set for the range it covers,
     // which is why `liga`, `clig` and `calt` are re-added below even though
     // nothing asked for them. `kern` belongs in that list for exactly the same
     // reason and was missing, so an app that wrote ANY `font-feature-settings`
     // lost kerning as a side effect.
+    //
+    // An EMPTY typography replaces them too — the vue-native fork used to keep
+    // an early return here on the belief that it did not, and zed#62338 removed
+    // it. Measured on Windows 11 (IDWriteTextLayout, 48px, none / empty / these
+    // four): Calibri 580.69 / 601.88 / 580.69 px and 4 / 0 / 4 ligature
+    // clusters, Segoe UI 633.14 / 652.52 / 633.14 px (kerning gone), while
+    // Arabic (Segoe UI) and Devanagari (Nirmala UI) are identical in all
+    // three — the script-required features are not part of what this replaces.
+    // So these four are exactly DirectWrite's defaults, and every run gets them.
     let mut feature_liga = make_direct_write_feature("liga", 1);
     let mut feature_clig = make_direct_write_feature("clig", 1);
     let mut feature_calt = make_direct_write_feature("calt", 1);
@@ -2272,7 +2284,7 @@ mod tests {
     #[test]
     fn color_emoji_rasterization_is_stable_across_batches() -> Result<()> {
         let devices = DirectXDevices::new()?;
-        let text_system = DirectWriteTextSystem::new(&devices)?;
+        let text_system = DirectWriteTextSystem::new(Some(&devices))?;
 
         let font = Font {
             family: "Segoe UI Emoji".into(),

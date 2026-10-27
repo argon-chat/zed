@@ -36,9 +36,12 @@ pub struct WorkspaceSettings {
     pub on_new_window: settings::OnNewWindow,
     pub on_last_window_closed: settings::OnLastWindowClosed,
     pub text_rendering_mode: settings::TextRenderingMode,
+    pub use_display_p3: bool,
     pub resize_all_panels_in_dock: Vec<DockPosition>,
     pub close_on_file_delete: bool,
     pub close_panel_on_toggle: bool,
+    pub window_title_format: String,
+    pub window_title_separator: String,
     pub use_system_window_tabs: bool,
     pub fullscreen_mode: settings::FullscreenMode,
     pub zoomed_padding: bool,
@@ -133,6 +136,7 @@ impl Settings for WorkspaceSettings {
             on_new_window: workspace.on_new_window.unwrap(),
             on_last_window_closed: workspace.on_last_window_closed.unwrap(),
             text_rendering_mode: workspace.text_rendering_mode.unwrap(),
+            use_display_p3: workspace.use_display_p3.unwrap(),
             resize_all_panels_in_dock: workspace
                 .resize_all_panels_in_dock
                 .clone()
@@ -142,6 +146,8 @@ impl Settings for WorkspaceSettings {
                 .collect(),
             close_on_file_delete: workspace.close_on_file_delete.unwrap(),
             close_panel_on_toggle: workspace.close_panel_on_toggle.unwrap(),
+            window_title_format: workspace.window_title_format.clone().unwrap(),
+            window_title_separator: workspace.window_title_separator.clone().unwrap(),
             use_system_window_tabs: workspace.use_system_window_tabs.unwrap(),
             fullscreen_mode: workspace.fullscreen_mode.unwrap(),
             zoomed_padding: workspace.zoomed_padding.unwrap(),

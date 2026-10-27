@@ -16,15 +16,15 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
-    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
-    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, BackGestureEvent, Bounds, ClickEvent,
+    DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
+    ExternalDragPayloadSource, FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox,
+    HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, LongPressEvent,
+    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Size, Style, StyleRefinement,
+    Styled, Task, TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -32,7 +32,7 @@ use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -328,6 +328,28 @@ impl Interactivity {
             }));
     }
 
+    /// Bind the given callback to [`FileDropEvent::Exited`] when a platform file drag
+    /// leaves this element's window while the element is hovered.
+    ///
+    /// This is a window-local exit event, not notification that the platform drag session ended.
+    /// The imperative API equivalent to [`InteractiveElement::on_file_drop_exit`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_file_drop_exit(
+        &mut self,
+        listener: impl Fn(&FileDropEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.file_drop_exit_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && matches!(event, FileDropEvent::Exited)
+                    && hitbox.id.is_hovered_ignoring_last_input(window)
+                {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
     /// Bind the given callback to the mouse drag event of the given type. Note that this
     /// will be called for all move events, inside or outside of this element, as long as the
     /// drag was started with this element under the mouse. Useful for implementing draggable
@@ -361,20 +383,26 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to scroll wheel events during the bubble phase.
-    /// The imperative API equivalent to [`InteractiveElement::on_scroll_wheel`].
+    /// Bind the given callback to scroll events during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_scroll`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    pub fn on_scroll_wheel(
-        &mut self,
-        listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
-    ) {
-        self.scroll_wheel_listeners
+    pub fn on_scroll(&mut self, listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static) {
+        self.scroll_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     (listener)(event, window, cx);
                 }
             }));
+    }
+
+    /// The former name of [`Interactivity::on_scroll`].
+    #[deprecated(note = "renamed to `on_scroll`")]
+    pub fn on_scroll_wheel(
+        &mut self,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.on_scroll(listener);
     }
 
     /// Bind the given callback to pinch gesture events during the bubble phase.
@@ -385,6 +413,24 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind the given callback to back-navigation gestures that start over this element.
+    /// The imperative API equivalent to [`InteractiveElement::on_back_gesture`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_back_gesture(
+        &mut self,
+        listener: impl Fn(&BackGestureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.back_gesture_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
                 }
             }));
     }
@@ -432,6 +478,7 @@ impl Interactivity {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     #[track_caller]
+    #[inline(always)]
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
         self.action_listeners.push((
             TypeId::of::<A>(),
@@ -535,10 +582,7 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
-        self.modifiers_changed_listeners
-            .push(Box::new(move |event, window, cx| {
-                listener(event, window, cx)
-            }));
+        self.modifiers_changed_listeners.push(Box::new(listener));
     }
 
     /// Bind the given callback to drop events of the given type, whether or not the drag started on this element.
@@ -567,13 +611,12 @@ impl Interactivity {
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     pub fn on_click(&mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static)
     where
         Self: Sized,
     {
-        self.click_listeners.push(Rc::new(move |event, window, cx| {
-            listener(event, window, cx)
-        }));
+        self.click_listeners.push(Rc::new(listener));
     }
 
     /// Bind the given callback to non-primary click events of this element.
@@ -584,10 +627,7 @@ impl Interactivity {
     where
         Self: Sized,
     {
-        self.aux_click_listeners
-            .push(Rc::new(move |event, window, cx| {
-                listener(event, window, cx)
-            }));
+        self.aux_click_listeners.push(Rc::new(listener));
     }
 
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
@@ -688,7 +728,7 @@ impl Interactivity {
         self.hover_style_mode = mode;
     }
 
-    /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
+    /// Constructs a tooltip when the element is hovered or long-pressed.
     /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip`].
     pub fn tooltip(&mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static)
     where
@@ -704,7 +744,7 @@ impl Interactivity {
         });
     }
 
-    /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
+    /// Constructs a tooltip when the element is hovered or long-pressed.
     /// The tooltip itself is also hoverable and won't disappear when the user moves the mouse into
     /// the tooltip. The imperative API equivalent to [`StatefulInteractiveElement::hoverable_tooltip`].
     pub fn hoverable_tooltip(
@@ -723,7 +763,9 @@ impl Interactivity {
         });
     }
 
-    /// Set the delay before this element's tooltip is shown.
+    /// Sets the delay before this element's tooltip is shown on hover.
+    ///
+    /// Touch long presses show the tooltip immediately once the gesture is recognized.
     /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip_show_delay`].
     pub fn tooltip_show_delay(&mut self, delay: Duration) {
         self.tooltip_show_delay = Some(delay);
@@ -858,6 +900,7 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::on_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to the view state from this callback.
+    #[inline(always)]
     fn on_mouse_down(
         mut self,
         button: MouseButton,
@@ -867,19 +910,25 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`crate::VisualTestContext::debug_bounds`] map
-    /// This is a noop in release builds
+    /// in the [`crate::VisualTestContext::debug_bounds`] map.
+    ///
+    /// Selectors are only recorded in debug builds with the `test-support`
+    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
+    /// in release builds without the per-frame cost.
+    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
         self
     }
 
-    #[cfg(not(any(test, feature = "test-support")))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`crate::VisualTestContext::debug_bounds`] map
-    /// This is a noop in release builds
+    /// in the [`crate::VisualTestContext::debug_bounds`] map.
+    ///
+    /// Selectors are only recorded in debug builds with the `test-support`
+    /// feature. Elsewhere this is a no-op, so `test-support` can stay enabled
+    /// in release builds without the per-frame cost.
+    #[cfg(not(any(test, all(debug_assertions, feature = "test-support"))))]
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
@@ -1009,6 +1058,21 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind the given callback to [`FileDropEvent::Exited`] when a platform file drag
+    /// leaves this element's window while the element is hovered.
+    ///
+    /// This is a window-local exit event, not notification that the platform drag session ended.
+    /// The fluent API equivalent to [`Interactivity::on_file_drop_exit`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_file_drop_exit(
+        mut self,
+        listener: impl Fn(&FileDropEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_file_drop_exit(listener);
+        self
+    }
+
     /// Bind the given callback to the mouse drag event of the given type. Note that this
     /// will be called for all move events, inside or outside of this element, as long as the
     /// drag was started with this element under the mouse. Useful for implementing draggable
@@ -1024,16 +1088,25 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to scroll wheel events during the bubble phase.
-    /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`].
+    /// Bind the given callback to scroll events during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_scroll`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
-    fn on_scroll_wheel(
+    fn on_scroll(
         mut self,
-        listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.interactivity().on_scroll_wheel(listener);
+        self.interactivity().on_scroll(listener);
         self
+    }
+
+    /// The former name of [`InteractiveElement::on_scroll`].
+    #[deprecated(note = "renamed to `on_scroll`")]
+    fn on_scroll_wheel(
+        self,
+        listener: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_scroll(listener)
     }
 
     /// Bind the given callback to pinch gesture events during the bubble phase.
@@ -1042,6 +1115,20 @@ pub trait InteractiveElement: Sized {
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_pinch(mut self, listener: impl Fn(&PinchEvent, &mut Window, &mut App) + 'static) -> Self {
         self.interactivity().on_pinch(listener);
+        self
+    }
+
+    /// Bind the given callback to back-navigation gestures that start over this
+    /// element, such as the iOS swipe from the leading screen edge. The innermost
+    /// element with a back listener claims the gesture and receives every phase.
+    /// The fluent API equivalent to [`Interactivity::on_back_gesture`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_back_gesture(
+        mut self,
+        listener: impl Fn(&BackGestureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_back_gesture(listener);
         self
     }
 
@@ -1073,6 +1160,7 @@ pub trait InteractiveElement: Sized {
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     #[track_caller]
+    #[inline(always)]
     fn on_action<A: Action>(
         mut self,
         listener: impl Fn(&A, &mut Window, &mut App) + 'static,
@@ -1148,6 +1236,7 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::on_modifiers_changed`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     fn on_modifiers_changed(
         mut self,
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
@@ -1506,6 +1595,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The handler is called when a screen reader requests the given action.
     ///
     /// See the [accessibility guide](crate::_accessibility) for an overview.
+    #[inline(always)]
     fn on_a11y_action(
         mut self,
         action: accesskit::Action,
@@ -1592,6 +1682,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// The fluent API equivalent to [`Interactivity::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    #[inline(always)]
     fn on_click(mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self
     where
         Self: Sized,
@@ -1691,7 +1782,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
+    /// Constructs a tooltip when the element is hovered or long-pressed.
     /// The fluent API equivalent to [`Interactivity::tooltip`].
     fn tooltip(mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self
     where
@@ -1701,7 +1792,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
+    /// Constructs a tooltip when the element is hovered or long-pressed.
     /// The tooltip itself is also hoverable and won't disappear when the user moves the mouse into
     /// the tooltip. The fluent API equivalent to [`Interactivity::hoverable_tooltip`].
     fn hoverable_tooltip(
@@ -1715,7 +1806,9 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Set the delay before this element's tooltip is shown.
+    /// Sets the delay before this element's tooltip is shown on hover.
+    ///
+    /// Touch long presses show the tooltip immediately once the gesture is recognized.
     /// The fluent API equivalent to [`Interactivity::tooltip_show_delay`].
     fn tooltip_show_delay(mut self, delay: Duration) -> Self
     where
@@ -1737,11 +1830,17 @@ pub(crate) type MouseMoveListener =
 pub(crate) type MouseExitListener =
     Box<dyn Fn(&MouseExitEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
-pub(crate) type ScrollWheelListener =
-    Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type FileDropExitListener =
+    Box<dyn Fn(&FileDropEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type ScrollListener =
+    Box<dyn Fn(&ScrollEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
 pub(crate) type PinchListener =
     Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type BackGestureListener =
+    Box<dyn Fn(&BackGestureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -2188,8 +2287,10 @@ pub struct Interactivity {
     pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
-    pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
+    pub(crate) file_drop_exit_listeners: Vec<FileDropExitListener>,
+    pub(crate) scroll_listeners: Vec<ScrollListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
+    pub(crate) back_gesture_listeners: Vec<BackGestureListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
@@ -2230,7 +2331,7 @@ pub struct Interactivity {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
     pub(crate) debug_selector: Option<String>,
 }
 
@@ -2403,6 +2504,11 @@ impl Interactivity {
                             self.tooltip_id = set_tooltip_on_window(active_tooltip, window);
                         } else {
                             // If there is no longer a tooltip builder, remove the active tooltip.
+                            if let Some(long_press_tooltip_active) =
+                                element_state.long_press_tooltip_active.as_ref()
+                            {
+                                long_press_tooltip_active.set(false);
+                            }
                             element_state.active_tooltip.take();
                         }
                     }
@@ -2452,10 +2558,12 @@ impl Interactivity {
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
             || !self.mouse_exit_listeners.is_empty()
+            || !self.file_drop_exit_listeners.is_empty()
             || !self.click_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
-            || !self.scroll_wheel_listeners.is_empty()
+            || !self.scroll_listeners.is_empty()
             || self.has_pinch_listeners()
+            || !self.back_gesture_listeners.is_empty()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
             || !self.drag_over_styles.is_empty()
@@ -2558,12 +2666,11 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
-                #[cfg(any(feature = "test-support", test))]
+                #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
                 if let Some(debug_selector) = &self.debug_selector {
                     window
                         .next_frame
-                        .debug_bounds
-                        .insert(debug_selector.clone(), bounds);
+                        .record_debug_bounds(debug_selector.clone(), bounds);
                 }
 
                 self.paint_hover_group_handler(window, cx);
@@ -2857,9 +2964,16 @@ impl Interactivity {
             })
         }
 
-        for listener in self.scroll_wheel_listeners.drain(..) {
+        for listener in self.file_drop_exit_listeners.drain(..) {
             let hitbox = hitbox.clone();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &FileDropEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.scroll_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -2867,6 +2981,13 @@ impl Interactivity {
         for listener in self.pinch_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.back_gesture_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &BackGestureEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -3226,6 +3347,10 @@ impl Interactivity {
                     .pending_mouse_down
                     .get_or_insert_with(Default::default)
                     .clone();
+                let long_press_tooltip_active = element_state
+                    .long_press_tooltip_active
+                    .get_or_insert_with(Default::default)
+                    .clone();
 
                 let tooltip_is_hoverable = tooltip_builder.hoverable;
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
@@ -3253,6 +3378,7 @@ impl Interactivity {
                     build_tooltip,
                     check_is_hovered,
                     check_is_hovered_during_prepaint,
+                    long_press_tooltip_active,
                     self.tooltip_show_delay,
                     window,
                 );
@@ -3364,7 +3490,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
@@ -3682,6 +3808,7 @@ pub struct InteractiveElementState {
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    long_press_tooltip_active: Option<Rc<Cell<bool>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3773,6 +3900,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
+    long_press_tooltip_active: Rc<Cell<bool>>,
     show_delay: Option<Duration>,
     window: &mut Window,
 ) {
@@ -3783,6 +3911,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
         let active_tooltip = active_tooltip.clone();
         let build_tooltip = build_tooltip.clone();
         let check_is_hovered = check_is_hovered.clone();
+        let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
         move |_: &MouseMoveEvent, phase, window, cx| {
             handle_tooltip_mouse_move(
                 &active_tooltip,
@@ -3810,7 +3939,45 @@ pub(crate) fn register_tooltip_mouse_handlers(
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
-        move |_: &ScrollWheelEvent, _phase, window: &mut Window, _cx| {
+        let build_tooltip = build_tooltip.clone();
+        let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+        move |event: &LongPressEvent, phase, window, cx| {
+            if !phase.bubble() {
+                return;
+            }
+
+            match event.phase {
+                TouchPhase::Started if !window.default_prevented() && check_is_hovered(window) => {
+                    if show_tooltip(
+                        &active_tooltip,
+                        &build_tooltip,
+                        &check_is_hovered_during_prepaint,
+                        Some(long_press_tooltip_active.clone()),
+                        window,
+                        cx,
+                    ) {
+                        long_press_tooltip_active.set(true);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }
+                TouchPhase::Ended | TouchPhase::Cancelled
+                    if long_press_tooltip_active.replace(false) =>
+                {
+                    clear_active_tooltip(&active_tooltip, window);
+                    cx.stop_propagation();
+                }
+                TouchPhase::Started
+                | TouchPhase::Moved
+                | TouchPhase::Ended
+                | TouchPhase::Cancelled => {}
+            }
+        }
+    });
+
+    window.on_mouse_event({
+        let active_tooltip = active_tooltip.clone();
+        move |_: &ScrollEvent, _phase, window: &mut Window, _cx| {
             if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
@@ -3907,36 +4074,14 @@ fn handle_tooltip_mouse_move(
                         return;
                     };
                     cx.update(|window, cx| {
-                        let new_tooltip =
-                            build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
-                                let weak_active_tooltip = Rc::downgrade(&active_tooltip);
-                                ActiveTooltip::Visible {
-                                    tooltip: AnyTooltip {
-                                        view,
-                                        mouse_position: window.mouse_position(),
-                                        check_visible_and_update: Rc::new(
-                                            move |tooltip_bounds, window, cx| {
-                                                let Some(active_tooltip) =
-                                                    weak_active_tooltip.upgrade()
-                                                else {
-                                                    return false;
-                                                };
-                                                handle_tooltip_check_visible_and_update(
-                                                    &active_tooltip,
-                                                    tooltip_is_hoverable,
-                                                    &check_is_hovered_during_prepaint,
-                                                    tooltip_bounds,
-                                                    window,
-                                                    cx,
-                                                )
-                                            },
-                                        ),
-                                    },
-                                    is_hoverable: tooltip_is_hoverable,
-                                }
-                            });
-                        *active_tooltip.borrow_mut() = new_tooltip;
-                        window.refresh();
+                        show_tooltip(
+                            &active_tooltip,
+                            &build_tooltip,
+                            &check_is_hovered_during_prepaint,
+                            None,
+                            window,
+                            cx,
+                        );
                     })
                     .ok();
                 }
@@ -3949,6 +4094,50 @@ fn handle_tooltip_mouse_move(
         }
         Action::CheckVisible => cx.notify(current_view),
     }
+}
+
+fn show_tooltip(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let new_tooltip = build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
+        let weak_active_tooltip = Rc::downgrade(active_tooltip);
+        let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+        ActiveTooltip::Visible {
+            tooltip: AnyTooltip {
+                view,
+                mouse_position: window.mouse_position(),
+                check_visible_and_update: Rc::new(move |tooltip_bounds, window, cx| {
+                    if long_press_tooltip_active
+                        .as_ref()
+                        .is_some_and(|active| active.get())
+                    {
+                        return true;
+                    }
+                    let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
+                        return false;
+                    };
+                    handle_tooltip_check_visible_and_update(
+                        &active_tooltip,
+                        tooltip_is_hoverable,
+                        &check_is_hovered_during_prepaint,
+                        tooltip_bounds,
+                        window,
+                        cx,
+                    )
+                }),
+            },
+            is_hoverable: tooltip_is_hoverable,
+        }
+    });
+    let did_show = new_tooltip.is_some();
+    *active_tooltip.borrow_mut() = new_tooltip;
+    window.refresh();
+    did_show
 }
 
 /// Returns a callback which will be called by window prepaint to update tooltip visibility. The
@@ -4438,8 +4627,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, GestureTuning, InputEvent, Keystroke,
+        MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -4914,7 +5103,118 @@ mod tests {
         assert_eq!(handle.offset().y, px(-25.));
     }
 
+    #[test]
+    fn long_press_shows_tooltip_until_touch_ends() {
+        let (mut test_app, any_window, captured_active_tooltip) = create_tooltip_owner_test(None);
+        let active_tooltip = captured_active_tooltip
+            .borrow()
+            .clone()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let touch_id = TouchId(1);
+        let touch_position = point(px(49.), px(10.));
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Started,
+                        position: touch_position,
+                        predicted_position: None,
+                        force: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+        test_app
+            .dispatcher
+            .advance_clock(GestureTuning::default().long_press_duration + Duration::from_millis(1));
+        test_app.run_until_parked();
+
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+
+        let moved_position = point(px(55.), px(10.));
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Moved,
+                        position: moved_position,
+                        predicted_position: None,
+                        force: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    TouchEvent {
+                        id: touch_id,
+                        phase: TouchPhase::Ended,
+                        position: moved_position,
+                        predicted_position: None,
+                        force: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        assert!(active_tooltip.borrow().is_none());
+    }
+
     fn setup_tooltip_owner_test(
+        show_delay_override: Option<Duration>,
+    ) -> (
+        TestAppContext,
+        crate::AnyWindowHandle,
+        CapturedActiveTooltip,
+    ) {
+        let (mut test_app, any_window, captured_active_tooltip) =
+            create_tooltip_owner_test(show_delay_override);
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(10.), px(10.)),
+                        modifiers: Default::default(),
+                        pressed_button: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+
+        (test_app, any_window, captured_active_tooltip)
+    }
+
+    fn create_tooltip_owner_test(
         show_delay_override: Option<Duration>,
     ) -> (
         TestAppContext,
@@ -4931,26 +5231,6 @@ mod tests {
             }
         });
         let any_window = window.into();
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.draw(cx).clear(cx);
-            })
-            .unwrap();
-
-        test_app
-            .update_window(any_window, |_, window, cx| {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(10.), px(10.)),
-                        modifiers: Default::default(),
-                        pressed_button: None,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            })
-            .unwrap();
 
         test_app
             .update_window(any_window, |_, window, cx| {
@@ -5153,6 +5433,96 @@ mod tests {
             1,
             "mouse down over an active prompt should not fire mouse-down-out listeners"
         );
+    }
+
+    #[test]
+    fn touch_tap_out_fires_once_after_release() {
+        let mut test_app = TestAppContext::single();
+        let mouse_down_out_count = Rc::new(RefCell::new(0));
+        let window = test_app.add_window({
+            let mouse_down_out_count = mouse_down_out_count.clone();
+            move |_, _| MouseDownOutOwner {
+                mouse_down_out_count,
+            }
+        });
+        let any_window: AnyWindowHandle = window.into();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let started = TouchEvent {
+                    id: TouchId(1),
+                    phase: TouchPhase::Started,
+                    position: point(px(75.), px(75.)),
+                    force: None,
+                    predicted_position: None,
+                };
+                window.dispatch_event(started.clone().to_platform_input(), cx);
+                assert_eq!(*mouse_down_out_count.borrow(), 0);
+                window.dispatch_event(
+                    TouchEvent {
+                        phase: TouchPhase::Ended,
+                        ..started
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(
+            *mouse_down_out_count.borrow(),
+            1,
+            "a touch tap outside the element should use mouse-down-out listeners"
+        );
+    }
+
+    #[crate::test]
+    fn touch_pan_and_cancel_do_not_fire_mouse_down_out(cx: &mut TestAppContext) {
+        let mouse_down_out_count = Rc::new(RefCell::new(0));
+        let window = cx.add_window({
+            let mouse_down_out_count = mouse_down_out_count.clone();
+            move |_, _| MouseDownOutOwner {
+                mouse_down_out_count,
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            for (id, samples) in [
+                (
+                    TouchId(1),
+                    [
+                        (TouchPhase::Started, 100.),
+                        (TouchPhase::Moved, 75.),
+                        (TouchPhase::Ended, 75.),
+                    ],
+                ),
+                (
+                    TouchId(2),
+                    [
+                        (TouchPhase::Started, 100.),
+                        (TouchPhase::Moved, 100.),
+                        (TouchPhase::Cancelled, 100.),
+                    ],
+                ),
+            ] {
+                for (phase, vertical_position) in samples {
+                    window.dispatch_event(
+                        TouchEvent {
+                            id,
+                            phase,
+                            position: point(px(75.), px(vertical_position)),
+                            predicted_position: None,
+                            force: None,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(*mouse_down_out_count.borrow(), 0);
     }
 
     #[test]

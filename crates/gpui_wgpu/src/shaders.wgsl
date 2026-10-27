@@ -1405,10 +1405,10 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 struct MonochromeSprite {
     order: u32,
     pad: u32,
+    tile: AtlasTile,
     bounds: Bounds,
     content_mask: Bounds,
     color: Hsla,
-    tile: AtlasTile,
     transformation: TransformationMatrix,
 }
 
@@ -1452,17 +1452,17 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 struct PolychromeSprite {
     order: u32,
     pad: u32,
+    tile: AtlasTile,
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
-    tile: AtlasTile,
     // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
     // gpui/src/scene.rs IS this layout, so the field must stay last and in
-    // sync. Only the DirectX backend APPLIES it today (gpui_windows'
-    // shaders.hlsl); here it keeps the record size right so nothing else is
-    // read at the wrong offset.
+    // sync (zed#65814 moved `tile` up beside `order`). Only the DirectX
+    // backend APPLIES it today (gpui_windows' shaders.hlsl); here it keeps the
+    // record size right so nothing else is read at the wrong offset.
     transformation: TransformationMatrix,
 }
 

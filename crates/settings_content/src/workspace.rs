@@ -19,6 +19,10 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: platform_default
     pub text_rendering_mode: Option<TextRenderingMode>,
+    /// Whether to render windows using the Display P3 color space (macOS only).
+    ///
+    /// Default: false
+    pub use_display_p3: Option<bool>,
     /// Layout mode for the bottom dock
     ///
     /// Default: contained
@@ -125,7 +129,7 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: false
     pub close_on_file_delete: Option<bool>,
-    /// Whether to allow windows to tab together based on the user’s tabbing preference (macOS only).
+    /// Whether to allow windows to tab together based on the user's tabbing preference (macOS only).
     ///
     /// Default: false
     pub use_system_window_tabs: Option<bool>,
@@ -146,6 +150,25 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: false
     pub close_panel_on_toggle: Option<bool>,
+    /// Window title template.
+    ///
+    /// Available variables are `${projectName}`, `${fileName}`,
+    /// `${filePath}`, `${relativePath}`, `${fileStem}`, `${remoteName}`,
+    /// `${remoteHost}`, `${appName}`, `${branch}`,
+    /// and `${separator}`.
+    /// `${separator}` is omitted when adjacent variables are empty,
+    /// but literal text is preserved.
+    /// The collaboration indicator, when present, is appended after the
+    /// rendered template.
+    /// If the template renders to nothing, the default template is used instead.
+    ///
+    /// Default: `${projectName}${separator}${fileName}`
+    pub window_title_format: Option<String>,
+    /// String substituted for `${separator}` in the window title format.
+    /// Include any surrounding whitespace in the value.
+    ///
+    /// Default: ` — `
+    pub window_title_separator: Option<String>,
     /// Controls whether Zed or the window manager or compositor draws window decorations on Linux.
     ///
     /// Default: client
@@ -193,7 +216,8 @@ pub struct PreviewTabsSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
-    /// Whether to open tabs in preview mode when opened from the project panel with a single click.
+    /// Whether to open tabs in preview mode when opened from the project panel
+    /// with a single click or the `project_panel::Open` action.
     ///
     /// Default: true
     pub enable_preview_from_project_panel: Option<bool>,
@@ -561,8 +585,8 @@ pub struct StatusBarSettingsContent {
     ///
     /// Default: non_utf8
     pub active_encoding_button: Option<EncodingDisplayOptions>,
-    /// Whether to show an indicator with a countdown while timed multi-stroke input is pending.
-    /// Hovering the indicator pauses the timeout.
+    /// Whether to show an indicator while multi-stroke input is pending.
+    /// If the input has a timeout, a countdown is shown and hovering the indicator pauses it.
     /// Its binding preview popover is disabled when the which-key popup is enabled.
     ///
     /// Default: true
@@ -808,6 +832,8 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: right (Agentic layout), left (Classic layout)
     pub dock: Option<DockSide>,
+    // TODO
+    pub title_tooltip_delay: Option<ProjectPanelTitleTooltipDelay>,
     /// Spacing between worktree entries in the project panel.
     ///
     /// Default: comfortable
@@ -891,6 +917,31 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: false
     pub git_status_indicator: Option<bool>,
+}
+
+/// Controls the width of the git diff hunk indicators in the gutter.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    strum::EnumDiscriminants,
+)]
+#[strum_discriminants(derive(strum::VariantArray, strum::VariantNames, strum::FromRepr))]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPanelTitleTooltipDelay {
+    /// Default is 1500ms.
+    #[default]
+    Default,
+    /// A custom offset in milliseconds for the tooltip show delay.
+    Custom(crate::DelayMs),
+    /// Disables the tooltip
+    Disabled,
 }
 
 #[derive(
@@ -1005,6 +1056,11 @@ pub enum ProjectPanelSortOrder {
     /// Pure Unicode codepoint comparison. No case folding, no natural number sorting.
     /// Uppercase ASCII sorts before lowercase. Accented characters sort after ASCII.
     Unicode,
+    /// Files are grouped by their last extension (case-insensitive) in ascending order,
+    /// with extensionless files, including dotfiles such as `.gitignore`, first.
+    /// Dotfiles with a further suffix, such as `.config.json`, keep that extension.
+    /// Within a group, names use the default natural sort.
+    Extension,
 }
 
 impl From<ProjectPanelSortMode> for util::paths::SortMode {
@@ -1024,6 +1080,7 @@ impl From<ProjectPanelSortOrder> for util::paths::SortOrder {
             ProjectPanelSortOrder::Upper => Self::Upper,
             ProjectPanelSortOrder::Lower => Self::Lower,
             ProjectPanelSortOrder::Unicode => Self::Unicode,
+            ProjectPanelSortOrder::Extension => Self::Extension,
         }
     }
 }
