@@ -10118,6 +10118,7 @@ mod tests {
                                 thickness: px(thickness as f32 / 4.),
                                 color: Some(hsla(0.25, 0.5, 0.75, 0.5)),
                                 wavy,
+                                offset: px(0.),
                             };
                             let bounds = Bounds::new(
                                 point(snap(origin), snap(-origin)),
@@ -10203,6 +10204,7 @@ mod tests {
                 thickness: px(1.),
                 color: None,
                 wavy: true,
+                offset: px(0.),
             };
             let origin = point(px(2.888_183_8), px(15.357_917));
             let width = px(23.848_145) - origin.x;
@@ -10245,6 +10247,7 @@ mod tests {
                 thickness: px(2.),
                 color: Some(hsla(0.25, 0.5, 0.75, 0.5)),
                 wavy: true,
+                offset: px(0.),
             };
             let origin = point(px(-1.25), px(9.25));
             let width = px(24.);
@@ -10297,6 +10300,7 @@ mod tests {
                 thickness: px(1.),
                 color: None,
                 wavy: true,
+                offset: px(0.),
             };
             let origin = point(px(-4.), px(-1.));
             let width = px(8.);

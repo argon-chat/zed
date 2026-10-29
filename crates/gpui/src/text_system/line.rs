@@ -1130,6 +1130,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(hsla(0., 1., 0.5, 1.)),
                 wavy: true,
+                offset: px(0.),
             };
             let last_style = UnderlineStyle {
                 color: Some(hsla(0.5, 1., 0.5, 1.)),
@@ -1278,6 +1279,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(black()),
                 wavy: true,
+                offset: px(0.),
             };
             let last_style = UnderlineStyle {
                 wavy: false,
@@ -1357,6 +1359,7 @@ mod tests {
                 thickness: px(1.),
                 color: Some(black()),
                 wavy: true,
+                offset: px(0.),
             };
             for zero_advance in [false, true] {
                 let line = underline_test_line(

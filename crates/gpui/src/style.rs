@@ -1711,6 +1711,7 @@ mod tests {
                 thickness: px(2.),
                 color: Some(red()),
                 wavy: true,
+                offset: px(0.),
             }),
         };
         let expected_style = style_b;
@@ -1743,6 +1744,7 @@ mod tests {
                 thickness: px(4.),
                 color: None,
                 wavy: false,
+                offset: px(0.),
             }),
         };
 
@@ -1761,6 +1763,7 @@ mod tests {
                 thickness: px(4.),
                 color: None,
                 wavy: false,
+                offset: px(0.),
             }),
         };
 

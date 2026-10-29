@@ -7823,6 +7823,8 @@ dependencies = [
  "rand 0.9.4",
  "raw-window-handle",
  "scheduler",
+ "serde",
+ "serde_json",
  "smallvec",
  "uuid",
  "windows 0.62.2",
