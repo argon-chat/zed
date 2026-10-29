@@ -1465,9 +1465,69 @@ pub(crate) fn transformed_bounds(
     )
 }
 
+/// vue-native fork: `bounds` carried through `matrix` EXACTLY, for the
+/// primitives that have no `transformation` of their own and are drawn as an
+/// axis-aligned rect — the backdrop blur and the `--shading` effect quad, which
+/// sample the render target under that rect. A translation and an axis-aligned
+/// scale (how every popper is positioned) fold into the rect itself; the `f32`
+/// is the factor the corner radii scale by. `None` under a rotation or a skew,
+/// which no axis-aligned rect can express.
+pub(crate) fn axis_aligned_through(
+    bounds: Bounds<ScaledPixels>,
+    matrix: TransformationMatrix,
+) -> Option<(Bounds<ScaledPixels>, f32)> {
+    if matrix.is_unit() {
+        return Some((bounds, 1.0));
+    }
+    let [[a, b], [c, d]] = matrix.rotation_scale;
+    const EPS: f32 = 1e-6;
+    if b.abs() > EPS || c.abs() > EPS || a.abs() <= EPS || d.abs() <= EPS {
+        return None;
+    }
+    Some((transformed_bounds(bounds, matrix), a.abs().min(d.abs())))
+}
+
 impl Default for TransformationMatrix {
     fn default() -> Self {
         Self::unit()
+    }
+}
+
+#[cfg(test)]
+mod vn_axis_aligned_tests {
+    use super::*;
+    use crate::{Radians, point, size};
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        }
+    }
+
+    #[test]
+    fn a_translate_moves_the_rect_and_a_rotation_has_no_rect() {
+        let moved =
+            TransformationMatrix::unit().translate(point(ScaledPixels(300.), ScaledPixels(120.)));
+        assert_eq!(
+            axis_aligned_through(rect(0., 0., 100., 50.), moved),
+            Some((rect(300., 120., 100., 50.), 1.0))
+        );
+        // A popper's open animation: scale 0.95 about the centre.
+        let zoomed = TransformationMatrix::unit()
+            .translate(point(ScaledPixels(50.), ScaledPixels(25.)))
+            .scale(size(0.5, 0.5))
+            .translate(point(ScaledPixels(-50.), ScaledPixels(-25.)));
+        assert_eq!(
+            axis_aligned_through(rect(0., 0., 100., 50.), zoomed),
+            Some((rect(25., 12.5, 50., 25.), 0.5))
+        );
+        let turned = TransformationMatrix::unit().rotate(Radians(0.3));
+        assert_eq!(axis_aligned_through(rect(0., 0., 100., 50.), turned), None);
+        assert_eq!(
+            axis_aligned_through(rect(1., 2., 3., 4.), TransformationMatrix::unit()),
+            Some((rect(1., 2., 3., 4.), 1.0))
+        );
     }
 }
 

@@ -5169,12 +5169,22 @@ impl Window {
             return;
         }
 
+        // vue-native fork: the blur has no `transformation` of its own, so the
+        // element transform is folded into its rect — without this a popper
+        // positioned by `transform: translate()` blurred a ghost at its
+        // untransformed place. Under a rotation there is no rect to fold it
+        // into, and nothing is drawn rather than the ghost.
+        let Some((bounds, k)) =
+            crate::scene::axis_aligned_through(self.snap_bounds(bounds), self.element_transform)
+        else {
+            return;
+        };
         self.next_frame.scene.insert_primitive(BackdropBlurRect {
             order: 0,
             pad: 0,
-            bounds: self.snap_bounds(bounds),
+            bounds,
             content_mask: self.snapped_content_mask(),
-            corner_radii: corner_radii.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor * k),
             blur_radius,
             opacity,
             tint: effect.tint,
@@ -5243,12 +5253,21 @@ impl Window {
             self.request_animation_frame();
         }
 
+        // vue-native fork: as for the backdrop blur — no `transformation`
+        // field, so the element transform is folded into the rect, and a
+        // rotated effect is not drawn rather than drawn unrotated elsewhere.
+        let Some((draw_bounds, k)) = crate::scene::axis_aligned_through(
+            self.snap_bounds(draw_bounds),
+            self.element_transform,
+        ) else {
+            return;
+        };
         self.next_frame.scene.insert_primitive(EffectQuad {
             order: 0,
             effect_id: spec.id,
-            bounds: self.snap_bounds(draw_bounds),
+            bounds: draw_bounds,
             content_mask: self.snapped_content_mask(),
-            corner_radii: draw_radii.scale(scale_factor),
+            corner_radii: draw_radii.scale(scale_factor * k),
             params0: [params[0], params[1], params[2], params[3]],
             params1: [params[4], params[5], params[6], params[7]],
             opacity,
