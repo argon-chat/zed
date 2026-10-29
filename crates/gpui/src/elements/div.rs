@@ -1966,6 +1966,17 @@ impl Div {
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
     child_layout_ids: SmallVec<[LayoutId; 2]>,
+    /// vue-native fork: did `prepaint` visit the children? `paint` must not
+    /// visit them when it did not. The two phases compute the style
+    /// separately, and a hover or group-hover rung can flip `display` between
+    /// them: prepaint decides from the hover state STORED in the element state,
+    /// paint from the LIVE hit test, and the window recomputes that hit test
+    /// between the two phases (`Window::draw`). A `hidden` box with a
+    /// `group_hover(|s| s.flex())` rung was therefore skipped by prepaint and
+    /// walked by paint whenever the pointer reached its group without a mouse
+    /// move (a scroll, a layout shift), and its first child panicked with "must
+    /// call prepaint before paint".
+    children_prepainted: bool,
 }
 
 /// Interactivity state displayed an manipulated in the inspector.
@@ -2071,7 +2082,13 @@ impl Element for Div {
             )
         });
 
-        (layout_id, DivFrameState { child_layout_ids })
+        (
+            layout_id,
+            DivFrameState {
+                child_layout_ids,
+                children_prepainted: false,
+            },
+        )
     }
 
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
@@ -2142,6 +2159,7 @@ impl Element for Div {
                 if style.display == Display::None {
                     return hitbox;
                 }
+                request_layout.children_prepainted = true;
 
                 window.with_image_cache(image_cache, |window| {
                     window.with_element_offset(scroll_offset, |window| {
@@ -2175,7 +2193,7 @@ impl Element for Div {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         hitbox: &mut Option<Hitbox>,
         window: &mut Window,
         cx: &mut App,
@@ -2184,6 +2202,7 @@ impl Element for Div {
             .image_cache
             .as_mut()
             .map(|provider| provider.provide(window, cx));
+        let children_prepainted = request_layout.children_prepainted;
 
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
@@ -2195,7 +2214,9 @@ impl Element for Div {
                 cx,
                 |style, window, cx| {
                     // skip children
-                    if style.display == Display::None {
+                    // vue-native fork: …and skip them whenever prepaint did,
+                    // whatever this phase's style says (`DivFrameState`).
+                    if style.display == Display::None || !children_prepainted {
                         return;
                     }
 
@@ -3006,6 +3027,10 @@ impl Interactivity {
             let current_view = window.current_view();
 
             let hover_style_mode = self.hover_style_mode;
+            if let Some(hover_state) = &hover_state {
+                let hovered = hover_style_mode.is_hovered(&hitbox, window);
+                catch_up_stored_hover(hover_state, |s| &mut s.element, hovered, window, cx);
+            }
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 // vue-native fork: agrees with `compute_style` above.
                 let hovered = hover_style_mode.is_hovered(&hitbox, window);
@@ -3030,6 +3055,10 @@ impl Interactivity {
                 let current_view = window.current_view();
 
                 let hover_style_mode = self.hover_style_mode;
+                if let Some(hover_state) = &hover_state {
+                    let group_hovered = hover_style_mode.is_hovered_id(group_hitbox_id, window);
+                    catch_up_stored_hover(hover_state, |s| &mut s.group, group_hovered, window, cx);
+                }
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     // vue-native fork: agrees with `compute_style` above.
                     let group_hovered = hover_style_mode.is_hovered_id(group_hitbox_id, window);
@@ -3835,6 +3864,35 @@ pub struct ElementHoverState {
 
     /// True if this element is hovered, false otherwise
     pub element: bool,
+}
+
+/// vue-native fork: bring a STORED hover flag up to the LIVE hit test at paint
+/// time, and redraw when it moved.
+///
+/// The stored flags are what `request_layout` and `prepaint` style the element
+/// from; paint asks the hit test directly. Upstream updates the flags only from
+/// a mouse-move listener, so when the hit test changes under a stationary
+/// pointer (a scroll, a layout shift, a box appearing under it) the layout keeps
+/// the old answer until the pointer next moves, while paint already shows the
+/// new one. A `group_hover` that changes `display` was then laid out hidden and
+/// never shown. Catching up here gives the next frame the new answer, which is
+/// a browser's order too: hover is re-evaluated after the frame that moved the
+/// content, and the style recalc follows. The `on_hover` listener already
+/// catches up the same way (`paint_mouse_listeners`). See `DivFrameState`.
+fn catch_up_stored_hover(
+    state: &Rc<RefCell<ElementHoverState>>,
+    field: impl FnOnce(&mut ElementHoverState) -> &mut bool,
+    hovered: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut state = state.borrow_mut();
+    let stored = field(&mut state);
+    if *stored != hovered {
+        *stored = hovered;
+        let current_view = window.current_view();
+        window.defer(cx, move |_, cx| cx.notify(current_view));
+    }
 }
 
 pub(crate) enum ActiveTooltip {
@@ -4729,6 +4787,125 @@ mod tests {
         assert_eq!(render_count.get(), initial_render_count + 2);
         assert_eq!(anonymous_paint_count.get(), 1);
         assert_eq!(stateful_width.get(), px(10.));
+    }
+
+    /// vue-native fork: a `hidden` box that a `group_hover` shows, the shape of
+    /// Tailwind's `hidden group-hover/msg:flex` (a chat row's timestamp).
+    struct GroupHoverDisplayTestView {
+        group_left: Pixels,
+        /// What each frame did to the box's content, one entry per frame:
+        /// `(rendered, content prepainted at this width, content painted)`.
+        frames: Rc<RefCell<Vec<(bool, Option<Pixels>, bool)>>>,
+    }
+
+    impl Render for GroupHoverDisplayTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.frames.borrow_mut().push((true, None, false));
+            let prepainted = self.frames.clone();
+            let painted = self.frames.clone();
+            div().relative().size_full().child(
+                div()
+                    .id("display-group")
+                    .absolute()
+                    .left(self.group_left)
+                    .top_0()
+                    .size(px(20.))
+                    .group("display-group")
+                    .child(
+                        div()
+                            .id("display-target")
+                            .hidden()
+                            .w(px(12.))
+                            .h(px(8.))
+                            .group_hover("display-group", |style| style.flex())
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| {
+                                        if let Some(frame) = prepainted.borrow_mut().last_mut() {
+                                            frame.1 = Some(bounds.size.width);
+                                        }
+                                    },
+                                    move |_, _, _, _| {
+                                        if let Some(frame) = painted.borrow_mut().last_mut() {
+                                            frame.2 = true;
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            ),
+                    ),
+            )
+        }
+    }
+
+    /// vue-native fork (`DivFrameState`, `catch_up_stored_hover`). The pointer
+    /// reaches the group without moving: the layout moves the group under it.
+    /// Prepaint styles the target from the stored hover flag (hidden, children
+    /// skipped), paint from the live hit test (shown), and paint used to walk
+    /// into the canvas prepaint never saw: "must call prepaint before paint".
+    #[gpui::test]
+    fn group_hover_that_shows_a_hidden_box_under_a_stationary_pointer(cx: &mut TestAppContext) {
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let frames = frames.clone();
+            move |_, _| GroupHoverDisplayTestView {
+                group_left: px(40.),
+                frames,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        // A test window draws by itself whenever it is dirty once an update
+        // returns (`App::flush_effects`), so every frame below is one of those.
+        let frames_since = |mark: usize| frames.borrow()[mark..].to_vec();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+        })
+        .unwrap();
+        assert!(
+            frames
+                .borrow()
+                .iter()
+                .all(|frame| frame.1.is_none() && !frame.2),
+            "the group is not under the pointer"
+        );
+
+        // The layout moves the group under the still pointer. The first
+        // frame is the one that panicked.
+        let mark = frames.borrow().len();
+        window
+            .update(cx, |view, _, cx| {
+                view.group_left = px(0.);
+                cx.notify();
+            })
+            .unwrap();
+        assert_eq!(
+            frames_since(mark),
+            [
+                // Laid out and prepainted hidden: nothing inside is painted,
+                // although paint's own style already says `flex`.
+                (true, None, false),
+                // The stored flag caught up and asked for this frame, which
+                // lays the box out shown and paints what is in it.
+                (true, Some(px(12.)), true),
+            ]
+        );
+
+        // The way back: the group leaves under the still pointer. Prepaint
+        // walks the content (stored: shown) and paint hides it (live), then
+        // the next frame does not lay it out at all.
+        let mark = frames.borrow().len();
+        window
+            .update(cx, |view, _, cx| {
+                view.group_left = px(40.);
+                cx.notify();
+            })
+            .unwrap();
+        assert_eq!(
+            frames_since(mark),
+            [(true, Some(px(12.)), false), (true, None, false)]
+        );
     }
 
     struct HoverListenerLayoutTestView {
