@@ -511,16 +511,36 @@ impl ToTaffy<taffy::style::Style> for Style {
         }
         fn to_grid_tracks<T: taffy::style::CheapCloneStr>(
             tracks: &Option<Vec<crate::GridTrack>>,
+            auto: Option<crate::GridAutoRepeat>,
         ) -> Option<Vec<taffy::GridTemplateComponent<T>>> {
+            let track =
+                |t: &crate::GridTrack| minmax(to_track_size_min(t.min), to_track_size_max(t.max));
             tracks.as_ref().map(|list| {
-                list.iter()
-                    .map(|t| {
-                        taffy::GridTemplateComponent::Single(minmax(
-                            to_track_size_min(t.min),
-                            to_track_size_max(t.max),
-                        ))
-                    })
-                    .collect()
+                // vue-native fork: one `repeat(auto-fill | auto-fit, …)` run,
+                // which taffy expands against the container at layout time.
+                let run = auto
+                    .map(|a| a.start as usize..(a.start as usize + a.len as usize))
+                    .filter(|run| !run.is_empty() && run.end <= list.len());
+                let mut out = Vec::with_capacity(list.len());
+                for (index, t) in list.iter().enumerate() {
+                    match (&run, auto) {
+                        (Some(run), Some(a)) if run.contains(&index) => {
+                            if index == run.start {
+                                let count = if a.fit {
+                                    taffy::RepetitionCount::AutoFit
+                                } else {
+                                    taffy::RepetitionCount::AutoFill
+                                };
+                                out.push(repeat(
+                                    count,
+                                    list[run.clone()].iter().map(track).collect(),
+                                ));
+                            }
+                        }
+                        _ => out.push(taffy::GridTemplateComponent::Single(track(t))),
+                    }
+                }
+                out
             })
         }
 
@@ -548,9 +568,9 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
             // An explicit track list wins over the `repeat(N, …)` shorthand.
-            grid_template_rows: to_grid_tracks(&self.vn_grid_rows)
+            grid_template_rows: to_grid_tracks(&self.vn_grid_rows, self.vn_grid_rows_auto)
                 .unwrap_or_else(|| to_grid_repeat(&self.grid_rows)),
-            grid_template_columns: to_grid_tracks(&self.vn_grid_cols)
+            grid_template_columns: to_grid_tracks(&self.vn_grid_cols, self.vn_grid_cols_auto)
                 .unwrap_or_else(|| to_grid_repeat(&self.grid_cols)),
             grid_auto_flow: match self.vn_grid_auto_flow.unwrap_or_default() {
                 crate::GridAutoFlow::Row => taffy::GridAutoFlow::Row,

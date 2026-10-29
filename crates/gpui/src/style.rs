@@ -231,6 +231,23 @@ impl GridTrack {
     }
 }
 
+/// vue-native fork: CSS `repeat(auto-fill | auto-fit, <tracks>)` inside a
+/// track list — as many repetitions as fit the container, which taffy counts
+/// at layout time. The repeated tracks are a run of the track list it belongs
+/// to ([`Style::vn_grid_cols`] / [`Style::vn_grid_rows`]); CSS allows one such
+/// repetition per list, and every other track in that list must then have a
+/// fixed size, which the caller checks.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GridAutoRepeat {
+    /// `auto-fit` (the empty repetitions collapse) rather than `auto-fill`
+    /// (they keep their size).
+    pub fit: bool,
+    /// The index in the track list of the first repeated track.
+    pub start: u16,
+    /// How many tracks of the list one repetition holds.
+    pub len: u16,
+}
+
 /// CSS `grid-auto-flow`: which axis the auto-placement algorithm fills, and
 /// whether it backfills holes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -469,6 +486,13 @@ pub struct Style {
     /// CSS `grid-template-rows` as an arbitrary track list. See
     /// [`Style::vn_grid_cols`].
     pub vn_grid_rows: Option<Vec<GridTrack>>,
+
+    /// The `repeat(auto-fill | auto-fit, …)` run of [`Style::vn_grid_cols`],
+    /// if it has one. Meaningless without that list.
+    pub vn_grid_cols_auto: Option<GridAutoRepeat>,
+
+    /// The `repeat(auto-fill | auto-fit, …)` run of [`Style::vn_grid_rows`].
+    pub vn_grid_rows_auto: Option<GridAutoRepeat>,
 
     /// CSS `grid-auto-flow` — the direction the auto-placement algorithm fills,
     /// and whether it packs densely.
@@ -1153,6 +1177,8 @@ impl Default for Style {
             grid_location: None,
             vn_grid_cols: None,
             vn_grid_rows: None,
+            vn_grid_cols_auto: None,
+            vn_grid_rows_auto: None,
             vn_grid_auto_flow: None,
             vn_justify_items: None,
             vn_justify_self: None,
