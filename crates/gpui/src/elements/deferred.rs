@@ -224,3 +224,44 @@ mod tests {
             .unwrap();
     }
 }
+
+/// vue-native fork: a deferred element paints under the text style its
+/// ancestors set, as it is prepainted under it.
+#[cfg(test)]
+mod vn_deferred_text_style_tests {
+    use crate::{
+        Context, Hsla, TestAppContext, Window, canvas, deferred, div, prelude::*, px, red, size,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    struct Tinted {
+        seen: Rc<RefCell<Vec<Hsla>>>,
+    }
+
+    impl Render for Tinted {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            div().size_full().text_color(red()).child(
+                deferred(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| seen.borrow_mut().push(window.text_style().color),
+                    )
+                    .size(px(10.)),
+                )
+                .with_priority(1),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_deferred_paint_reads_the_inherited_text_style(cx: &mut TestAppContext) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let view_seen = seen.clone();
+        let _window = cx.open_window(size(px(200.), px(200.)), move |_, _| Tinted { seen: view_seen });
+        cx.run_until_parked();
+        let seen = seen.borrow();
+        assert!(!seen.is_empty(), "the deferred canvas painted");
+        assert!(seen.iter().all(|c| *c == red()), "painted under the ancestor's colour: {seen:?}");
+    }
+}

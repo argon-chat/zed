@@ -1490,6 +1490,10 @@ pub enum AlignContent {
     /// The gap between the first and last items is exactly HALF the gap between items.
     /// The gaps are distributed evenly in proportion to these ratios.
     SpaceAround,
+    /// vue-native fork: CSS `safe center`. Centred while the content fits, and
+    /// packed toward the start when it would overflow. HTML lays a `<button>`'s
+    /// content out this way.
+    SafeCenter,
 }
 
 /// Sets the distribution of space between and around content items
@@ -1648,6 +1652,7 @@ impl From<AlignContent> for taffy::style::AlignContent {
             AlignContent::SpaceBetween => Self::SPACE_BETWEEN,
             AlignContent::SpaceEvenly => Self::SPACE_EVENLY,
             AlignContent::SpaceAround => Self::SPACE_AROUND,
+            AlignContent::SafeCenter => Self::SAFE_CENTER,
         }
     }
 }
@@ -1904,5 +1909,39 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+}
+
+/// vue-native fork: `AlignContent::SafeCenter` reaches taffy as `safe center`.
+/// A block container centres content that fits and starts content that
+/// overflows.
+#[cfg(test)]
+mod vn_safe_center_tests {
+    use crate::{AlignContent, Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    struct Boxes;
+
+    impl Render for Boxes {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let block = |name: &'static str, child_h: f32| {
+                let mut d = div().w(px(100.)).h(px(100.));
+                d.style().align_content = Some(AlignContent::SafeCenter);
+                d.child(div().debug_selector(move || name.into()).w(px(10.)).h(px(child_h)))
+            };
+            div().child(block("FITS", 20.)).child(block("OVERFLOWS", 200.))
+        }
+    }
+
+    #[gpui::test]
+    fn safe_center_centres_what_fits_and_starts_what_overflows(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(400.), px(600.)), |_, _| Boxes);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let at = |name: &str| window.rendered_frame.debug_bounds.get(name).copied().unwrap();
+                assert_eq!(at("FITS").origin.y, px(40.), "(100 - 20) / 2");
+                assert_eq!(at("OVERFLOWS").origin.y, px(100.), "at the start of the second box");
+            })
+            .unwrap();
     }
 }
