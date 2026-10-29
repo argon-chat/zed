@@ -3474,6 +3474,18 @@ pub enum DefiniteLength {
     Absolute(AbsoluteLength),
     /// A relative length specified as a fraction of the parent's size, between 0 and 1.
     Fraction(f32),
+    /// vue-native fork: CSS `calc(<percentage> + <length>)`, the fraction of the
+    /// parent's size plus an absolute length, resolved at LAYOUT time like a
+    /// percentage. It is the one calc() shape a layout needs that cannot be
+    /// folded to a constant when the stylesheet is compiled: reka's slider
+    /// places its thumbs with `left: calc(38.89% + 13.33px)`, and Tailwind
+    /// writes `w-[calc(100%-2rem)]`. See `calc_handle` in `taffy.rs`.
+    Calc {
+        /// The percentage half, as a fraction (`50%` is `0.5`).
+        fraction: f32,
+        /// The absolute half.
+        pixels: Pixels,
+    },
 }
 
 impl DefiniteLength {
@@ -3512,6 +3524,9 @@ impl DefiniteLength {
                 AbsoluteLength::Pixels(px) => px * fraction,
                 AbsoluteLength::Rems(rems) => rems * rem_size * fraction,
             },
+            DefiniteLength::Calc { fraction, pixels } => {
+                DefiniteLength::Fraction(fraction).to_pixels(base_size, rem_size) + pixels
+            }
         }
     }
 }
@@ -3527,6 +3542,9 @@ impl Display for DefiniteLength {
         match self {
             DefiniteLength::Absolute(length) => write!(f, "{length}"),
             DefiniteLength::Fraction(fraction) => write!(f, "{}%", (fraction * 100.0) as i32),
+            DefiniteLength::Calc { fraction, pixels } => {
+                write!(f, "calc({}% + {pixels})", fraction * 100.0)
+            }
         }
     }
 }
@@ -3934,6 +3952,7 @@ impl IsZero for DefiniteLength {
         match self {
             DefiniteLength::Absolute(length) => length.is_zero(),
             DefiniteLength::Fraction(fraction) => *fraction == 0.,
+            DefiniteLength::Calc { fraction, pixels } => *fraction == 0. && pixels.is_zero(),
         }
     }
 }

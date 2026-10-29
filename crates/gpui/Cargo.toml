@@ -112,6 +112,8 @@ taffy = { workspace = true, features = [
     "block_layout",
     "float_layout",
     "content_size",
+    # vue-native fork: `DefiniteLength::Calc` (see `calc_handle` in taffy.rs).
+    "calc",
 ] }
 thiserror.workspace = true
 gpui_util.workspace = true

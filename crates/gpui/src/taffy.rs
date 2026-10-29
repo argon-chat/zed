@@ -610,6 +610,12 @@ impl ToTaffy<taffy::style::LengthPercentage> for DefiniteLength {
             DefiniteLength::Fraction(fraction) => {
                 taffy::style::LengthPercentage::percent(*fraction)
             }
+            DefiniteLength::Calc { fraction, pixels } => {
+                match calc_handle(*fraction, *pixels, scale_factor) {
+                    Ok(handle) => taffy::style::LengthPercentage::calc(handle),
+                    Err(pixels) => taffy::style::LengthPercentage::length(pixels),
+                }
+            }
         }
     }
 }
@@ -621,6 +627,12 @@ impl ToTaffy<taffy::style::LengthPercentageAuto> for DefiniteLength {
             DefiniteLength::Fraction(fraction) => {
                 taffy::style::LengthPercentageAuto::percent(*fraction)
             }
+            DefiniteLength::Calc { fraction, pixels } => {
+                match calc_handle(*fraction, *pixels, scale_factor) {
+                    Ok(handle) => taffy::style::LengthPercentageAuto::calc(handle),
+                    Err(pixels) => taffy::style::LengthPercentageAuto::length(pixels),
+                }
+            }
         }
     }
 }
@@ -630,7 +642,49 @@ impl ToTaffy<taffy::style::Dimension> for DefiniteLength {
         match self {
             DefiniteLength::Absolute(length) => length.to_taffy(rem_size, scale_factor),
             DefiniteLength::Fraction(fraction) => taffy::style::Dimension::percent(*fraction),
+            DefiniteLength::Calc { fraction, pixels } => {
+                match calc_handle(*fraction, *pixels, scale_factor) {
+                    Ok(handle) => taffy::style::Dimension::calc(handle),
+                    Err(pixels) => taffy::style::Dimension::length(pixels),
+                }
+            }
         }
+    }
+}
+
+/// vue-native fork: the taffy `calc()` handle for [`DefiniteLength::Calc`].
+///
+/// taffy treats a calc value as an opaque, 8-byte-aligned handle and asks its
+/// tree to resolve it against the percentage basis (`resolve_calc_value`). A
+/// pointer to a heap node would need an owner and a lifetime; the linear form
+/// `fraction * basis + pixels` fits in the handle itself, so it is packed
+/// there: the length's `f32` bits in the high half, the fraction's in the low
+/// half with its three lowest mantissa bits cleared for taffy's tag (a relative
+/// error under 2^-20). vue-native's vendored taffy (`vendor/taffy`, patched
+/// into the vue-native workspace) decodes exactly this in
+/// `TaffyView::resolve_calc_value`; the two halves are a contract. Upstream
+/// taffy resolves every calc to zero, which is what this degrades to in a
+/// build against it (only vue-native ever writes a `Calc`).
+///
+/// `Err(pixels)` when there is nothing to pack: a zero fraction is a plain
+/// length, and taffy reserves the all-zero handle. On a 32-bit target the
+/// handle has no room for two `f32`s, so the percentage half is dropped there.
+fn calc_handle(fraction: f32, pixels: Pixels, scale_factor: f32) -> Result<*const (), f32> {
+    let length = round_to_device_pixel(pixels.0, scale_factor);
+    if fraction == 0. {
+        return Err(length);
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let bits = ((length.to_bits() as u64) << 32) | (fraction.to_bits() & !0b111) as u64;
+        if bits == 0 {
+            return Err(length);
+        }
+        Ok(bits as usize as *const ())
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        Err(length)
     }
 }
 
