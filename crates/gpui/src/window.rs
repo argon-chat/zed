@@ -1413,6 +1413,8 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    /// vue-native fork: [`Window::set_assume_active`].
+    assume_active: bool,
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
@@ -2160,6 +2162,12 @@ impl Window {
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
+                        // vue-native fork: an assumed-active window keeps
+                        // reading as active whatever the OS says
+                        // (`Window::set_assume_active`).
+                        if window.assume_active {
+                            return;
+                        }
                         window.active.set(active);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
@@ -2349,6 +2357,7 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            assume_active: false,
             visibility,
             visibility_observers: SubscriberSet::new(),
             hovered,
@@ -3167,6 +3176,26 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// vue-native fork: while `on`, gpui treats this window as active whatever
+    /// the operating system says. That covers [`Window::is_window_active`],
+    /// the focus paths a frame's focus events carry (with no OS activation
+    /// they are empty, so `on_focus` never fires), and the inactive-window
+    /// frame throttle. The platform's activation changes are ignored while it
+    /// is set.
+    ///
+    /// Nothing at the OS level changes: the window is not raised, activated
+    /// or given keyboard focus. vue-native's test hosts open their windows
+    /// behind everything and never take the foreground, yet must run focus
+    /// exactly as a window in front does. Turning it off goes back to what
+    /// the platform reports.
+    pub fn set_assume_active(&mut self, on: bool) {
+        self.assume_active = on;
+        let active = on || self.platform_window.is_active();
+        if self.active.replace(active) != active {
+            self.refresh();
+        }
     }
 
     /// Returns whether this window is considered to be the window
@@ -10648,5 +10677,72 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// vue-native fork: `Window::set_assume_active`.
+#[cfg(test)]
+mod vn_assume_active_tests {
+    use crate::{
+        Context, FocusHandle, Render, Subscription, TestAppContext, Window, div, prelude::*, px,
+        size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Focusable {
+        handle: FocusHandle,
+        _on_focus: Subscription,
+    }
+
+    impl Render for Focusable {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.handle)
+        }
+    }
+
+    #[gpui::test]
+    fn an_assumed_active_window_runs_focus_and_ignores_the_os(cx: &mut TestAppContext) {
+        let focused = Rc::new(Cell::new(0u32));
+        let counter = focused.clone();
+        let window = cx.open_window(size(px(200.), px(200.)), move |window, cx| {
+            let handle = cx.focus_handle();
+            let on_focus = cx.on_focus(&handle, window, move |_, _, _| counter.set(counter.get() + 1));
+            Focusable { handle, _on_focus: on_focus }
+        });
+        let platform = cx.test_window(window.into());
+        platform.simulate_active_status_change(false);
+        cx.run_until_parked();
+
+        // An inactive window's focus events carry no path, so nothing hears
+        // the focus move.
+        window
+            .update(cx, |view, window, cx| window.focus(&view.handle, cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(focused.get(), 0, "no focus event without activation");
+
+        // Assumed active: the focused element hears it on the next frame.
+        window
+            .update(cx, |_, window, _| window.set_assume_active(true))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(focused.get(), 1, "the focus event carries the path");
+        let active = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, _| window.is_window_active())
+                .unwrap()
+        };
+        assert!(active(cx));
+
+        // The OS's activation changes are ignored while it is set.
+        platform.simulate_active_status_change(false);
+        cx.run_until_parked();
+        assert!(active(cx), "still active after the OS says otherwise");
+
+        // Off: back to what the platform reports (a test window: inactive).
+        window
+            .update(cx, |_, window, _| window.set_assume_active(false))
+            .unwrap();
+        assert!(!active(cx));
     }
 }
