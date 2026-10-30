@@ -1108,6 +1108,10 @@ pub(crate) struct DeferredDraw {
     /// inside a `translate(-50%, -50%)` dialog landed half the window away from
     /// the dialog it belongs to.
     element_transform: TransformationMatrix,
+    /// vue-native fork: the accessibility node on top of the stack where the
+    /// element was deferred FROM, which its nodes belong under
+    /// (`A11yNodeBuilder::begin_adopted`). `None` when accessibility was off.
+    a11y_parent: Option<accesskit::NodeId>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -4150,9 +4154,17 @@ impl Window {
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
+                // vue-native fork: the element's accessibility nodes go under
+                // the node it was deferred from, not the window root.
+                let a11y_parent = self.next_frame.deferred_draws[deferred_draw_ix]
+                    .a11y_parent
+                    .filter(|&p| p != a11y::ROOT_NODE_ID && self.a11y.is_active());
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    if let Some(parent) = a11y_parent {
+                        self.a11y.nodes.begin_adopted(parent);
+                    }
                     self.with_rendered_view(current_view, |window| {
                         window.with_rem_size(Some(rem_size), |window| {
                             // The mask BEFORE the transform: it was captured in
@@ -4171,6 +4183,9 @@ impl Window {
                             });
                         });
                     });
+                    if a11y_parent.is_some() {
+                        self.a11y.nodes.end_adopted();
+                    }
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -4314,6 +4329,7 @@ impl Window {
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
                     element_transform: deferred_draw.element_transform,
+                    a11y_parent: deferred_draw.a11y_parent,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -4903,6 +4919,10 @@ impl Window {
             element: Some(element),
             absolute_offset,
             element_transform: self.element_transform,
+            a11y_parent: self
+                .a11y
+                .is_active()
+                .then(|| self.a11y.nodes.current_id()),
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });

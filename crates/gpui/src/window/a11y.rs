@@ -383,6 +383,9 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// vue-native fork: `(parent, child)` pairs from deferred draws (see
+    /// [`Self::begin_adopted`]), linked in [`Self::finalize`].
+    adoptions: Vec<(NodeId, NodeId)>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -396,6 +399,7 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            adoptions: Vec::new(),
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -460,6 +464,58 @@ impl A11yNodeBuilder {
         self.nodes_stack.last_mut()
     }
 
+    /// vue-native fork: the node on top of the stack, which a node pushed now
+    /// would become a child of. `Window::defer_draw` records it.
+    pub(crate) fn current_id(&self) -> NodeId {
+        self.ids_stack.last().copied().unwrap_or(ROOT_NODE_ID)
+    }
+
+    /// vue-native fork: starts prepainting a deferred draw that was deferred
+    /// while `parent` was on top of the stack.
+    ///
+    /// A deferred draw is prepainted after the whole tree, when only the root
+    /// is left on the stack, so its nodes used to hang off the window root: a
+    /// dialog's absolutely positioned Close button was the dialog's sibling.
+    /// `parent` was finalized long ago, so a stand-in carrying its id collects
+    /// the children here, and [`Self::finalize`] links them to it.
+    pub(crate) fn begin_adopted(&mut self, parent: NodeId) {
+        self.ids_stack.push(parent);
+        self.nodes_stack
+            .push(accesskit::Node::new(accesskit::Role::GenericContainer));
+    }
+
+    /// vue-native fork: ends what [`Self::begin_adopted`] began.
+    pub(crate) fn end_adopted(&mut self) {
+        if let (Some(parent), Some(stand_in)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
+            self.adoptions
+                .extend(stand_in.children().iter().map(|&child| (parent, child)));
+        }
+    }
+
+    /// vue-native fork: gives every adopted child to its parent, after the
+    /// parent's own children. A parent that is not in the tree after all
+    /// leaves the child on the root, where it would have been anyway.
+    fn link_adoptions(&mut self) {
+        if self.adoptions.is_empty() {
+            return;
+        }
+        let index: FxHashMap<NodeId, usize> = self
+            .all_nodes
+            .iter()
+            .enumerate()
+            .map(|(ix, (id, _))| (*id, ix))
+            .collect();
+        for (parent, child) in std::mem::take(&mut self.adoptions) {
+            let ix = index
+                .get(&parent)
+                .or_else(|| index.get(&ROOT_NODE_ID))
+                .copied();
+            if let Some(ix) = ix {
+                self.all_nodes[ix].1.push_child(child);
+            }
+        }
+    }
+
     /// Pop the current node off the stack and finalize it into the all_nodes
     /// list.
     pub(crate) fn pop(&mut self) {
@@ -476,6 +532,7 @@ impl A11yNodeBuilder {
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
+        self.adoptions.clear();
         #[cfg(debug_assertions)]
         self.node_info.clear();
         let mut root_node = accesskit::Node::new(accesskit::Role::Window);
@@ -560,6 +617,7 @@ impl A11yNodeBuilder {
                 self.all_nodes.push((id, node));
             }
         }
+        self.link_adoptions();
 
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,
@@ -901,5 +959,55 @@ mod tests {
 
         let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, a);
+    }
+}
+
+/// vue-native fork: a deferred draw's nodes go under the node it was deferred
+/// from (`A11yNodeBuilder::begin_adopted`).
+#[cfg(test)]
+mod vn_adoption_tests {
+    use super::{A11yNodeBuilder, ROOT_NODE_ID};
+    use accesskit::{NodeId, Role};
+
+    fn node() -> accesskit::Node {
+        accesskit::Node::new(Role::GenericContainer)
+    }
+
+    fn children_of(update: &accesskit::TreeUpdate, id: NodeId) -> Vec<NodeId> {
+        update
+            .nodes
+            .iter()
+            .find(|(n, _)| *n == id)
+            .map(|(_, node)| node.children().to_vec())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_deferred_node_is_a_child_of_the_node_it_was_deferred_from() {
+        let (dialog, title, close, icon) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+        let mut b = A11yNodeBuilder::new();
+        b.begin_frame(None);
+
+        // The dialog and its in-flow child; the Close button is deferred while
+        // the dialog is on top of the stack.
+        assert!(b.push(dialog, node()));
+        assert!(b.push_leaf(title, node()));
+        let deferred_from = b.current_id();
+        b.pop();
+        assert_eq!(deferred_from, dialog);
+
+        // Prepainted after the whole tree, with only the root on the stack.
+        b.begin_adopted(deferred_from);
+        assert!(b.push(close, node()));
+        assert!(b.push_leaf(icon, node()));
+        b.pop();
+        b.end_adopted();
+
+        let update = b.finalize();
+        assert_eq!(children_of(&update, dialog), vec![title, close]);
+        assert_eq!(children_of(&update, close), vec![icon]);
+        assert_eq!(children_of(&update, ROOT_NODE_ID), vec![dialog], "not on the root");
+        let dialogs = update.nodes.iter().filter(|(id, _)| *id == dialog).count();
+        assert_eq!(dialogs, 1, "the stand-in is not a node of its own");
     }
 }
