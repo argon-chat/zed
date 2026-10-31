@@ -825,6 +825,13 @@ impl HitboxId {
     }
 
     fn hit_test(self, window: &Window) -> bool {
+        // vue-native fork: a pointer that is not in the window hovers nothing,
+        // wherever `mouse_position` says it is (`Window::pointer_inside`). A
+        // browser shows no `:hover` under a cursor that is over another
+        // window, or that has left this one.
+        if !window.pointer_inside {
+            return false;
+        }
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
             if self == *id {
@@ -1423,6 +1430,20 @@ pub struct Window {
     pub(crate) visibility_observers:
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
+    /// vue-native fork: is the pointer in this window, as far as the input
+    /// gpui has seen says? Until it is, `mouse_position` is only where the OS
+    /// cursor projects onto the client area (`Window::new` and
+    /// `bounds_changed` read it from the platform). The cursor may be over
+    /// another window that covers this one, or the position may be stale
+    /// since the pointer left. No hitbox counts as hovered while this is
+    /// false ([`HitboxId::is_hovered`]). The hit test itself is kept, because
+    /// the platform's window-control hit test (`WM_NCHITTEST`) reads it.
+    ///
+    /// Any pointer input dispatched to the window sets it, a synthesized
+    /// one included (a test harness or devtools moving the pointer means it).
+    /// `MouseExited`, a file drag leaving, and the platform's hover-status
+    /// change to false clear it. It starts as the platform's `is_hovered()`.
+    pointer_inside: bool,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -2204,6 +2225,7 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, _| {
                         window.hovered.set(active);
+                        window.pointer_inside = active;
                         window.refresh();
                     })
                     .log_err();
@@ -2364,6 +2386,7 @@ impl Window {
             assume_active: false,
             visibility,
             visibility_observers: SubscriberSet::new(),
+            pointer_inside: hovered.get(),
             hovered,
             needs_present,
             input_rate_tracker,
@@ -6308,6 +6331,33 @@ impl Window {
         if self.last_input_modality != old_modality {
             self.refresh();
         }
+        // vue-native fork: [`Window::pointer_inside`]. Exhaustive on purpose,
+        // so a new kind of input has to say which side it is on. A leave
+        // applies AFTER the event is dispatched, so the listeners that handle
+        // it (a file drag's exit, say) still see the element the pointer left.
+        let pointer_leaves = match &event {
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_)
+            | PlatformInput::MousePressure(_)
+            | PlatformInput::Scroll(_)
+            | PlatformInput::Pinch(_)
+            | PlatformInput::LongPress(_)
+            | PlatformInput::TouchDrag(_)
+            | PlatformInput::BackGesture(_)
+            | PlatformInput::Touch(_) => {
+                self.pointer_inside = true;
+                false
+            }
+            PlatformInput::FileDrop(FileDropEvent::Exited) | PlatformInput::MouseExited(_) => true,
+            PlatformInput::FileDrop(_) => {
+                self.pointer_inside = true;
+                false
+            }
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => false,
+        };
 
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
@@ -6451,6 +6501,12 @@ impl Window {
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
         // is the last chance for drag listeners to see the pointer leave and reset their state.
         self.promote_external_drag_to_platform(&event, cx);
+
+        // vue-native fork: the leave, now that its listeners have run. The
+        // frame that drops the hover styles is asked for here.
+        if pointer_leaves && std::mem::replace(&mut self.pointer_inside, false) {
+            self.refresh();
+        }
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
@@ -10764,5 +10820,80 @@ mod vn_assume_active_tests {
             .update(cx, |_, window, _| window.set_assume_active(false))
             .unwrap();
         assert!(!active(cx));
+    }
+}
+
+/// vue-native fork: `Window::pointer_inside`.
+#[cfg(test)]
+mod vn_pointer_inside_tests {
+    use crate::{
+        Context, Modifiers, MouseExitEvent, MouseMoveEvent, PlatformInput, Render,
+        TestAppContext, Window, div, point, prelude::*, px, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Hoverable {
+        hovered: Rc<Cell<bool>>,
+    }
+
+    impl Render for Hoverable {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hovered = self.hovered.clone();
+            div()
+                .id("box")
+                .size_full()
+                .on_hover(move |is_hovered, _, _| hovered.set(*is_hovered))
+        }
+    }
+
+    #[gpui::test]
+    fn a_pointer_outside_the_window_hovers_nothing(cx: &mut TestAppContext) {
+        let hovered = Rc::new(Cell::new(false));
+        let state = hovered.clone();
+        let window = cx.open_window(size(px(200.), px(200.)), move |_, _| Hoverable {
+            hovered: state,
+        });
+        let mut platform = cx.test_window(window.into());
+        let draw = |cx: &mut TestAppContext| {
+            window.update(cx, |_, window, _| window.refresh()).unwrap();
+            cx.run_until_parked();
+        };
+        let at = |x: f32, y: f32| point(px(x), px(y));
+        let moved = |x: f32, y: f32| {
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: at(x, y),
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            })
+        };
+
+        // The test platform reports the cursor at (0, 0), inside the box, as
+        // Windows reports wherever the cursor projects. No pointer input has
+        // reached the window, so nothing is hovered.
+        draw(cx);
+        assert!(!hovered.get(), "a cursor that never entered hovers nothing");
+
+        platform.simulate_input(moved(50., 50.));
+        draw(cx);
+        assert!(hovered.get(), "a move into the box hovers it");
+
+        // The platform says the pointer left (`WM_MOUSELEAVE`). The position
+        // is still inside the box, and the next frame's hit test still finds
+        // it there.
+        platform.simulate_hover_status_change(false);
+        draw(cx);
+        assert!(!hovered.get(), "a pointer that left hovers nothing");
+
+        platform.simulate_input(moved(60., 60.));
+        draw(cx);
+        assert!(hovered.get(), "back in");
+
+        platform.simulate_input(PlatformInput::MouseExited(MouseExitEvent {
+            position: at(60., 60.),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }));
+        draw(cx);
+        assert!(!hovered.get(), "MouseExited");
     }
 }

@@ -266,6 +266,18 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    /// vue-native fork: the platform reports that the pointer entered or left
+    /// the window (`WM_MOUSELEAVE` on Windows).
+    pub(crate) fn simulate_hover_status_change(&self, hovered: bool) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.hover_status_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(hovered);
+        self.0.lock().hover_status_change_callback = Some(callback);
+    }
+
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
         let mut lock = self.0.lock();
         lock.appearance = appearance;
