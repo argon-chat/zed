@@ -6349,6 +6349,29 @@ impl Window {
             .map(|(_, hitbox)| hitbox)
     }
 
+    /// vue-native fork: the embedder tags of the hitboxes under `position` in
+    /// the RENDERED frame, topmost first — the order a press resolves in
+    /// ([`Frame::hit_test`], so a deferred draw's boxes sort where it paints).
+    /// A hitbox no node tagged is left out; a node with several boxes there
+    /// appears once per box.
+    ///
+    /// An embedder asks it to learn which of ITS nodes is on top under the
+    /// pointer, which gpui's own answer (`Hitbox::is_hovered`, true for every
+    /// box under the pointer) cannot say. One hit test plus one pass over the
+    /// frame's tagged boxes: meant for a press or a drag, not for every mouse
+    /// move.
+    pub fn vn_tags_at(&self, position: Point<Pixels>) -> Vec<u32> {
+        let hit = self.rendered_frame.hit_test(position, self.scale_factor);
+        if hit.ids.is_empty() {
+            return Vec::new();
+        }
+        let mut tag_of: FxHashMap<HitboxId, u32> = FxHashMap::default();
+        for (tag, hitbox) in &self.rendered_frame.vn_tagged_hitboxes {
+            tag_of.entry(hitbox.id).or_insert(*tag);
+        }
+        hit.ids.iter().filter_map(|id| tag_of.get(id).copied()).collect()
+    }
+
     /// Set a hitbox which will act as a control area of the platform window.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
