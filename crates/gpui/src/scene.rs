@@ -1149,7 +1149,8 @@ impl EffectSpec {
 /// Keep the field order in sync with `struct EffectQuad` in
 /// `gpui_windows/src/effects.hlsl` and with `struct VnEffectQuad` in the
 /// generated wrapper (`packages/vue-native/shaders.ts`).
-/// 32 words / 128 bytes.
+/// 32 words / 128 bytes. (vue-native fork: the content mask's corner radii
+/// took the four words of padding that closed it.)
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1177,7 +1178,6 @@ pub struct EffectQuad {
     /// Device pixels per logical pixel.
     pub scale: f32,
     pub flags: u32,
-    pub pad: [u32; 4],
 }
 
 impl EffectQuad {
@@ -1219,17 +1219,18 @@ const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
 // bytes and produces garbage rather than an error, so the sizes are asserted
 // here where a mismatch is a compile failure.
 //
-// Word counts, for the shader side: 85 / 34 / 22 / 30.
+// Word counts, for the shader side: 89 / 38 / 26 / 34. (vue-native fork: each
+// grew by four, the content mask's corner radii.)
 //
 // `Quad` carries a `Background`, which is 57 words since it grew from a
 // two-stop linear ramp to an eight-stop linear / radial / conic one with
 // repeat and tiling (`color.rs`). `PathRasterizationVertex` carries one too
 // and is asserted next to the WebGL word strides in `gpui_wgpu`.
-const _: () = assert!(std::mem::size_of::<Quad>() == 85 * 4);
+const _: () = assert!(std::mem::size_of::<Quad>() == 89 * 4);
 const _: () = assert!(std::mem::size_of::<Background>() == 57 * 4);
-const _: () = assert!(std::mem::size_of::<Shadow>() == 34 * 4);
-const _: () = assert!(std::mem::size_of::<Underline>() == 22 * 4);
-const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 30 * 4);
+const _: () = assert!(std::mem::size_of::<Shadow>() == 38 * 4);
+const _: () = assert!(std::mem::size_of::<Underline>() == 26 * 4);
+const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 34 * 4);
 const _: () = assert!(std::mem::size_of::<TransformationMatrix>() == 6 * 4);
 
 /// Seconds since the first effect was painted — the clock [`EffectQuad::time`]

@@ -1465,7 +1465,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
         };
 
         let bounds = Bounds::new(self.origin + origin, size);
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::rect(bounds)), |window| {
             let colors = cx.theme().colors();
 
             let capture_phase;
@@ -1566,6 +1566,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
 
                         window.with_content_mask(
                             Some(ContentMask {
+                                corner_radii: Default::default(),
                                 bounds: *track_bounds,
                             }),
                             |window| {

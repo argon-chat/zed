@@ -2139,6 +2139,7 @@ impl Editor {
 
         window.with_content_mask(
             Some(gpui::ContentMask {
+                corner_radii: Default::default(),
                 bounds: *text_bounds,
             }),
             |window| {

@@ -57,7 +57,7 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
-    ops::{DerefMut, Range},
+    ops::{Add, DerefMut, Div, Range, Sub},
     rc::Rc,
     sync::{
         Arc, Weak,
@@ -890,6 +890,38 @@ fn transform_bounds(
     Bounds::from_corners(Point::new(min_x, min_y), Point::new(max_x, max_y))
 }
 
+/// vue-native fork: a content mask mapped like [`transform_bounds`]. Its radii
+/// survive a translation and a positive scale. A non-uniform scale takes the
+/// smaller factor, a circular corner inside the elliptical one, so the clip
+/// shows a little more rather than less. A rotation, skew or flip drops the
+/// radii, leaving the square bounding box that `transform_bounds` gives.
+fn transform_mask(
+    matrix: TransformationMatrix,
+    mask: ContentMask<Pixels>,
+    scale_factor: f32,
+) -> ContentMask<Pixels> {
+    let bounds = transform_bounds(matrix, mask.bounds, scale_factor);
+    if !mask.is_rounded() || matrix.is_unit() {
+        return ContentMask {
+            bounds,
+            corner_radii: mask.corner_radii,
+        };
+    }
+    let [[a, b], [c, d]] = matrix.rotation_scale;
+    let corner_radii = if b == 0. && c == 0. && a > 0. && d > 0. {
+        let factor = a.min(d);
+        mask.corner_radii
+            .map(|radius| *radius * factor)
+            .clamp_radii_for_quad_size(bounds.size)
+    } else {
+        Corners::default()
+    };
+    ContentMask {
+        bounds,
+        corner_radii,
+    }
+}
+
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [Window::insert_hitbox] for more details.
 #[derive(Clone, Debug, Deref)]
@@ -1306,7 +1338,7 @@ impl Frame {
             // exist: a `translate(-50%, -50%)` dialog painted 500px to the left
             // of a clip rect that had not moved, and every clipping element
             // inside it hit-tested against a region it no longer covered.
-            if hitbox.content_mask.bounds.contains(&position) && hitbox.bounds.contains(&local) {
+            if hitbox.content_mask.contains(&position) && hitbox.bounds.contains(&local) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -2441,13 +2473,37 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered.
+///
+/// vue-native fork: the mask is a ROUNDED rect. All-zero `corner_radii` is the plain rectangle gpui
+/// always had, and costs each fragment shader one uniform branch. With radii, every primitive's
+/// fragment shader multiplies its coverage by the rounded rect's antialiased SDF
+/// (`content_mask_coverage` in each backend), on top of the hardware clip to `bounds`. CSS
+/// `overflow` under a `border-radius` is what pushes one ([`crate::Style::overflow_mask`]).
+/// [`ContentMask::intersect`] says what nesting two masks keeps exact.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// vue-native fork: each corner's radius, zero for a square corner. Every
+    /// primitive carries it right after `bounds`, so the shaders' structs do too.
+    pub corner_radii: Corners<P>,
+}
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// vue-native fork: a plain rectangular mask.
+    pub fn rect(bounds: Bounds<P>) -> Self {
+        ContentMask {
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+
+    /// vue-native fork: whether any corner is rounded.
+    pub fn is_rounded(&self) -> bool {
+        self.corner_radii != Corners::default()
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -2455,13 +2511,94 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+        }
+    }
+}
+
+impl<P> ContentMask<P>
+where
+    P: Copy
+        + Ord
+        + Debug
+        + Default
+        + Add<P, Output = P>
+        + Sub<P, Output = P>
+        + Div<f32, Output = P>
+        + Into<f64>,
+{
+    /// Intersect the content mask with the given content mask.
+    ///
+    /// vue-native fork, the rounded corners:
+    /// - Two rectangles intersect exactly, as before.
+    /// - A corner of the result that is also a corner of one of the masks keeps
+    ///   that mask's radius. When both masks have a corner there, the larger
+    ///   radius wins. Two corners at one point nest, so the larger radius is the
+    ///   smaller region, and that is exact.
+    /// - Any other corner of the result is square. That is exact when the
+    ///   rounded mask's curve does not reach it: a rect clip inside the curve's
+    ///   span, or a scroller inset from its rounded card. Where a rect clip cuts
+    ///   through a curve, the cut corner comes out square and shows the sliver
+    ///   the curve would have hidden. That is the one approximation; the common
+    ///   case, one rounded ancestor around rect clips that fill it or sit
+    ///   inside it, is exact.
+    pub fn intersect(&self, other: &Self) -> Self {
+        let bounds = self.bounds.intersect(&other.bounds);
+        if !self.is_rounded() && !other.is_rounded() {
+            return ContentMask::rect(bounds);
+        }
+        let at = |mask: &Self, left: bool, top: bool| {
+            let x = if left { mask.bounds.left() } else { mask.bounds.right() };
+            let y = if top { mask.bounds.top() } else { mask.bounds.bottom() };
+            (x, y)
+        };
+        let radius = |left: bool, top: bool, mine: P, theirs: P| {
+            let here = at(&ContentMask::rect(bounds), left, top);
+            let mine = if at(self, left, top) == here { mine } else { P::default() };
+            let theirs = if at(other, left, top) == here { theirs } else { P::default() };
+            mine.max(theirs)
+        };
+        let (a, b) = (&self.corner_radii, &other.corner_radii);
+        let corner_radii = Corners {
+            top_left: radius(true, true, a.top_left, b.top_left),
+            top_right: radius(false, true, a.top_right, b.top_right),
+            bottom_right: radius(false, false, a.bottom_right, b.bottom_right),
+            bottom_left: radius(true, false, a.bottom_left, b.bottom_left),
+        }
+        .clamp_radii_for_quad_size(bounds.size);
+        ContentMask {
+            bounds,
+            corner_radii,
         }
     }
 
-    /// Intersect the content mask with the given content mask.
-    pub fn intersect(&self, other: &Self) -> Self {
-        let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+    /// vue-native fork: whether `point` is inside the mask, its rounded
+    /// corners included. The hit test asks this, so a click outside a rounded
+    /// clip's curve does not reach what the clip hides.
+    pub fn contains(&self, point: &Point<P>) -> bool {
+        if !self.bounds.contains(point) {
+            return false;
+        }
+        if !self.is_rounded() {
+            return true;
+        }
+        let b = &self.bounds;
+        let r = &self.corner_radii;
+        for (radius, cx, cy, left, top) in [
+            (r.top_left, b.left() + r.top_left, b.top() + r.top_left, true, true),
+            (r.top_right, b.right() - r.top_right, b.top() + r.top_right, false, true),
+            (r.bottom_right, b.right() - r.bottom_right, b.bottom() - r.bottom_right, false, false),
+            (r.bottom_left, b.left() + r.bottom_left, b.bottom() - r.bottom_left, true, false),
+        ] {
+            let in_x = if left { point.x < cx } else { point.x > cx };
+            let in_y = if top { point.y < cy } else { point.y > cy };
+            if radius > P::default() && in_x && in_y {
+                let (dx, dy): (f64, f64) = ((point.x - cx).into(), (point.y - cy).into());
+                let radius: f64 = radius.into();
+                return dx * dx + dy * dy <= radius * radius;
+            }
+        }
+        true
     }
 }
 
@@ -3499,13 +3636,14 @@ impl Window {
         exclusions.sort_unstable_by_key(|span| span.start);
 
         let mut paint_span = |start, end| {
+            // vue-native fork: through `intersect`, so a span that ends at a
+            // rounded mask's corner keeps the curve.
+            let span = ContentMask::rect(Bounds::from_corners(
+                point(start, bounds.top()),
+                point(end, bounds.bottom()),
+            ));
             self.next_frame.scene.insert_primitive(Underline {
-                content_mask: ContentMask {
-                    bounds: Bounds::from_corners(
-                        point(start, bounds.top()),
-                        point(end, bounds.bottom()),
-                    ),
-                },
+                content_mask: underline.content_mask.intersect(&span),
                 ..underline
             });
         };
@@ -3579,8 +3717,13 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(mask.bounds),
+            // vue-native fork: the radii scale as they are. The curve then
+            // sits on the covered bounds, which are at most one device pixel
+            // out from the exact ones, as the straight edges already are.
+            corner_radii: mask.corner_radii.scale(self.scale_factor()),
         }
     }
 
@@ -4496,14 +4639,9 @@ impl Window {
             // Exact for a translation; a rotation or scale gives the axis-
             // aligned bounding box of the mapped rect, which is a superset — a
             // clip that shows a little too much rather than one that hides
-            // content that should be visible.
-            let mask = ContentMask {
-                bounds: transform_bounds(
-                    self.element_transform,
-                    mask.bounds,
-                    self.scale_factor,
-                ),
-            };
+            // content that should be visible. (vue-native fork: the corner
+            // radii map along; `transform_mask` says when they survive.)
+            let mask = transform_mask(self.element_transform, mask, self.scale_factor);
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
@@ -4634,10 +4772,8 @@ impl Window {
             return mask;
         }
         match self.element_transform.inverse() {
-            Some(inverse) => ContentMask {
-                bounds: transform_bounds(inverse, mask.bounds, self.scale_factor),
-            },
-            None => ContentMask { bounds: Bounds::default() },
+            Some(inverse) => transform_mask(inverse, mask, self.scale_factor),
+            None => ContentMask::rect(Bounds::default()),
         }
     }
 
@@ -4734,11 +4870,11 @@ impl Window {
         self.content_mask_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
+            .unwrap_or_else(|| {
+                ContentMask::rect(Bounds {
                     origin: Point::default(),
                     size: self.viewport_size,
-                },
+                })
             })
     }
 
@@ -5160,8 +5296,10 @@ impl Window {
         // those masks no longer correspond to the pieces they are clipping, so
         // the optimisation is skipped rather than made wrong — a transformed
         // border-only quad shades its transparent interior, which is what it
-        // did before the split existed.
-        if !quad.transformation.is_unit() {
+        // did before the split existed. (vue-native fork: under a rounded
+        // content mask too: a strip's mask would cut through the curve, and
+        // `ContentMask::intersect` squares such a corner.)
+        if !quad.transformation.is_unit() || quad.content_mask.is_rounded() {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -5203,9 +5341,7 @@ impl Window {
             let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
             if !content_mask_bounds.is_empty() {
                 self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                    },
+                    content_mask: ContentMask::rect(content_mask_bounds),
                     ..quad
                 });
             }
@@ -5356,7 +5492,6 @@ impl Window {
             backdrop_blur_radius: px(spec.backdrop_blur_radius()).scale(scale_factor),
             scale: scale_factor,
             flags: spec.flags,
-            pad: [0; 4],
         });
     }
 
@@ -10374,6 +10509,7 @@ mod tests {
             let original_opacity = window.element_opacity();
             let mask = ContentMask {
                 bounds: Bounds::from_corners(point(px(4.), px(10.)), point(px(16.), px(12.))),
+                corner_radii: crate::Corners::default(),
             };
             let style = UnderlineStyle {
                 thickness: px(2.),
@@ -10519,12 +10655,10 @@ mod tests {
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
-                    window.content_mask_stack.push(ContentMask {
-                        bounds: Bounds::from_corners(
-                            point(px(-1000.), px(-1000.)),
-                            point(px(1000.), px(1000.)),
-                        ),
-                    });
+                    window.content_mask_stack.push(ContentMask::rect(Bounds::from_corners(
+                        point(px(-1000.), px(-1000.)),
+                        point(px(1000.), px(1000.)),
+                    )));
                     paint(window);
                     window.content_mask_stack.pop();
                 },
@@ -10820,6 +10954,100 @@ mod vn_assume_active_tests {
             .update(cx, |_, window, _| window.set_assume_active(false))
             .unwrap();
         assert!(!active(cx));
+    }
+}
+
+/// vue-native fork: rounded content masks, `ContentMask::intersect`'s corner
+/// rule, `contains` and `transform_mask`.
+#[cfg(test)]
+mod vn_rounded_mask_tests {
+    use super::transform_mask;
+    use crate::{Bounds, ContentMask, Corners, TransformationMatrix, point, px, size};
+
+    fn mask(x: f32, y: f32, w: f32, h: f32, radius: f32) -> ContentMask<crate::Pixels> {
+        ContentMask {
+            bounds: Bounds::new(point(px(x), px(y)), size(px(w), px(h))),
+            corner_radii: Corners::all(px(radius)),
+        }
+    }
+
+    #[test]
+    fn rectangles_intersect_exactly_and_stay_square() {
+        let a = mask(0., 0., 100., 100., 0.);
+        let b = mask(50., 20., 100., 30., 0.);
+        let both = a.intersect(&b);
+        assert_eq!(both.bounds, Bounds::new(point(px(50.), px(20.)), size(px(50.), px(30.))));
+        assert!(!both.is_rounded());
+    }
+
+    #[test]
+    fn a_corner_keeps_the_radius_of_the_mask_it_belongs_to() {
+        // A rounded card and the square scroller that fills it.
+        let card = mask(10., 10., 200., 160., 24.);
+        let scroller = mask(10., 10., 200., 160., 0.);
+        assert_eq!(scroller.intersect(&card).corner_radii, Corners::all(px(24.)));
+        assert_eq!(card.intersect(&scroller).corner_radii, Corners::all(px(24.)));
+
+        // A rect that shares only the card's top edge: its top corners are
+        // the card's, its bottom ones are its own.
+        let header = mask(10., 10., 200., 60., 0.);
+        let clipped = header.intersect(&card);
+        assert_eq!(clipped.corner_radii.top_left, px(24.));
+        assert_eq!(clipped.corner_radii.top_right, px(24.));
+        assert_eq!(clipped.corner_radii.bottom_left, px(0.));
+        assert_eq!(clipped.corner_radii.bottom_right, px(0.));
+
+        // Two rounded corners at one point nest; the larger radius is the
+        // smaller region.
+        let inner = mask(10., 10., 200., 160., 8.);
+        assert_eq!(inner.intersect(&card).corner_radii, Corners::all(px(24.)));
+
+        // A rect inside the card's straight span is square, which is exact.
+        let row = mask(40., 60., 100., 20., 0.);
+        assert!(!row.intersect(&card).is_rounded());
+
+        // The radii still fit the result.
+        let sliver = mask(10., 10., 200., 10., 0.);
+        let clipped = sliver.intersect(&card);
+        assert_eq!(clipped.corner_radii.top_left, px(5.));
+    }
+
+    #[test]
+    fn contains_follows_the_curve() {
+        let avatar = mask(0., 0., 64., 64., 32.);
+        assert!(avatar.contains(&point(px(32.), px(32.))));
+        assert!(avatar.contains(&point(px(32.), px(1.))), "the top edge's middle");
+        assert!(!avatar.contains(&point(px(2.), px(2.))), "outside the curve");
+        assert!(!avatar.contains(&point(px(62.), px(62.))));
+        assert!(avatar.contains(&point(px(10.), px(10.))), "inside the curve");
+        assert!(!avatar.contains(&point(px(70.), px(32.))), "outside the rect");
+        assert!(mask(0., 0., 64., 64., 0.).contains(&point(px(1.), px(1.))));
+    }
+
+    #[test]
+    fn a_transform_keeps_the_radii_only_while_corners_stay_round() {
+        let card = mask(0., 0., 100., 100., 10.);
+        let moved = TransformationMatrix {
+            rotation_scale: [[1., 0.], [0., 1.]],
+            translation: [5., 7.],
+        };
+        assert_eq!(transform_mask(moved, card, 1.).corner_radii, Corners::all(px(10.)));
+
+        let scaled = TransformationMatrix {
+            rotation_scale: [[2., 0.], [0., 3.]],
+            translation: [0., 0.],
+        };
+        assert_eq!(
+            transform_mask(scaled, card, 1.).corner_radii,
+            Corners::all(px(20.)),
+            "the smaller factor"
+        );
+
+        let rotated = TransformationMatrix {
+            rotation_scale: [[0., 1.], [-1., 0.]],
+            translation: [0., 0.],
+        };
+        assert!(!transform_mask(rotated, card, 1.).is_rounded());
     }
 }
 

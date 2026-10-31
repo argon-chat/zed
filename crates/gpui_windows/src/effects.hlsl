@@ -76,6 +76,8 @@ struct EffectQuad {
     uint effect_id;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Corners corner_radii;
     float4 params0;
     float4 params1;
@@ -85,7 +87,6 @@ struct EffectQuad {
     float backdrop_blur_radius;
     float scale;
     uint flags;
-    uint4 pad;
 };
 
 StructuredBuffer<EffectQuad> effect_quads: register(t1);

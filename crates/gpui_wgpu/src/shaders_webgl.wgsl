@@ -158,18 +158,20 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 }
 
 fn load_quad(instance_id: u32) -> Quad {
-    // 85 words: 22 + the 57 of `Background` + the 6 of the vue-native
-    // `transformation` field.
+    // 89 words: 26 + the 57 of `Background` + the 6 of the vue-native
+    // `transformation` field. (vue-native fork: the 26 include the content
+    // mask's corner radii.)
     //
     // vue-native fork: upstream (zed#64337) replaced this with a fixed
     // 10-texel decoder for ITS 40-word quad. Our quad is 85 words with an
     // 8-stop `Background`, so the cursor stays; gpui_web is not in our build.
-    var cursor = instance_cursor(instance_id * 85u);
+    var cursor = instance_cursor(instance_id * 89u);
     return Quad(
         read_word(&cursor),
         read_word(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
         read_background(&cursor),
         read_hsla(&cursor),
         read_corners(&cursor),
@@ -179,13 +181,14 @@ fn load_quad(instance_id: u32) -> Quad {
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 34u);
+    var cursor = instance_cursor(instance_id * 38u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
         read_hsla(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
@@ -196,13 +199,16 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    // 65 words: 8 + the 57 of `Background`.
-    var cursor = instance_cursor(vertex_id * 65u);
+    // 73 words: 8 + the 57 of `Background` + the vue-native content mask's
+    // rect and radii.
+    var cursor = instance_cursor(vertex_id * 73u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
         read_background(&cursor),
         read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_corners(&cursor),
     );
 }
 
@@ -212,12 +218,13 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 22u);
+    var cursor = instance_cursor(instance_id * 26u);
     return Underline(
         read_word(&cursor),
         read_word(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
         read_hsla(&cursor),
         read_f32(&cursor),
         read_word(&cursor),
@@ -226,20 +233,21 @@ fn load_underline(instance_id: u32) -> Underline {
 }
 
 fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 28u);
+    var cursor = instance_cursor(instance_id * 32u);
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),
         read_atlas_tile(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
         read_hsla(&cursor),
         read_transformation(&cursor),
     );
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 30u);
+    var cursor = instance_cursor(instance_id * 34u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -248,6 +256,7 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_f32(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
         read_corners(&cursor),
         read_transformation(&cursor),
     );

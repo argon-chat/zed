@@ -419,6 +419,25 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
     return vec4<f32>(color.rgb * multiplier, alpha);
 }
 
+// vue-native fork: the coverage of a ROUNDED content mask at `position`, the
+// fragment's pixel centre, in the device pixels the mask is in. The clip
+// distances already cut the mask's rectangle, so all-zero radii, the common
+// case, return 1 before any SDF math. Mirrors gpui_windows' shaders.hlsl.
+fn content_mask_coverage(position: vec2<f32>, mask: Bounds, radii: Corners) -> f32 {
+    if (radii.top_left == 0.0 && radii.top_right == 0.0 &&
+        radii.bottom_right == 0.0 && radii.bottom_left == 0.0) {
+        return 1.0;
+    }
+    return saturate(0.5 - quad_sdf(position, mask, radii));
+}
+
+// vue-native fork: scales a `blend_color` result by a coverage: its alpha, and
+// its colour too when the target is premultiplied.
+fn mask_blended(color: vec4<f32>, coverage: f32) -> vec4<f32> {
+    let multiplier = select(1.0, coverage, globals.premultiplied_alpha != 0u);
+    return vec4<f32>(color.rgb * multiplier, color.a * coverage);
+}
+
 
 struct GradientColor {
     solid: vec4<f32>,
@@ -705,6 +724,8 @@ struct Quad {
     border_style: u32,
     bounds: Bounds,
     content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
     background: Background,
     border_color: Hsla,
     corner_radii: Corners,
@@ -746,8 +767,9 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
-@fragment
-fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+// vue-native fork: `fs_quad` before the content mask's corners; it returns from
+// a handful of places, and the wrapper below takes them all.
+fn quad_color(input: QuadVarying) -> vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
@@ -1084,6 +1106,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     return blend_color(color, saturate(antialias_threshold - outer_sdf));
 }
 
+@fragment
+fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    let quad = load_quad(input.quad_id);
+    return mask_blended(quad_color(input),
+        content_mask_coverage(input.position.xy, quad.content_mask, quad.content_mask_radii));
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
@@ -1146,6 +1175,8 @@ struct Shadow {
     bounds: Bounds,
     corner_radii: Corners,
     content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
@@ -1240,6 +1271,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= saturate(0.5 - element_distance);
     }
 
+    alpha *= content_mask_coverage(input.position.xy, shadow.content_mask, shadow.content_mask_radii);
     return blend_color(input.color, alpha);
 }
 
@@ -1250,6 +1282,11 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    // vue-native fork: the path's content mask. `bounds` is the path clipped
+    // to it, which is the clip rect and the gradient's box; the rounded
+    // corners need the mask's own rect.
+    content_mask: Bounds,
+    content_mask_radii: Corners,
 }
 
 
@@ -1299,6 +1336,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let prepared_gradient = prepare_gradient_color(background);
     let color = gradient_color(background, input.position.xy, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
+    alpha *= content_mask_coverage(input.position.xy, v.content_mask, v.content_mask_radii);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
 
@@ -1344,6 +1382,8 @@ struct Underline {
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
     color: Hsla,
     thickness: f32,
     wavy: u32,
@@ -1388,9 +1428,11 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     }
 
     let underline = load_underline(input.underline_id);
+    let mask = content_mask_coverage(input.position.xy, underline.content_mask,
+                                     underline.content_mask_radii);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, input.color.a * mask);
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1406,7 +1448,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * input.color.a * mask);
 }
 
 // --- monochrome sprites --- //
@@ -1417,16 +1459,31 @@ struct MonochromeSprite {
     tile: AtlasTile,
     bounds: Bounds,
     content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
     color: Hsla,
     transformation: TransformationMatrix,
 }
 
 
+// vue-native fork: the glyph pipeline carries no sprite id to the fragment
+// shader, so the content mask's rect and radii ride along as flat varyings.
 struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) mask_bounds: vec4<f32>,
+    @location(5) @interpolate(flat) mask_radii: vec4<f32>,
+}
+
+// vue-native fork: `content_mask_coverage` for the flat varyings above.
+fn sprite_mask_coverage(position: vec2<f32>, mask_bounds: vec4<f32>, mask_radii: vec4<f32>) -> f32 {
+    return content_mask_coverage(
+        position,
+        Bounds(mask_bounds.xy, mask_bounds.zw),
+        Corners(mask_radii.x, mask_radii.y, mask_radii.z, mask_radii.w),
+    );
 }
 
 @vertex
@@ -1440,6 +1497,9 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.mask_bounds = vec4<f32>(sprite.content_mask.origin, sprite.content_mask.size);
+    out.mask_radii = vec4<f32>(sprite.content_mask_radii.top_left, sprite.content_mask_radii.top_right,
+                               sprite.content_mask_radii.bottom_right, sprite.content_mask_radii.bottom_left);
     return out;
 }
 
@@ -1453,7 +1513,8 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    let mask = sprite_mask_coverage(input.position.xy, input.mask_bounds, input.mask_radii);
+    return blend_color(input.color, alpha_corrected * mask);
 }
 
 // --- polychrome sprites --- //
@@ -1466,6 +1527,8 @@ struct PolychromeSprite {
     opacity: f32,
     bounds: Bounds,
     content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
     corner_radii: Corners,
     // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
     // gpui/src/scene.rs IS this layout, so the field must stay last and in
@@ -1512,7 +1575,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    let mask = content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance) * mask);
 }
 
 // --- surfaces --- //

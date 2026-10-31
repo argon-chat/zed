@@ -350,6 +350,7 @@ impl Element for SplitBufferHeadersElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(
                     Some(ContentMask {
+                        corner_radii: Default::default(),
                         bounds: prepaint.content_bounds,
                     }),
                     |window| {
@@ -688,7 +689,7 @@ impl SplitBufferHeadersElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::rect(bounds)), |window| {
             header.prepaint_as_root(origin, available_size, window, cx);
         });
     }

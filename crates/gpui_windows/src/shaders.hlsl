@@ -367,6 +367,21 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
+// vue-native fork: the coverage of a ROUNDED content mask at `position`, the
+// fragment's SV_Position (its pixel centre, in the device pixels the mask is
+// in). The hardware clip distances already cut the mask's rectangle, so
+// all-zero radii, the common case, return 1 before any SDF math: one uniform
+// branch per fragment. A rounded mask is the antialiased SDF the polychrome
+// sprite's own corners use. The mask's straight edges sit on device pixels
+// (`snapped_content_mask`), so they stay at full coverage.
+float content_mask_coverage(float2 position, Bounds mask, Corners radii) {
+    if (radii.top_left == 0. && radii.top_right == 0. &&
+        radii.bottom_right == 0. && radii.bottom_left == 0.) {
+        return 1.;
+    }
+    return saturate(0.5 - quad_sdf(position, mask, radii));
+}
+
 // The solid colour is still resolved in the VERTEX shader — it is one
 // conversion for the whole quad and the overwhelmingly common case. A gradient
 // can no longer precompute its endpoints there (which pair is needed depends on
@@ -702,6 +717,8 @@ struct Quad {
     uint border_style;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Background background;
     Hsla border_color;
     Corners corner_radii;
@@ -765,7 +782,9 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     return output;
 }
 
-float4 quad_fragment(QuadFragmentInput input): SV_Target {
+// vue-native fork: `quad_fragment` before the content mask's corners; it returns
+// from a handful of places, and the wrapper below takes them all.
+float4 quad_color(QuadFragmentInput input) {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.local_position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -1062,6 +1081,14 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+float4 quad_fragment(QuadFragmentInput input): SV_Target {
+    Quad quad = quads[input.quad_id];
+    float4 color = quad_color(input);
+    // Straight alpha, like everything `quad_color` returns.
+    color.a *= content_mask_coverage(input.position.xy, quad.content_mask, quad.content_mask_radii);
+    return color;
+}
+
 /*
 **
 **              Backdrop Blur
@@ -1086,6 +1113,8 @@ struct BlurRect {
     uint pad;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Corners corner_radii;
     float blur_radius;
     // Fades the backdrop replacement, not just the tint.
@@ -1196,7 +1225,8 @@ float4 blur_rect_fragment(BlurRectFragmentInput input): SV_Target {
     float4 tinted = tint.a > 0.0
         ? over_straight_on_premultiplied(blurred, tint)
         : blurred;
-    float coverage = shape_alpha * saturate(blur_rect.opacity);
+    float coverage = shape_alpha * saturate(blur_rect.opacity) *
+        content_mask_coverage(position, blur_rect.content_mask, blur_rect.content_mask_radii);
     return clamp_premultiplied(lerp(original, tinted, coverage));
 }
 
@@ -1212,6 +1242,8 @@ struct Shadow {
     Bounds bounds;
     Corners corner_radii;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
@@ -1313,6 +1345,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         alpha *= saturate(0.5 - element_distance);
     }
 
+    alpha *= content_mask_coverage(input.position.xy, shadow.content_mask, shadow.content_mask_radii);
     return input.color * float4(1., 1., 1., alpha);
 }
 
@@ -1327,6 +1360,11 @@ struct PathRasterizationSprite {
     float2 st_position;
     Background color;
     Bounds bounds;
+    // vue-native fork: the path's content mask. `bounds` is the path clipped
+    // to it, which is the clip rect and the gradient's box; the rounded
+    // corners need the mask's own rect.
+    Bounds content_mask;
+    Corners content_mask_radii;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1378,6 +1416,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
     float4 color = gradient_color(background, input.position.xy, bounds,
         gradient.solid, gradient.color0, gradient.color1);
+    alpha *= content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -1429,6 +1468,8 @@ struct Underline {
     uint pad;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1479,6 +1520,8 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
     const float WAVE_HEIGHT_RATIO = 0.8;
 
     Underline underline = underlines[input.underline_id];
+    float mask = content_mask_coverage(input.position.xy, underline.content_mask,
+                                       underline.content_mask_radii);
     if (underline.wavy) {
         float half_thickness = underline.thickness * 0.5;
         float2 origin = underline.bounds.origin;
@@ -1495,9 +1538,9 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
         float distance_from_bottom_border = distance_in_pixels + half_thickness;
         float alpha = saturate(
             0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-        return input.color * float4(1., 1., 1., alpha);
+        return input.color * float4(1., 1., 1., alpha * mask);
     } else {
-        return input.color;
+        return input.color * float4(1., 1., 1., mask);
     }
 }
 
@@ -1513,14 +1556,20 @@ struct MonochromeSprite {
     AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Hsla color;
     TransformationMatrix transformation;
 };
 
+// vue-native fork: the glyph pipelines carry no sprite id to the fragment
+// shader, so the content mask's rect and radii ride along as flat varyings.
 struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask_bounds: TEXCOORD1;
+    nointerpolation float4 mask_radii: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1528,8 +1577,23 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask_bounds: TEXCOORD1;
+    nointerpolation float4 mask_radii: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
+
+// vue-native fork: `content_mask_coverage` for the flat varyings above.
+float sprite_mask_coverage(float2 position, float4 mask_bounds, float4 mask_radii) {
+    Bounds mask;
+    mask.origin = mask_bounds.xy;
+    mask.size = mask_bounds.zw;
+    Corners radii;
+    radii.top_left = mask_radii.x;
+    radii.top_right = mask_radii.y;
+    radii.bottom_right = mask_radii.z;
+    radii.bottom_left = mask_radii.w;
+    return content_mask_coverage(position, mask, radii);
+}
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
@@ -1547,6 +1611,9 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.mask_bounds = float4(sprite.content_mask.origin, sprite.content_mask.size);
+    output.mask_radii = float4(sprite.content_mask_radii.top_left, sprite.content_mask_radii.top_right,
+                               sprite.content_mask_radii.bottom_right, sprite.content_mask_radii.bottom_left);
     output.clip_distance = clip_distance;
     return output;
 }
@@ -1554,7 +1621,8 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    float mask = sprite_mask_coverage(input.position.xy, input.mask_bounds, input.mask_radii);
+    return float4(input.color.rgb, input.color.a * alpha_corrected * mask);
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1568,9 +1636,11 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
     }
     float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, subpixel_enhanced_contrast, gamma_ratios);
 
+    float mask = sprite_mask_coverage(input.position.xy, input.mask_bounds, input.mask_radii);
+
     SubpixelSpriteFragmentOutput output;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    output.alpha = float4(input.color.a * alpha_corrected * mask, 1.0f);
     return output;
 }
 
@@ -1588,6 +1658,8 @@ struct PolychromeSprite {
     float opacity;
     Bounds bounds;
     Bounds content_mask;
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    Corners content_mask_radii;
     Corners corner_radii;
     // See `struct Quad`. The monochrome and subpixel sprites have carried one
     // since gpui's SVG element; this is the one that was missing, and it is
@@ -1644,6 +1716,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    color.a *= sprite.opacity * saturate(0.5 - distance);
+    color.a *= sprite.opacity * saturate(0.5 - distance) *
+        content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);
     return color;
 }

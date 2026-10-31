@@ -901,6 +901,7 @@ impl Style {
             _ => {
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
+                let border_box = bounds;
 
                 if self
                     .border_color
@@ -932,7 +933,36 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                // vue-native fork: CSS clips overflow to the padding box's
+                // ROUNDED shape, whose radii are the border radii less the
+                // border widths. Each corner takes the larger of its two
+                // borders off, a circle inside the elliptical corner CSS draws
+                // for unequal ones. The insets are read off the mask's own
+                // bounds, so a border the mask does not inset (a transparent
+                // one, above) takes nothing off.
+                let insets = Edges {
+                    top: bounds.top() - border_box.top(),
+                    right: border_box.right() - bounds.right(),
+                    bottom: border_box.bottom() - bounds.bottom(),
+                    left: bounds.left() - border_box.left(),
+                };
+                let outer = self
+                    .corner_radii
+                    .to_pixels(rem_size)
+                    .clamp_radii_for_quad_size(border_box.size);
+                let inner = |radius: Pixels, a: Pixels, b: Pixels| (radius - a.max(b)).max(px(0.));
+                let corner_radii = Corners {
+                    top_left: inner(outer.top_left, insets.top, insets.left),
+                    top_right: inner(outer.top_right, insets.top, insets.right),
+                    bottom_right: inner(outer.bottom_right, insets.bottom, insets.right),
+                    bottom_left: inner(outer.bottom_left, insets.bottom, insets.left),
+                }
+                .clamp_radii_for_quad_size(bounds.size);
+
+                Some(ContentMask {
+                    bounds,
+                    corner_radii,
+                })
             }
         }
     }
@@ -2074,5 +2104,106 @@ mod vn_mask_ring_tests {
             .expect("the border still paints");
         assert_eq!(border.border_widths.top.0, 1.0 * scale);
         assert_eq!(shadows, 0, "the mask cuts the outer shadow");
+    }
+}
+
+/// vue-native fork: `overflow` under a `border-radius` clips to the rounded
+/// padding box, and what is painted inside carries that mask.
+#[cfg(test)]
+mod vn_rounded_clip_tests {
+    use crate::{
+        Bounds, Context, Corners, Edges, Hsla, Overflow, Style, TestAppContext, Window, div,
+        point, prelude::*, px, size,
+    };
+
+    fn clipping(radius: f32, border: f32, border_color: Option<Hsla>) -> Style {
+        Style {
+            overflow: point(Overflow::Hidden, Overflow::Hidden),
+            corner_radii: Corners::all(px(radius)).map(|radius| (*radius).into()),
+            border_widths: Edges::all(px(border).into()),
+            border_color,
+            ..Style::default()
+        }
+    }
+
+    #[test]
+    fn an_overflow_clip_takes_the_padding_box_curve() {
+        let rem = px(16.);
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(200.), px(160.)));
+
+        let mask = clipping(24., 4., Some(Hsla::black())).overflow_mask(bounds, rem).unwrap();
+        assert_eq!(mask.bounds, Bounds::new(point(px(14.), px(24.)), size(px(192.), px(152.))));
+        assert_eq!(mask.corner_radii, Corners::all(px(20.)), "the radius less the border");
+
+        let mask = clipping(24., 4., None).overflow_mask(bounds, rem).unwrap();
+        assert_eq!(mask.bounds, bounds, "a transparent border is not inset");
+        assert_eq!(mask.corner_radii, Corners::all(px(24.)), "so it takes nothing off");
+
+        let mask = clipping(3., 4., Some(Hsla::black())).overflow_mask(bounds, rem).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(0.)), "a border wider than the radius");
+
+        let avatar = Bounds::new(point(px(0.), px(0.)), size(px(64.), px(64.)));
+        let mask = clipping(9999., 0., None).overflow_mask(avatar, rem).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(32.)), "a pill is a circle");
+
+        let mask = clipping(0., 0., None).overflow_mask(bounds, rem).unwrap();
+        assert!(!mask.is_rounded(), "no radius, the plain rect");
+    }
+
+    /// reka's AvatarRoot around its image, and a rounded card around a list
+    /// that scrolls.
+    struct Clips;
+
+    impl Render for Clips {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    div()
+                        .size(px(64.))
+                        .rounded_full()
+                        .overflow_hidden()
+                        .child(div().size_full().bg(Hsla::red())),
+                )
+                .child(
+                    div()
+                        .w(px(200.))
+                        .h(px(160.))
+                        .rounded(px(24.))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("list")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .child(div().w_full().h(px(400.)).bg(Hsla::green())),
+                        ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn what_paints_inside_carries_the_rounded_mask(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(400.), px(400.)), |_, _| Clips);
+        cx.run_until_parked();
+        let (quads, scale) = window
+            .update(cx, |_, window, _| (window.painted_quads(), window.scale_factor()))
+            .unwrap();
+        let quad = |color: Hsla| {
+            quads
+                .iter()
+                .find(|q| q.background.as_solid() == Some(color))
+                .copied()
+                .expect("the quad")
+        };
+
+        let avatar = quad(Hsla::red());
+        assert_eq!(avatar.content_mask.corner_radii, Corners::all(px(32.)).scale(scale));
+        assert_eq!(avatar.corner_radii, Corners::default(), "the image itself is square");
+
+        // The scroller's own mask is square and fills the card, so its
+        // corners are the card's: the rows clip at the card's curve.
+        let rows = quad(Hsla::green());
+        assert_eq!(rows.content_mask.corner_radii, Corners::all(px(24.)).scale(scale));
+        assert_eq!(rows.content_mask.bounds.size, size(px(200.), px(160.)).scale(scale));
     }
 }

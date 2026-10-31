@@ -110,6 +110,7 @@ impl DebugFrameOverlay {
         let panel_top = cell * PANEL_MARGIN;
 
         let content_mask = ContentMask {
+            corner_radii: Default::default(),
             bounds: Bounds {
                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
                 size: viewport,

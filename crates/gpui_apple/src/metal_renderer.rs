@@ -1793,7 +1793,7 @@ mod tests {
         scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::rect(bounds),
             image_buffer: image_buffer.clone(),
         });
         drop(image_buffer);

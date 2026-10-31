@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -109,6 +109,9 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    // vue-native fork: the mask itself, for its rounded corners; `bounds`
+    // is the path clipped to it.
+    content_mask: ContentMask<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1853,6 +1856,7 @@ impl WgpuRendererCore {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask: path.content_mask,
             }));
         }
 
@@ -2651,7 +2655,7 @@ mod tests {
             order: 0,
             border_style: BorderStyle::Solid,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::rect(bounds),
             background: color.into(),
             border_color: color,
             corner_radii: Corners::default(),
@@ -2813,15 +2817,19 @@ mod tests {
         // `Background` then grew from 18 words to 57 (eight colour stops,
         // radial and conic geometry, repeat and tiling), which moved `Quad` and
         // `PathRasterizationVertex` by another 39 each.
+        //
+        // Then every content mask grew its four corner radii, which moved each
+        // record below by 4, and the path vertex by 8: it carries the mask's
+        // own rect as well as the clipped one.
         assert_eq!(std::mem::size_of::<Background>(), 57 * 4);
-        assert_eq!(std::mem::size_of::<Quad>(), 85 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 34 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 65 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 89 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 73 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
     }
 
     #[test]
@@ -2840,6 +2848,7 @@ mod tests {
                 },
             },
             content_mask: ContentMask {
+                corner_radii: Default::default(),
                 bounds: Bounds {
                     origin: Point {
                         x: 5.0.into(),
