@@ -51,6 +51,11 @@ pub struct RenderImage {
     /// is a new image, and a placeholder whose atlas tile the GPU fills has no
     /// pixels worth reading.
     dynamic: bool,
+    /// vue-native: the size the picture has, when its pixels are a smaller
+    /// copy of it ([`Self::with_natural_size`]). Layout and `object-fit` read
+    /// this, so an image an embedder swapped for the copy it is drawn from
+    /// lays out and fits exactly as the full decode did.
+    natural: Option<Size<DevicePixels>>,
 }
 
 impl PartialEq for RenderImage {
@@ -71,7 +76,30 @@ impl RenderImage {
             scale_factor: 1.0,
             data: data.into(),
             dynamic: false,
+            natural: None,
         }
+    }
+
+    /// vue-native: marks this single-frame image as a smaller copy of a picture
+    /// of `natural` pixels. [`Self::size`] and [`Self::as_bytes`] stay the copy's;
+    /// [`Self::natural_size`] (layout, `object-fit`) answers `natural`, so the copy
+    /// can stand in for the full decode in the asset cache
+    /// ([`crate::ImageSource::replace_cached`]).
+    pub fn with_natural_size(mut self, natural: Size<DevicePixels>) -> Self {
+        self.natural = Some(natural);
+        self
+    }
+
+    /// vue-native: the picture's own size in pixels: the one
+    /// [`Self::with_natural_size`] recorded, else the pixels' size.
+    pub fn natural_size(&self, frame_index: usize) -> Size<DevicePixels> {
+        self.natural.unwrap_or_else(|| self.size(frame_index))
+    }
+
+    /// vue-native: are these pixels a smaller copy of the picture
+    /// ([`Self::with_natural_size`])?
+    pub fn is_reduced(&self) -> bool {
+        self.natural.is_some()
     }
 
     /// vue-native: marks this image as one frame of a moving picture, which
@@ -106,7 +134,7 @@ impl RenderImage {
 
     /// Get the size of this image, in pixels for display, adjusted for the scale factor.
     pub(crate) fn render_size(&self, frame_index: usize) -> Size<Pixels> {
-        self.size(frame_index)
+        self.natural_size(frame_index)
             .map(|v| (v.0 as f32 / self.scale_factor).into())
     }
 
@@ -156,5 +184,19 @@ mod tests {
         let frame = RenderImage::new(SmallVec::new()).dynamic();
         assert!(frame.is_dynamic());
         assert_ne!(still.id, frame.id);
+    }
+
+    #[test]
+    fn a_reduced_copy_lays_out_at_the_natural_size() {
+        let pixels = image::RgbaImage::new(4, 2);
+        let copy = RenderImage::new(SmallVec::from_const([Frame::new(pixels)]))
+            .with_natural_size(size(DevicePixels(400), DevicePixels(200)));
+        assert!(copy.is_reduced());
+        assert_eq!(copy.size(0), size(DevicePixels(4), DevicePixels(2)));
+        assert_eq!(copy.natural_size(0), size(DevicePixels(400), DevicePixels(200)));
+        assert_eq!(copy.render_size(0), size(Pixels::from(400.), Pixels::from(200.)));
+        let full = RenderImage::new(SmallVec::from_const([Frame::new(image::RgbaImage::new(3, 3))]));
+        assert!(!full.is_reduced());
+        assert_eq!(full.natural_size(0), full.size(0));
     }
 }

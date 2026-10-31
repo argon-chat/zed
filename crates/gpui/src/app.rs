@@ -3146,6 +3146,34 @@ impl App {
         self.loading_assets.remove(&asset_id);
     }
 
+    /// vue-native fork: the cached result for `source`, if its load has
+    /// finished. Unlike [`Self::fetch_asset`], never starts a load.
+    pub fn peek_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.loading_assets
+            .get(&asset_id)?
+            .downcast_ref::<CachedLoad<A::Output>>()?
+            .get()
+    }
+
+    /// vue-native fork: makes `output` the cached result for `source`, as if
+    /// its load had produced it. A load still in flight is left alone (`false`):
+    /// views are waiting on it to notify them.
+    pub fn replace_asset<A: Asset>(&mut self, source: &A::Source, output: A::Output) -> bool {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        let in_flight = self
+            .loading_assets
+            .get(&asset_id)
+            .and_then(|entry| entry.downcast_ref::<CachedLoad<A::Output>>())
+            .is_some_and(|load| !load.is_loaded());
+        if in_flight {
+            return false;
+        }
+        self.loading_assets
+            .insert(asset_id, Box::new(CachedLoad::ready(output)));
+        true
+    }
+
     /// Check whether an asset is present in GPUI's cache (loading or loaded),
     /// without fetching it.
     #[cfg(any(test, feature = "test-support"))]

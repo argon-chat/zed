@@ -487,10 +487,12 @@ impl Element for Img {
                     if data.frame_count() == 0 {
                         return;
                     }
+                    // vue-native fork: the picture's size, not its pixels' (an
+                    // embedder may have swapped in a smaller copy).
                     let new_bounds = self
                         .style
                         .object_fit
-                        .get_bounds(bounds, data.size(layout_state.frame_index));
+                        .get_bounds(bounds, data.natural_size(layout_state.frame_index));
                     // vue-native fork: percentages and the overlap rule resolve
                     // against the box (`Style::corner_radii_for`).
                     let corner_radii = style.corner_radii_for(bounds.size, window.rem_size());
@@ -583,6 +585,54 @@ impl ImageSource {
             }
             ImageSource::Custom(_) | ImageSource::Render(_) => {}
             ImageSource::Image(data) => cx.remove_asset::<AssetLogger<ImageDecoder>>(data),
+        }
+    }
+
+    /// vue-native fork: the decode the asset system holds for this source, if
+    /// its load has finished. Never starts a load.
+    pub fn cached(&self, cx: &App) -> Option<Arc<RenderImage>> {
+        match self {
+            ImageSource::Resource(resource) => cx.peek_asset::<ImgResourceLoader>(resource)?.ok(),
+            ImageSource::Image(data) => cx.peek_asset::<AssetLogger<ImageDecoder>>(data)?.ok(),
+            ImageSource::Custom(_) | ImageSource::Render(_) => None,
+        }
+    }
+
+    /// vue-native fork: makes `image` what the asset system answers for this
+    /// source from now on — a smaller copy of the decode
+    /// ([`RenderImage::with_natural_size`]), or the full decode back. `false`
+    /// when the source is still loading, or is not one the asset system caches.
+    pub fn replace_cached(&self, image: Arc<RenderImage>, cx: &mut App) -> bool {
+        match self {
+            ImageSource::Resource(resource) => {
+                cx.replace_asset::<ImgResourceLoader>(resource, Ok(image))
+            }
+            ImageSource::Image(data) => {
+                cx.replace_asset::<AssetLogger<ImageDecoder>>(data, Ok(image))
+            }
+            ImageSource::Custom(_) | ImageSource::Render(_) => false,
+        }
+    }
+
+    /// vue-native fork: loads and decodes this source afresh on the background
+    /// executor, leaving the asset system's entry as it is (an embedder that
+    /// swapped in a smaller copy gets the full decode back this way without
+    /// the element going blank meanwhile). `None` for a source the asset
+    /// system does not load.
+    pub fn load_detached(
+        &self,
+        cx: &mut App,
+    ) -> Option<Task<Result<Arc<RenderImage>, ImageCacheError>>> {
+        match self {
+            ImageSource::Resource(resource) => {
+                let load = <ImgResourceLoader as Asset>::load(resource.clone(), cx);
+                Some(cx.background_executor().spawn(load))
+            }
+            ImageSource::Image(data) => {
+                let load = <AssetLogger<ImageDecoder> as Asset>::load(data.clone(), cx);
+                Some(cx.background_executor().spawn(load))
+            }
+            ImageSource::Custom(_) | ImageSource::Render(_) => None,
         }
     }
 

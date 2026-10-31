@@ -48,6 +48,20 @@ impl<T: Clone + Send + 'static> CachedLoad<T> {
         Self { state, _task: task }
     }
 
+    /// vue-native fork: an entry that is already loaded with `value`
+    /// ([`App::replace_asset`]).
+    pub(crate) fn ready(value: T) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(CachedLoadState::Loaded(value))),
+            _task: Task::ready(()),
+        }
+    }
+
+    /// vue-native fork: has the load finished?
+    pub(crate) fn is_loaded(&self) -> bool {
+        matches!(&*self.state.borrow(), CachedLoadState::Loaded(_))
+    }
+
     pub(crate) fn get(&self) -> Option<T> {
         match &*self.state.borrow() {
             CachedLoadState::Loading(_) => None,
