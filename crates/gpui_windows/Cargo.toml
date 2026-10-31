@@ -29,7 +29,18 @@ dunce.workspace = true
 etagere.workspace = true
 futures.workspace = true
 gpui_util.workspace = true
-image.workspace = true
+# vue-native: the decoders gpui itself keeps (see the note on `image` in
+# crates/gpui/Cargo.toml), not the workspace's every-format set.
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "tiff",
+    "webp",
+] }
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true

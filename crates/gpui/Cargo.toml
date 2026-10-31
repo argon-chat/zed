@@ -76,7 +76,24 @@ futures-concurrency = { workspace = true, optional = true }
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 http_client.workspace = true
-image.workspace = true
+# vue-native: not `image.workspace = true`. The workspace entry turns on every
+# decoder Zed's image viewer can open (exr, hdr, dds, farbfeld, qoi, tga, plus
+# rayon for exr), and a workspace dependency cannot take features away. gpui
+# decodes through `image::guess_format`, so each of those was a format an
+# `<img>` would decode where no browser does, and ~1 MB of decoders in every
+# vue-native binary (research/reports/m26/binary-size-1.md). Kept: what
+# `ImageFormat` names (png, jpeg, webp, gif, bmp, tiff, ico, pnm). Same version
+# requirement as the workspace, so resolution does not move.
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "tiff",
+    "webp",
+] }
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
