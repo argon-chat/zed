@@ -5799,6 +5799,9 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     /// Paint an image into `bounds`, positioning and scaling it according to `image_bounds`.
     ///
+    /// vue-native: with an [`ImageResampler`] installed, an image that is not
+    /// [`RenderImage::dynamic`] may be drawn from the smaller copy it returns.
+    ///
     /// The visible region rendered is `bounds.intersect(&image_bounds)`, with `corner_radii`
     /// applied to `bounds`.
     pub fn paint_image(
@@ -5819,6 +5822,23 @@ impl Window {
         if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
             return Ok(());
         }
+
+        // vue-native: an image drawn well below its own size is drawn from the
+        // host's smaller copy, when it has one (see `ImageResampler`).
+        let (data, frame_index) = match IMAGE_RESAMPLER.get() {
+            Some(resample) if !data.is_dynamic() => {
+                let scale = self.scale_factor();
+                let device = size(
+                    DevicePixels((image_bounds.size.width.0 * scale).round() as i32),
+                    DevicePixels((image_bounds.size.height.0 * scale).round() as i32),
+                );
+                match resample(&data, frame_index, device) {
+                    Some(smaller) => (smaller, 0),
+                    None => (data, frame_index),
+                }
+            }
+            _ => (data, frame_index),
+        };
 
         let params = RenderImageParams {
             image_id: data.id,
@@ -8747,6 +8767,27 @@ impl PaintQuad {
             ..self
         }
     }
+}
+
+/// vue-native: a host's smaller copy of an image that is about to be drawn
+/// well below its own size.
+///
+/// The sprite atlas keeps one mip level and samples it LINEARLY, so a 1080 px
+/// picture drawn at 40 px reads a 2×2 neighbourhood out of every 27×27 block
+/// and aliases. [`Window::paint_image`] asks this function first, with the
+/// image, the frame, and the size in device pixels the frame is about to be
+/// drawn at; `Some` is drawn instead (its frame 0), from its own atlas tile.
+/// `None` draws the image as it is. Called during paint, so it must be cheap
+/// whenever it says `None`.
+pub type ImageResampler =
+    fn(&Arc<RenderImage>, usize, Size<DevicePixels>) -> Option<Arc<RenderImage>>;
+
+static IMAGE_RESAMPLER: std::sync::OnceLock<ImageResampler> = std::sync::OnceLock::new();
+
+/// vue-native: installs the process's [`ImageResampler`]. The first one
+/// installed stays.
+pub fn set_image_resampler(resampler: ImageResampler) {
+    let _ = IMAGE_RESAMPLER.set(resampler);
 }
 
 /// Creates a quad with the given parameters.

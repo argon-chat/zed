@@ -46,6 +46,11 @@ pub struct RenderImage {
     /// The scale factor of this image on render.
     pub(crate) scale_factor: f32,
     data: SmallVec<[Frame; 1]>,
+    /// vue-native: one frame of a moving picture (a video, an animation). The
+    /// host's [`crate::ImageResampler`] is not asked about it: its next frame
+    /// is a new image, and a placeholder whose atlas tile the GPU fills has no
+    /// pixels worth reading.
+    dynamic: bool,
 }
 
 impl PartialEq for RenderImage {
@@ -65,7 +70,20 @@ impl RenderImage {
             id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
             scale_factor: 1.0,
             data: data.into(),
+            dynamic: false,
         }
+    }
+
+    /// vue-native: marks this image as one frame of a moving picture, which
+    /// [`crate::Window::paint_image`] draws as it is (see `dynamic`).
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
+        self
+    }
+
+    /// vue-native: whether [`Self::dynamic`] marked this image.
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
     }
 
     /// Convert this image into a byte slice.
@@ -129,5 +147,14 @@ mod tests {
         assert_eq!(image.render_size(0), Size::default());
         assert_eq!(image.delay(0), Delay::from_numer_denom_ms(100, 1));
         let _ = format!("{image:?}");
+    }
+
+    #[test]
+    fn a_frame_of_a_moving_picture_is_marked_dynamic() {
+        let still = RenderImage::new(SmallVec::new());
+        assert!(!still.is_dynamic());
+        let frame = RenderImage::new(SmallVec::new()).dynamic();
+        assert!(frame.is_dynamic());
+        assert_ne!(still.id, frame.id);
     }
 }
