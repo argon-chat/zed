@@ -1422,6 +1422,13 @@ pub struct Window {
     /// down is recorded under (0 = record nothing). See
     /// [`Frame::vn_tagged_hitboxes`].
     vn_hitbox_tag: u32,
+    /// vue-native fork: no element has prepainted yet under the tag that
+    /// [`Window::with_hitbox_tag`] set, so the next one is the tagged node's
+    /// own. See [`Window::note_tagged_transform`].
+    vn_tag_fresh: bool,
+    /// vue-native fork: the tagged node's whole `transform` (ancestors' and
+    /// its own), when it has one of its own.
+    vn_tag_transform: Option<TransformationMatrix>,
     /// vue-native fork: while set, EVERY element gets a hitbox, not only an
     /// interactive one — the same thing gpui's own inspector does while it is
     /// picking, and for the same reason: a hit test can only answer for a node
@@ -2390,6 +2397,8 @@ impl Window {
             element_opacity: 1.0,
             element_transform: TransformationMatrix::unit(),
             vn_hitbox_tag: 0,
+            vn_tag_fresh: false,
+            vn_tag_transform: None,
             vn_tag_every_hitbox: false,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -6135,6 +6144,55 @@ impl Window {
     /// `0` disables tagging. See [`Frame::vn_tagged_hitboxes`].
     pub fn set_hitbox_tag(&mut self, tag: u32) -> u32 {
         mem::replace(&mut self.vn_hitbox_tag, tag)
+    }
+
+    /// vue-native fork: [`Window::set_hitbox_tag`] for the duration of `f`,
+    /// which prepaints one embedder node, answering also the node's whole CSS
+    /// `transform` (its ancestors' composed with its own) when it has one of
+    /// its own. `None` means its picture moved only with its ancestors', by
+    /// [`Window::element_transform`] as it stood before `f`.
+    ///
+    /// "The node's own" is the FIRST element to prepaint inside `f`: the
+    /// node's element runs before anything inside it, and what it builds
+    /// internally under the same tag (a `::before` box, a list marker) after,
+    /// so a transformed pseudo-element does not move its node.
+    pub fn with_hitbox_tag<R>(
+        &mut self,
+        tag: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Option<TransformationMatrix>) {
+        let tag = mem::replace(&mut self.vn_hitbox_tag, tag);
+        let fresh = mem::replace(&mut self.vn_tag_fresh, true);
+        let noted = self.vn_tag_transform.take();
+        let result = f(self);
+        let own = mem::replace(&mut self.vn_tag_transform, noted);
+        self.vn_tag_fresh = fresh;
+        self.vn_hitbox_tag = tag;
+        (result, own)
+    }
+
+    /// vue-native fork: called by every element's prepaint once its own
+    /// `transform` is pushed. The first one inside a
+    /// [`Window::with_hitbox_tag`] is the tagged node's.
+    pub(crate) fn note_tagged_transform(&mut self, own_is_unit: bool) {
+        if self.vn_tag_fresh {
+            self.vn_tag_fresh = false;
+            if !own_is_unit {
+                self.vn_tag_transform = Some(self.element_transform);
+            }
+        }
+    }
+
+    /// vue-native fork: the axis-aligned bounding box of `bounds` (logical
+    /// pixels) under `matrix` (device space, as [`Window::element_transform`]
+    /// is) — the rectangle a browser's `getBoundingClientRect()` reports for a
+    /// transformed box.
+    pub fn transformed_bounds(
+        &self,
+        matrix: TransformationMatrix,
+        bounds: Bounds<Pixels>,
+    ) -> Bounds<Pixels> {
+        transform_bounds(matrix, bounds, self.scale_factor)
     }
 
     /// vue-native fork: give EVERY element a hitbox, not only an interactive
@@ -11164,5 +11222,141 @@ mod vn_pointer_inside_tests {
         }));
         draw(cx);
         assert!(!hovered.get(), "MouseExited");
+    }
+}
+
+#[cfg(test)]
+mod vn_tagged_transform_tests {
+    use crate::{
+        AnyElement, App, Bounds, Context, Element, GlobalElementId, InspectorElementId,
+        IntoElement, LayoutId, Pixels, Render, TestAppContext, TransformLength, TransformSpec,
+        Window, div, prelude::*, px, size,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    type Seen = Rc<RefCell<Vec<(u32, Bounds<Pixels>, Bounds<Pixels>)>>>;
+
+    /// What an embedder's per-node probe does: tag the subtree, prepaint it,
+    /// take the node's transform, and map its layout box through it.
+    struct Probe {
+        tag: u32,
+        inner: AnyElement,
+        seen: Seen,
+    }
+
+    impl IntoElement for Probe {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Probe {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            (self.inner.request_layout(window, cx), ())
+        }
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let ancestors = window.element_transform();
+            let (_, own) =
+                window.with_hitbox_tag(self.tag, |window| self.inner.prepaint(window, cx));
+            let seen = window.transformed_bounds(own.unwrap_or(ancestors), bounds);
+            self.seen.borrow_mut().push((self.tag, bounds, seen));
+        }
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.inner.paint(window, cx);
+        }
+    }
+
+    fn moved(x: TransformLength, y: TransformLength, scale: f32) -> TransformSpec {
+        TransformSpec { translate: (x, y), scale: (scale, scale), ..TransformSpec::IDENTITY }
+    }
+
+    /// A popper wrapper laid out at (0, 0) and moved by `translate`, a button
+    /// inside it, and a third box scaled inside that.
+    struct Popper {
+        seen: Seen,
+    }
+
+    impl Render for Popper {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let probe = |tag, inner: AnyElement| Probe { tag, inner, seen: self.seen.clone() };
+            let mut wrapper = div().w(px(100.)).h(px(80.));
+            wrapper.style().vn_transform =
+                Some(moved(TransformLength::Pixels(300.), TransformLength::Pixels(200.), 1.0));
+            let mut scaled = div().w(px(20.)).h(px(10.));
+            scaled.style().vn_transform =
+                Some(moved(TransformLength::ZERO, TransformLength::ZERO, 2.0));
+            // Built inside the button under the button's tag, like a
+            // `::before` box: its own transform is not the button's.
+            let mut pseudo = div().w(px(4.)).h(px(4.));
+            pseudo.style().vn_transform =
+                Some(moved(TransformLength::Pixels(50.), TransformLength::ZERO, 1.0));
+            let button = div()
+                .ml(px(10.))
+                .w(px(30.))
+                .h(px(20.))
+                .child(probe(3, scaled.into_any_element()))
+                .child(pseudo);
+            div().size_full().child(probe(
+                1,
+                wrapper.child(probe(2, button.into_any_element())).into_any_element(),
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn a_probe_sees_its_node_where_the_transforms_put_it(cx: &mut TestAppContext) {
+        let seen: Seen = Rc::default();
+        let state = seen.clone();
+        let window =
+            cx.open_window(size(px(800.), px(600.)), move |_, _| Popper { seen: state });
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        cx.run_until_parked();
+        let seen = seen.borrow();
+        let at = |tag: u32| *seen.iter().rev().find(|s| s.0 == tag).expect("probed");
+        let b = |x: f32, y: f32, w: f32, h: f32| {
+            Bounds::new(crate::point(px(x), px(y)), size(px(w), px(h)))
+        };
+        // Its own translate moves the wrapper; the layout box stays at 0, 0.
+        assert_eq!(at(1).1, b(0., 0., 100., 80.));
+        assert_eq!(at(1).2, b(300., 200., 100., 80.));
+        // A child with no transform of its own moves with its ancestor, and
+        // not with the one a box built inside it has.
+        assert_eq!(at(2).1, b(10., 0., 30., 20.));
+        assert_eq!(at(2).2, b(310., 200., 30., 20.));
+        // Its own scale (about its centre) composes with the ancestor's move.
+        assert_eq!(at(3).1, b(10., 0., 20., 10.));
+        assert_eq!(at(3).2, b(300., 195., 40., 20.));
     }
 }
