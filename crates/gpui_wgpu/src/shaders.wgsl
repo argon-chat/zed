@@ -146,6 +146,8 @@ const BG_TILE_W_FRACTION: u32 = 128u;
 const BG_TILE_H_FRACTION: u32 = 256u;
 const BG_TILE_X_FRACTION: u32 = 512u;
 const BG_TILE_Y_FRACTION: u32 = 1024u;
+// vue-native fork: the background fills only the quad's border area.
+const BG_RING: u32 = 2048u;
 const BG_STOP_PX_SHIFT: u32 = 16u;
 
 struct Background {
@@ -755,6 +757,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
+    // vue-native fork: what fills the inside of the inner border edge. A
+    // BG_RING background paints only in the border area, so its inside is
+    // transparent.
+    let interior_color = select(
+        background_color,
+        vec4<f32>(0.0),
+        (quad.background.flags & BG_RING) != 0u);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -767,7 +776,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(interior_color, 1.0);
     }
 
     let size = quad.bounds.size;
@@ -833,7 +842,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return blend_color(interior_color, 1.0);
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -867,7 +876,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Negative when inside the border
     let border_sdf = max(inner_sdf, outer_sdf);
 
-    var color = background_color;
+    var color = interior_color;
     if (border_sdf < antialias_threshold) {
         var border_color = input.border_color;
 
@@ -1068,7 +1077,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         // Blend the border on top of the background and then linearly interpolate
         // between the two as we slide inside the background.
         let blended_border = over(background_color, border_color);
-        color = mix(background_color, blended_border,
+        color = mix(interior_color, blended_border,
                     saturate(antialias_threshold - inner_sdf));
     }
 

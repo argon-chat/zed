@@ -3,6 +3,11 @@
 
 using namespace metal;
 
+// vue-native fork: Background::flags, the background fills only the quad's
+// border area. Defined up here, ahead of the other BG_* flags, because
+// quad_fragment reads it.
+#define BG_RING 2048u
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -103,6 +108,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+  // vue-native fork: what fills the inside of the inner border edge. A
+  // BG_RING background paints only in the border area, so its inside is
+  // transparent.
+  float4 interior_color = (quad.background.flags & BG_RING) != 0u
+    ? float4(0.0)
+    : background_color;
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -115,7 +126,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return interior_color;
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
@@ -175,7 +186,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return interior_color;
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -208,7 +219,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // Negative when inside the border
   float border_sdf = max(inner_sdf, outer_sdf);
 
-  float4 color = background_color;
+  float4 color = interior_color;
   if (border_sdf < antialias_threshold) {
     float4 border_color = input.border_color;
 
@@ -389,7 +400,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     // Blend the border on top of the background and then linearly interpolate
     // between the two as we slide inside the background.
     float4 blended_border = over(background_color, border_color);
-    color = mix(background_color, blended_border,
+    color = mix(interior_color, blended_border,
                 saturate(antialias_threshold - inner_sdf));
   }
 

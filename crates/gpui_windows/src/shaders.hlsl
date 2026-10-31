@@ -75,6 +75,8 @@ struct LinearColorStop {
 #define BG_TILE_H_FRACTION  256u
 #define BG_TILE_X_FRACTION  512u
 #define BG_TILE_Y_FRACTION  1024u
+// vue-native fork: the background fills only the quad's border area.
+#define BG_RING             2048u
 #define BG_STOP_PX_SHIFT    16u
 
 struct Background {
@@ -767,6 +769,12 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.local_position, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    // vue-native fork: what fills the inside of the inner border edge. A
+    // BG_RING background paints only in the border area, so its inside is
+    // transparent.
+    float4 interior_color = (quad.background.flags & BG_RING) != 0u
+        ? float4(0.0, 0.0, 0.0, 0.0)
+        : background_color;
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -779,7 +787,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return interior_color;
     }
 
     float2 size = quad.bounds.size;
@@ -838,7 +846,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return interior_color;
     }
 
     // Signed distance of the point to the outside edge of the quad's border
@@ -871,7 +879,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // Negative when inside the border
     float border_sdf = max(inner_sdf, outer_sdf);
 
-    float4 color = background_color;
+    float4 color = interior_color;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
         // Dashed border logic when border_style == 1
@@ -1047,7 +1055,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         // Blend the border on top of the background and then linearly interpolate
         // between the two as we slide inside the background.
         float4 blended_border = over(background_color, border_color);
-        color = lerp(background_color, blended_border,
+        color = lerp(interior_color, blended_border,
                     saturate(antialias_threshold - inner_sdf));
     }
 

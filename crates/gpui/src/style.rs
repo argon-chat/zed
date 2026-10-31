@@ -516,6 +516,25 @@ pub struct Style {
     /// lands on top of the element and outside it. `None` = never declared.
     pub vn_outline: Option<Outline>,
 
+    /// vue-native fork: CSS `mask` in the one shape the paint path can cut,
+    /// the gradient-border idiom. That is two opaque layers, the top one
+    /// clipped to the content box, composited with `exclude`:
+    /// `mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    /// mask-composite: exclude`. What is left visible is the ring of padding
+    /// and border around the content box.
+    ///
+    /// When set, the background and its layers paint only in that ring, as one
+    /// quad each whose border widths are the border plus the padding
+    /// (`color::BG_RING`). The border lies inside the ring and paints as
+    /// usual. Not painted at all: the outer shadows and the outline, which lie
+    /// outside the border box and which the mask cuts entirely, and the inset
+    /// shadows, backdrop blur and effect quads, which the ring would show only
+    /// a strip of. The children are NOT masked. vn-tree says so when there
+    /// are any. A
+    /// percentage padding resolves against the element's own width here,
+    /// not its containing block's.
+    pub vn_mask_ring: bool,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -977,7 +996,26 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        // vue-native fork: `vn_mask_ring` paints the background only in the
+        // padding and border area. These are the border widths of the quads
+        // that do it: the border plus the padding. A percentage padding
+        // resolves against this box's width (see the field's doc).
+        let ring_widths = self.vn_mask_ring.then(|| {
+            let border = self.border_widths.to_pixels(rem_size);
+            let width = AbsoluteLength::Pixels(bounds.size.width);
+            let padding = self.padding.to_pixels(size(width, width), rem_size);
+            Edges {
+                top: border.top + padding.top,
+                right: border.right + padding.right,
+                bottom: border.bottom + padding.bottom,
+                left: border.left + padding.left,
+            }
+        });
+        let ring = ring_widths.is_some();
+
+        if !ring {
+            window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        }
 
         // CSS paints the filtered backdrop underneath the element's own
         // background, so the blur goes in between the drop shadows and the
@@ -985,6 +1023,7 @@ impl Style {
         // the quad below.
         if let Some(radius) = self.backdrop_blur
             && radius > crate::px(0.)
+            && !ring
         {
             window.paint_backdrop_blur_rect(
                 bounds,
@@ -1010,10 +1049,18 @@ impl Style {
         // `App::reduce_motion` here — clearing the flag stops the repaint
         // request, which freezes the effect on its current frame rather than
         // removing it. Same behaviour vn-css's animator gives transitions.
-        let effect = self.vn_effect.filter(EffectSpec::is_some).map(|mut spec| {
-            spec.animated &= !cx.reduce_motion();
-            spec
-        });
+        let effect = self
+            .vn_effect
+            .filter(|spec| spec.is_some() && !ring)
+            .map(|mut spec| {
+                spec.animated &= !cx.reduce_motion();
+                spec
+            });
+        // The background quads: the whole box, or only the ring.
+        let fill = |background: Background| match ring_widths {
+            Some(widths) => (background.ring(), widths),
+            None => (background, Edges::default()),
+        };
         if let Some(spec) = effect
             && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0
         {
@@ -1025,11 +1072,12 @@ impl Style {
             let color = background_color.unwrap_or_default();
             let mut border_color = representative_color(&color);
             border_color.a = 0.;
+            let (color, widths) = fill(color);
             window.paint_quad(quad(
                 bounds,
                 corner_radii,
                 color,
-                Edges::default(),
+                widths,
                 border_color,
                 self.border_style,
             ));
@@ -1046,17 +1094,20 @@ impl Style {
             }
             let mut border_color = representative_color(layer);
             border_color.a = 0.;
+            let (layer, widths) = fill(*layer);
             window.paint_quad(quad(
                 bounds,
                 corner_radii,
-                *layer,
-                Edges::default(),
+                layer,
+                widths,
                 border_color,
                 self.border_style,
             ));
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        if !ring {
+            window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        }
 
         if let Some(spec) = effect
             && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP == 0
@@ -1091,7 +1142,7 @@ impl Style {
         // concentric with a rounded box — the same rule Chromium applies.
         if let Some(outline) = self
             .vn_outline
-            .filter(|o| o.width > px(0.) && !o.color.is_transparent())
+            .filter(|o| o.width > px(0.) && !o.color.is_transparent() && !ring)
         {
             let grow = outline.offset + outline.width;
             let ring = bounds.dilate(grow);
@@ -1183,6 +1234,7 @@ impl Default for Style {
             vn_justify_items: None,
             vn_justify_self: None,
             vn_outline: None,
+            vn_mask_ring: false,
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -1943,5 +1995,84 @@ mod vn_safe_center_tests {
                 assert_eq!(at("OVERFLOWS").origin.y, px(100.), "at the start of the second box");
             })
             .unwrap();
+    }
+}
+
+/// vue-native fork: `Style::vn_mask_ring`.
+#[cfg(test)]
+mod vn_mask_ring_tests {
+    use crate::{
+        BoxShadow, Context, Hsla, TestAppContext, Window, color::BG_RING, div, point,
+        prelude::*, px, size,
+    };
+
+    struct Card {
+        ring: bool,
+    }
+
+    impl Render for Card {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut d = div()
+                .w(px(100.))
+                .h(px(60.))
+                .p(px(2.))
+                .border_1()
+                .border_color(Hsla::white())
+                .bg(Hsla::red())
+                .shadow(vec![BoxShadow {
+                    color: Hsla::black(),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(8.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }]);
+            d.style().vn_mask_ring = Some(self.ring);
+            d
+        }
+    }
+
+    /// The painted quads, and the frame's shadow count.
+    fn paint(ring: bool, cx: &mut TestAppContext) -> (Vec<crate::Quad>, usize, f32) {
+        let window = cx.open_window(size(px(300.), px(300.)), move |_, _| Card { ring });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let shadows = window.rendered_frame.scene.shadows.len();
+                (window.painted_quads(), shadows, window.scale_factor())
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn a_ring_mask_paints_the_background_in_the_padding_and_border_only(
+        cx: &mut TestAppContext,
+    ) {
+        let (quads, shadows, scale) = paint(false, cx);
+        let background = quads.iter().find(|q| q.background.as_solid() == Some(Hsla::red()));
+        let background = background.expect("the background quad");
+        assert_eq!(background.background.flags & BG_RING, 0);
+        assert_eq!(background.border_widths.top.0, 0.0, "a plain background fills the box");
+        assert_eq!(shadows, 1);
+
+        let (quads, shadows, _) = paint(true, cx);
+        let background = quads
+            .iter()
+            .find(|q| q.background.flags & BG_RING != 0)
+            .expect("the background quad, flagged");
+        assert_eq!(background.background.as_solid(), Some(Hsla::red()));
+        for width in [
+            background.border_widths.top,
+            background.border_widths.right,
+            background.border_widths.bottom,
+            background.border_widths.left,
+        ] {
+            assert_eq!(width.0, 3.0 * scale, "1px border + 2px padding");
+        }
+        let border = quads
+            .iter()
+            .find(|q| q.border_color == Hsla::white())
+            .expect("the border still paints");
+        assert_eq!(border.border_widths.top.0, 1.0 * scale);
+        assert_eq!(shadows, 0, "the mask cuts the outer shadow");
     }
 }

@@ -798,6 +798,16 @@ pub(crate) const BG_TILE_H_FRACTION: u32 = 1 << 8;
 pub(crate) const BG_TILE_X_FRACTION: u32 = 1 << 9;
 /// `Background::flags` — as [`BG_TILE_X_FRACTION`], for the y offset.
 pub(crate) const BG_TILE_Y_FRACTION: u32 = 1 << 10;
+/// `Background::flags` (vue-native fork) — paint this background only in the
+/// quad's BORDER area, the ring between the outer edge and the inner edge the
+/// border widths make. Inside the inner edge the quad is transparent. The
+/// border colour still blends over the ring. This is what [`Style::vn_mask_ring`]
+/// paints with: the quad's border widths are the element's border plus its
+/// padding, so the ring is the padding and border area, and the content box
+/// stays empty.
+///
+/// [`Style::vn_mask_ring`]: crate::Style::vn_mask_ring
+pub(crate) const BG_RING: u32 = 1 << 11;
 /// `Background::flags` — bit `BG_STOP_PX_SHIFT + i` marks stop `i`'s
 /// `percentage` as an ABSOLUTE length in pixels along the gradient line rather
 /// than a fraction of it. `linear-gradient(white 1px, transparent 1px)` — the
@@ -1052,6 +1062,13 @@ impl Background {
         } else {
             None
         }
+    }
+
+    /// vue-native fork: this background, painted only in the border area of
+    /// the quad it fills ([`BG_RING`]).
+    pub(crate) fn ring(mut self) -> Self {
+        self.flags |= BG_RING;
+        self
     }
 
     /// Use specified color space for color interpolation.
