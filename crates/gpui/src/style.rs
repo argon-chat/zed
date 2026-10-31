@@ -278,6 +278,90 @@ pub struct Outline {
     pub style: BorderStyle,
 }
 
+/// vue-native fork: one CSS `border-*-radius` corner, as its two radii. Each
+/// is a length, a percentage of the box (`Fraction`), or a linear `calc()`
+/// with one. See [`Style::vn_corner_radii`].
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct VnCornerRadius {
+    /// The horizontal radius; a percentage is of the box's width.
+    pub x: DefiniteLength,
+    /// The vertical radius; a percentage is of the box's height.
+    pub y: DefiniteLength,
+}
+
+static VN_ELLIPSE_DRAWN_AS_CIRCLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// vue-native fork: whether a corner was painted with a circle in place of
+/// the ellipse CSS asks for, since the last call. vn-tree reads it to advise
+/// once.
+pub fn vn_take_ellipse_drawn_as_circle() -> bool {
+    VN_ELLIPSE_DRAWN_AS_CIRCLE.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// vue-native fork: a box's painted corner radii, as CSS resolves them.
+///
+/// - A corner with a `relative` radius resolves it against `size`: the
+///   horizontal radius against the width, the vertical against the height.
+///   Any other corner takes its `lengths` radius on both axes.
+/// - CSS's overlap rule (css-backgrounds-3 §5.5) applies: when the radii
+///   along a side sum past its length, every radius is scaled by the
+///   smallest such ratio. That is what makes Tailwind's `rounded-full`
+///   (9999px) a pill.
+/// - gpui's corners are circles, so a corner whose two radii still differ
+///   takes the smaller one. `50%` on a box that is not square comes out as a
+///   pill where a browser draws an ellipse, and
+///   [`vn_take_ellipse_drawn_as_circle`] reports it.
+/// - Each radius is finally clamped to half the shorter side, which the
+///   shaders need because they pick a corner by quadrant. CSS lets a lone
+///   large corner reach past the middle of the box.
+pub fn vn_resolve_corner_radii(
+    lengths: &Corners<AbsoluteLength>,
+    relative: &Corners<Option<VnCornerRadius>>,
+    size: Size<Pixels>,
+    rem_size: Pixels,
+) -> Corners<Pixels> {
+    let (width, height) = (f32::from(size.width).max(0.), f32::from(size.height).max(0.));
+    let pair = |length: &AbsoluteLength, relative: &Option<VnCornerRadius>| -> (f32, f32) {
+        match relative {
+            Some(radius) => (
+                f32::from(radius.x.to_pixels(px(width).into(), rem_size)).max(0.),
+                f32::from(radius.y.to_pixels(px(height).into(), rem_size)).max(0.),
+            ),
+            None => {
+                let radius = f32::from(length.to_pixels(rem_size)).max(0.);
+                (radius, radius)
+            }
+        }
+    };
+    let top_left = pair(&lengths.top_left, &relative.top_left);
+    let top_right = pair(&lengths.top_right, &relative.top_right);
+    let bottom_right = pair(&lengths.bottom_right, &relative.bottom_right);
+    let bottom_left = pair(&lengths.bottom_left, &relative.bottom_left);
+
+    let ratio = |side: f32, a: f32, b: f32| if a + b > side { side / (a + b) } else { 1. };
+    let factor = ratio(width, top_left.0, top_right.0)
+        .min(ratio(width, bottom_left.0, bottom_right.0))
+        .min(ratio(height, top_left.1, bottom_left.1))
+        .min(ratio(height, top_right.1, bottom_right.1));
+
+    let circle = |(x, y): (f32, f32)| {
+        let (x, y) = (x * factor, y * factor);
+        let radius = x.min(y);
+        if radius > 0. && (x - y).abs() > 0.5 {
+            VN_ELLIPSE_DRAWN_AS_CIRCLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        px(radius)
+    };
+    Corners {
+        top_left: circle(top_left),
+        top_right: circle(top_right),
+        bottom_right: circle(bottom_right),
+        bottom_left: circle(bottom_left),
+    }
+    .clamp_radii_for_quad_size(size)
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -405,6 +489,15 @@ pub struct Style {
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
+
+    /// vue-native fork: a CSS corner radius `corner_radii` cannot hold. That is a
+    /// percentage of the box, a `calc()` with one, or an elliptical `a / b`
+    /// corner. Where a corner has one, it replaces that corner's
+    /// `corner_radii`, and it resolves against the box at paint
+    /// ([`Style::corner_radii_for`]). vn-css writes both fields for every
+    /// corner it maps, so the later declaration wins whichever it used.
+    #[refineable]
+    pub vn_corner_radii: Corners<Option<VnCornerRadius>>,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
@@ -886,6 +979,12 @@ impl Style {
         }
     }
 
+    /// vue-native fork: the corner radii this style paints on a box of `size`,
+    /// percentages, the overlap rule and all. See [`vn_resolve_corner_radii`].
+    pub fn corner_radii_for(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Pixels> {
+        vn_resolve_corner_radii(&self.corner_radii, &self.vn_corner_radii, size, rem_size)
+    }
+
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
     pub fn overflow_mask(
@@ -946,10 +1045,7 @@ impl Style {
                     bottom: border_box.bottom() - bounds.bottom(),
                     left: bounds.left() - border_box.left(),
                 };
-                let outer = self
-                    .corner_radii
-                    .to_pixels(rem_size)
-                    .clamp_radii_for_quad_size(border_box.size);
+                let outer = self.corner_radii_for(border_box.size, rem_size);
                 let inner = |radius: Pixels, a: Pixels, b: Pixels| (radius - a.max(b)).max(px(0.));
                 let corner_radii = Corners {
                     top_left: inner(outer.top_left, insets.top, insets.left),
@@ -1021,10 +1117,7 @@ impl Style {
         }
 
         let rem_size = window.rem_size();
-        let corner_radii = self
-            .corner_radii
-            .to_pixels(rem_size)
-            .clamp_radii_for_quad_size(bounds.size);
+        let corner_radii = self.corner_radii_for(bounds.size, rem_size);
 
         // vue-native fork: `vn_mask_ring` paints the background only in the
         // padding and border area. These are the border widths of the quads
@@ -1265,6 +1358,7 @@ impl Default for Style {
             vn_justify_self: None,
             vn_outline: None,
             vn_mask_ring: false,
+            vn_corner_radii: Corners::default(),
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -2112,8 +2206,9 @@ mod vn_mask_ring_tests {
 #[cfg(test)]
 mod vn_rounded_clip_tests {
     use crate::{
-        Bounds, Context, Corners, Edges, Hsla, Overflow, Style, TestAppContext, Window, div,
-        point, prelude::*, px, size,
+        Bounds, Context, Corners, DefiniteLength, Edges, Hsla, Overflow, Style, TestAppContext,
+        VnCornerRadius, Window, div, point, prelude::*, px, size, vn_resolve_corner_radii,
+        vn_take_ellipse_drawn_as_circle,
     };
 
     fn clipping(radius: f32, border: f32, border_color: Option<Hsla>) -> Style {
@@ -2148,6 +2243,76 @@ mod vn_rounded_clip_tests {
 
         let mask = clipping(0., 0., None).overflow_mask(bounds, rem).unwrap();
         assert!(!mask.is_rounded(), "no radius, the plain rect");
+    }
+
+    fn resolve(lengths: [f32; 4], relative: [Option<(DefiniteLength, DefiniteLength)>; 4], w: f32, h: f32) -> [f32; 4] {
+        let corner = |r: Option<(DefiniteLength, DefiniteLength)>| r.map(|(x, y)| VnCornerRadius { x, y });
+        let radii = vn_resolve_corner_radii(
+            &Corners {
+                top_left: px(lengths[0]).into(),
+                top_right: px(lengths[1]).into(),
+                bottom_right: px(lengths[2]).into(),
+                bottom_left: px(lengths[3]).into(),
+            },
+            &Corners {
+                top_left: corner(relative[0]),
+                top_right: corner(relative[1]),
+                bottom_right: corner(relative[2]),
+                bottom_left: corner(relative[3]),
+            },
+            size(px(w), px(h)),
+            px(16.),
+        );
+        [radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left].map(f32::from)
+    }
+
+    #[test]
+    fn percentages_resolve_against_the_box_and_overlaps_scale() {
+        let half = Some((DefiniteLength::Fraction(0.5), DefiniteLength::Fraction(0.5)));
+        let _ = vn_take_ellipse_drawn_as_circle();
+
+        assert_eq!(resolve([0.; 4], [half; 4], 64., 64.), [32.; 4], "50% of a square: a circle");
+        assert!(!vn_take_ellipse_drawn_as_circle());
+
+        // 50% of 120x48 is a 60x24 ellipse at each corner; gpui draws the
+        // 24px circle, a pill, and says so.
+        assert_eq!(resolve([0.; 4], [half; 4], 120., 48.), [24.; 4]);
+        assert!(vn_take_ellipse_drawn_as_circle());
+
+        // `rounded-full`: 9999px on every corner of 100x40 scales by 40/19998.
+        assert_eq!(resolve([9999.; 4], [None; 4], 100., 40.), [20.; 4]);
+        // `rounded-l-full`: only the left side overruns; both its corners
+        // scale, and the right stays square.
+        assert_eq!(resolve([9999., 0., 0., 9999.], [None; 4], 100., 40.), [20., 0., 0., 20.]);
+        // Radii that fit stay as written.
+        assert_eq!(resolve([8., 4., 0., 12.], [None; 4], 100., 40.), [8., 4., 0., 12.]);
+        // 40 + 40 across a 60px top: both scale by 60/80, to 30.
+        assert_eq!(resolve([40., 40., 0., 0.], [None; 4], 60., 200.), [30., 30., 0., 0.]);
+
+        // `calc(50% - 4px)` and an elliptical `10px / 20px`.
+        let calc = DefiniteLength::Calc { fraction: 0.5, pixels: px(-4.) };
+        assert_eq!(resolve([0.; 4], [Some((calc, calc)); 4], 64., 64.), [28.; 4]);
+        let ellipse = Some((DefiniteLength::Absolute(px(10.).into()), DefiniteLength::Absolute(px(20.).into())));
+        assert_eq!(resolve([0.; 4], [ellipse; 4], 100., 100.), [10.; 4]);
+        assert!(vn_take_ellipse_drawn_as_circle());
+    }
+
+    #[test]
+    fn a_percentage_radius_clips_overflow_too() {
+        let mut avatar = clipping(0., 0., None);
+        let half = Some(VnCornerRadius {
+            x: DefiniteLength::Fraction(0.5),
+            y: DefiniteLength::Fraction(0.5),
+        });
+        avatar.vn_corner_radii = Corners {
+            top_left: half,
+            top_right: half,
+            bottom_right: half,
+            bottom_left: half,
+        };
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
+        let mask = avatar.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::all(px(20.)));
     }
 
     /// reka's AvatarRoot around its image, and a rounded card around a list

@@ -491,7 +491,9 @@ impl Element for Img {
                         .style
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
-                    let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                    // vue-native fork: percentages and the overlap rule resolve
+                    // against the box (`Style::corner_radii_for`).
+                    let corner_radii = style.corner_radii_for(bounds.size, window.rem_size());
                     window
                         .paint_image(
                             bounds,
