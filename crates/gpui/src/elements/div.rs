@@ -2543,6 +2543,10 @@ impl Interactivity {
                 let transformation = style.transform_matrix(bounds, window.scale_factor());
                 window.with_element_transform(transformation, |window| {
                     window.note_tagged_transform(transformation.is_unit());
+                    // vue-native fork: opacity too, so a draw deferred from in
+                    // here carries it (`Window::defer_draw_with_stack_key`).
+                    // Nothing reads it in prepaint otherwise.
+                    window.with_element_opacity(style.opacity, |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -2559,6 +2563,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                    })
                     })
                 })
             },

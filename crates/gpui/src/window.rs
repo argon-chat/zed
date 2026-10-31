@@ -1151,8 +1151,24 @@ pub(crate) struct DeferredDraw {
     /// element was deferred FROM, which its nodes belong under
     /// (`A11yNodeBuilder::begin_adopted`). `None` when accessibility was off.
     a11y_parent: Option<accesskit::NodeId>,
+    /// vue-native fork: where the draw sorts among draws of equal `priority`,
+    /// compared lexicographically — see [`crate::Deferred::with_stack_key`].
+    /// `None` sorts first.
+    vn_stack: Option<Rc<[u128]>>,
+    /// vue-native fork: the opacity in force where the element was deferred
+    /// FROM. Like the transform, it would otherwise be lost at the top of the
+    /// frame: CSS applies an ancestor's `opacity` to everything inside it,
+    /// out-of-flow descendants included.
+    element_opacity: f32,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+}
+
+impl DeferredDraw {
+    /// The paint order: `priority`, then the embedder's stack key.
+    fn order(&self) -> (usize, Option<&[u128]>) {
+        (self.priority, self.vn_stack.as_deref())
+    }
 }
 
 pub(crate) struct Frame {
@@ -1174,6 +1190,15 @@ pub(crate) struct Frame {
     /// preserved, and an element's own hitbox is inserted before any of its
     /// descendants', so the FIRST entry for a tag is that node's own box.
     pub(crate) vn_tagged_hitboxes: Vec<(u32, Hitbox)>,
+    /// vue-native fork: [`Frame::hitboxes`]' indices in PAINT order, which
+    /// [`Frame::hit_test`] walks topmost-first. Empty means insertion order.
+    ///
+    /// Hitboxes are inserted in prepaint order, and deferred draws prepaint in
+    /// nesting rounds: a draw nested one round deeper is inserted after every
+    /// draw of the round before, wherever it paints. Hit-testing by insertion
+    /// let a box that paints UNDER a later overlay take its clicks. The vector
+    /// itself is not reordered, because cached views replay ranges of it.
+    pub(crate) vn_hit_order: Vec<u32>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1235,6 +1260,7 @@ impl Frame {
             scene: Scene::default(),
             hitboxes: Vec::new(),
             vn_tagged_hitboxes: Vec::new(),
+            vn_hit_order: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1266,6 +1292,7 @@ impl Frame {
         self.cursor_styles.clear();
         self.hitboxes.clear();
         self.vn_tagged_hitboxes.clear();
+        self.vn_hit_order.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1302,7 +1329,14 @@ impl Frame {
     pub(crate) fn hit_test(&self, position: Point<Pixels>, scale_factor: f32) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        // vue-native fork: topmost PAINTED first (`vn_hit_order`).
+        let in_paint_order = (self.vn_hit_order.len() == self.hitboxes.len())
+            .then(|| self.vn_hit_order.iter().rev().map(|&i| &self.hitboxes[i as usize]));
+        let topmost_first: Box<dyn Iterator<Item = &Hitbox>> = match in_paint_order {
+            Some(order) => Box::new(order),
+            None => Box::new(self.hitboxes.iter().rev()),
+        };
+        for hitbox in topmost_first {
             // A transformed element keeps its untransformed `bounds`, so the
             // POINTER is mapped back into the element's own frame rather than
             // the rect being mapped forward into a polygon. That keeps the test
@@ -4119,7 +4153,9 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
+        let deferred_hitboxes_start = self.next_frame.hitboxes.len();
         self.prepaint_deferred_draws(cx);
+        let deferred_hitboxes = deferred_hitboxes_start..self.next_frame.hitboxes.len();
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -4144,6 +4180,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
+        self.compute_hit_order(deferred_hitboxes);
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position, self.scale_factor);
 
         // Now actually paint the elements.
@@ -4294,12 +4331,20 @@ impl Window {
                 break;
             }
             // Limit maximum nesting depth to prevent infinite loops.
-            assert!(depth < 10, "Exceeded maximum (10) deferred depth");
+            //
+            // vue-native fork: 64, not 10. An embedder that paints CSS
+            // stacking contexts defers one level per out-of-flow ancestor, and
+            // a round costs one pass over the draws it adds; the paint order
+            // does not depend on rounds (`DeferredDraw::order`).
+            assert!(depth < 64, "Exceeded maximum (64) deferred depth");
             depth += 1;
 
             // Sort this round by priority.
             let mut traversal_order = (round_start..round_end).collect::<SmallVec<[usize; 8]>>();
-            traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+            {
+                let draws = &self.next_frame.deferred_draws;
+                traversal_order.sort_by(|a, b| draws[*a].order().cmp(&draws[*b].order()));
+            }
 
             for deferred_draw_ix in traversal_order {
                 let (
@@ -4309,6 +4354,7 @@ impl Window {
                     rem_size,
                     absolute_offset,
                     element_transform,
+                    element_opacity,
                     content_mask,
                     prepaint_range,
                 ) = {
@@ -4324,6 +4370,7 @@ impl Window {
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.element_transform,
+                        deferred_draw.element_opacity,
                         deferred_draw.content_mask,
                         deferred_draw.prepaint_range.clone(),
                     )
@@ -4346,15 +4393,17 @@ impl Window {
                             // window space, and `with_content_mask` maps what it
                             // is given through whatever transform is in force.
                             window.with_content_mask(content_mask, |window| {
-                                window.with_absolute_element_transform(
-                                    element_transform,
-                                    |window| {
-                                        window.with_absolute_element_offset(
-                                            absolute_offset,
-                                            |window| element.prepaint(window, cx),
-                                        );
-                                    },
-                                );
+                                window.with_absolute_element_opacity(element_opacity, |window| {
+                                    window.with_absolute_element_transform(
+                                        element_transform,
+                                        |window| {
+                                            window.with_absolute_element_offset(
+                                                absolute_offset,
+                                                |window| element.prepaint(window, cx),
+                                            );
+                                        },
+                                    );
+                                });
                             });
                         });
                     });
@@ -4405,14 +4454,17 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             let element_transform = deferred_draw.element_transform;
+            let element_opacity = deferred_draw.element_opacity;
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     // Mask first, transform second — see the prepaint side.
                     window.with_content_mask(content_mask, |window| {
-                        window.with_absolute_element_transform(element_transform, |window| {
-                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                element.paint(window, cx);
-                            });
+                        window.with_absolute_element_opacity(element_opacity, |window| {
+                            window.with_absolute_element_transform(element_transform, |window| {
+                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                    element.paint(window, cx);
+                                });
+                            })
                         })
                     })
                 })
@@ -4430,8 +4482,45 @@ impl Window {
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
         let deferred_count = self.next_frame.deferred_draws.len();
         let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
-        sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+        let draws = &self.next_frame.deferred_draws;
+        sorted_indices.sort_by(|a, b| draws[*a].order().cmp(&draws[*b].order()));
         sorted_indices
+    }
+
+    /// vue-native fork: fills [`Frame::vn_hit_order`] once prepaint is done.
+    /// `deferred_hitboxes` is the range of hitbox indices the deferred draws'
+    /// prepaint inserted. Everything before it (the root tree, the inspector)
+    /// paints first and everything after it (a prompt, a drag, a tooltip)
+    /// paints last, as inserted; inside it, each draw's hitboxes go where the
+    /// draw paints. A draw's range never contains a nested draw's, which
+    /// prepaints in a later round.
+    fn compute_hit_order(&mut self, deferred_hitboxes: Range<usize>) {
+        let frame = &mut self.next_frame;
+        frame.vn_hit_order.clear();
+        if deferred_hitboxes.is_empty() {
+            return;
+        }
+        let mut order: Vec<u32> = Vec::with_capacity(frame.hitboxes.len());
+        order.extend(0..deferred_hitboxes.start as u32);
+        let mut traversal = (0..frame.deferred_draws.len()).collect::<Vec<_>>();
+        let draws = &frame.deferred_draws;
+        traversal.sort_by(|a, b| draws[*a].order().cmp(&draws[*b].order()));
+        for ix in traversal {
+            let range = &draws[ix].prepaint_range;
+            let (start, end) = (range.start.hitboxes_index, range.end.hitboxes_index);
+            // Draws replayed from a cached view outside this frame's
+            // deferred pass hold ranges of the frame they were recorded in.
+            if start >= deferred_hitboxes.start && end <= deferred_hitboxes.end && start < end {
+                order.extend(start as u32..end as u32);
+            }
+        }
+        order.extend(deferred_hitboxes.end as u32..frame.hitboxes.len() as u32);
+        // Anything a draw's range did not account for keeps insertion order
+        // rather than vanishing from the hit test.
+        if order.len() != frame.hitboxes.len() {
+            return;
+        }
+        frame.vn_hit_order = order;
     }
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
@@ -4505,6 +4594,8 @@ impl Window {
                     absolute_offset: deferred_draw.absolute_offset,
                     element_transform: deferred_draw.element_transform,
                     a11y_parent: deferred_draw.a11y_parent,
+                    vn_stack: deferred_draw.vn_stack.clone(),
+                    element_opacity: deferred_draw.element_opacity,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -4741,6 +4832,19 @@ impl Window {
         let previous = mem::replace(&mut self.element_transform, transformation);
         let result = f(self);
         self.element_transform = previous;
+        result
+    }
+
+    /// vue-native fork: [`Window::with_absolute_element_transform`] for the
+    /// opacity a deferred draw captured where it was deferred from.
+    fn with_absolute_element_opacity<R>(
+        &mut self,
+        opacity: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = mem::replace(&mut self.element_opacity, opacity);
+        let result = f(self);
+        self.element_opacity = previous;
         result
     }
 
@@ -5074,6 +5178,19 @@ impl Window {
         priority: usize,
         content_mask: Option<ContentMask<Pixels>>,
     ) {
+        self.defer_draw_with_stack_key(element, absolute_offset, priority, content_mask, None)
+    }
+
+    /// vue-native fork: [`Window::defer_draw`], sorted among draws of equal
+    /// `priority` by `stack_key` (see [`crate::Deferred::with_stack_key`]).
+    pub fn defer_draw_with_stack_key(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+        stack_key: Option<Rc<[u128]>>,
+    ) {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
@@ -5091,6 +5208,8 @@ impl Window {
                 .a11y
                 .is_active()
                 .then(|| self.a11y.nodes.current_id()),
+            vn_stack: stack_key,
+            element_opacity: self.element_opacity,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
