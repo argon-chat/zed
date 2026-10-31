@@ -3118,6 +3118,28 @@ impl App {
         self.prompt_builder = Some(PromptBuilder::Default);
     }
 
+    /// vue-native fork: what the asset cache holds, for an embedder's memory
+    /// report: `(entries, image entries, decoded images, their decoded bytes)`.
+    /// An image entry is an `img()` load (`ImageAssetLoader` or
+    /// `ImageDecoder`); its bytes are every frame's BGRA pixels at the decoded
+    /// size. Entries are never evicted on their own (see [`Self::remove_asset`]).
+    pub fn image_asset_stats(&self) -> (usize, usize, usize, u64) {
+        type ImageLoad = CachedLoad<Result<Arc<RenderImage>, crate::ImageCacheError>>;
+        let (mut images, mut decoded, mut bytes) = (0, 0, 0u64);
+        for entry in self.loading_assets.values() {
+            let Some(load) = entry.downcast_ref::<ImageLoad>() else { continue };
+            images += 1;
+            if let Some(Ok(image)) = load.get() {
+                decoded += 1;
+                for i in 0..image.frame_count() {
+                    let size = image.size(i);
+                    bytes += (size.width.0.max(0) as u64) * (size.height.0.max(0) as u64) * 4;
+                }
+            }
+        }
+        (self.loading_assets.len(), images, decoded, bytes)
+    }
+
     /// Remove an asset from GPUI's cache
     pub fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
         let asset_id = (TypeId::of::<A>(), hash(source));

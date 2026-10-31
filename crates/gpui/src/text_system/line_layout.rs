@@ -14,6 +14,33 @@ use std::{
 
 use super::LineWrapper;
 
+/// vue-native fork: line lookups and the shaping they missed into, process-wide.
+/// One relaxed add per lookup and a clock pair per shape, so an embedder's
+/// frame trace can say how much of a frame went to text shaping.
+static LINE_LOOKUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LINE_SHAPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LINE_SHAPE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// vue-native fork: `(lookups, shapes, nanoseconds spent shaping)` since the
+/// process started, over every window's line layout cache. A lookup that is
+/// not a shape was answered from this frame's or the previous frame's cache.
+pub fn line_layout_counters() -> (u64, u64, u64) {
+    (
+        LINE_LOOKUPS.load(Ordering::Relaxed),
+        LINE_SHAPES.load(Ordering::Relaxed),
+        LINE_SHAPE_NANOS.load(Ordering::Relaxed),
+    )
+}
+
+fn count_lookup() {
+    LINE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn count_shape(started: std::time::Instant) {
+    LINE_SHAPES.fetch_add(1, Ordering::Relaxed);
+    LINE_SHAPE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
 pub struct LineLayout {
@@ -685,6 +712,7 @@ impl LineLayoutCache {
             force_width,
         } as &dyn AsCacheKeyRef;
 
+        count_lookup();
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.lines.get(key) {
             return layout.clone();
@@ -697,9 +725,11 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
+            let shaping = std::time::Instant::now();
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            count_shape(shaping);
 
             // Spacing first: `force_width` assigns each cluster an ABSOLUTE
             // cell, so it has to see the positions it is going to overwrite,
@@ -808,6 +838,7 @@ impl LineLayoutCache {
         };
 
         // Fast path: already cached (no allocation).
+        count_lookup();
         let current_frame = self.current_frame.upgradable_read();
         if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
             HashedCacheKeyRef {
@@ -852,9 +883,11 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
+        let shaping = std::time::Instant::now();
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
+        count_shape(shaping);
 
         apply_spacing_to_layout(&mut layout, &text, runs);
         if let Some(force_width) = force_width {

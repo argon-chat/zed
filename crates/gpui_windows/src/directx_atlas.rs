@@ -10,7 +10,7 @@ use windows::Win32::Graphics::{
 };
 
 use gpui::{
-    AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
+    AtlasBackend, AtlasKey, AtlasState, AtlasStats, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
     AtlasTile, Bounds, DevicePixels, GpuTextureHandle, PlatformAtlas, Point, Size,
 };
 
@@ -184,6 +184,29 @@ impl PlatformAtlas for DirectXAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn stats(&self) -> Option<AtlasStats> {
+        let lock = self.0.lock();
+        let mut stats = AtlasStats::default();
+        lock.count_keys(&mut stats);
+        let backend = &lock.backend;
+        for (kind, list) in [
+            (AtlasTextureKind::Monochrome, &backend.monochrome_textures),
+            (AtlasTextureKind::Polychrome, &backend.polychrome_textures),
+            (AtlasTextureKind::Subpixel, &backend.subpixel_textures),
+        ] {
+            let out = &mut stats.kinds[kind as usize];
+            for texture in list.textures.iter().flatten() {
+                let size = texture.allocator.size();
+                out.pages += 1;
+                out.bytes += (size.width.max(0) as u64)
+                    * (size.height.max(0) as u64)
+                    * u64::from(texture.bytes_per_pixel);
+                out.tiles += texture.live_atlas_keys;
+            }
+        }
+        Some(stats)
     }
 }
 

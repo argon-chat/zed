@@ -1797,6 +1797,41 @@ pub trait PlatformAtlas {
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }
+
+    /// vue-native fork: the atlas's footprint, per texture kind — for an
+    /// embedder's memory report. `None` from a backend that does not keep
+    /// count.
+    fn stats(&self) -> Option<AtlasStats> {
+        None
+    }
+}
+
+/// vue-native fork: one [`AtlasTextureKind`]'s pages in a sprite atlas.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AtlasKindStats {
+    /// Live texture pages of this kind.
+    pub pages: u32,
+    /// Their GPU bytes: width × height × bytes per pixel, one mip level.
+    pub bytes: u64,
+    /// Tiles allocated in them.
+    pub tiles: u32,
+    /// The pixels those tiles cover, padding included — against `bytes`, how
+    /// full the pages are.
+    pub tile_pixels: u64,
+}
+
+/// vue-native fork: a sprite atlas's footprint, indexed by
+/// `AtlasTextureKind as usize` (monochrome, polychrome, subpixel).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AtlasStats {
+    /// Per kind.
+    pub kinds: [AtlasKindStats; 3],
+    /// Keys mapped to a tile (glyphs, SVG rasters, image frames).
+    pub keys: u32,
+    /// Of those, image frames (`AtlasKey::Image`) and their tile pixels.
+    pub image_keys: u32,
+    /// Pixels the image tiles cover.
+    pub image_pixels: u64,
 }
 
 /// A borrowed, platform-defined handle to a texture that already lives in the
@@ -1867,6 +1902,22 @@ impl<Backend> AtlasState<Backend> {
     /// free it like any other.
     pub fn insert_tile(&mut self, key: AtlasKey, tile: AtlasTile) {
         self.tiles_by_key.insert(key, tile);
+    }
+
+    /// vue-native fork: fills the key counts of an [`AtlasStats`] — how many
+    /// keys map to a tile, and how many of those are image frames and what
+    /// they cover. The backend fills the per-kind pages.
+    pub fn count_keys(&self, stats: &mut AtlasStats) {
+        stats.keys = self.tiles_by_key.len() as u32;
+        for (key, tile) in &self.tiles_by_key {
+            let pixels =
+                (tile.bounds.size.width.0.max(0) as u64) * (tile.bounds.size.height.0.max(0) as u64);
+            stats.kinds[tile.texture_id.kind as usize].tile_pixels += pixels;
+            if let AtlasKey::Image(_) = key {
+                stats.image_keys += 1;
+                stats.image_pixels += pixels;
+            }
+        }
     }
 }
 

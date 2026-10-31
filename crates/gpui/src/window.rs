@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlurRect, Background, BorderStyle,
+    AsyncWindowContext, AtlasStats, AtlasTile, AvailableSpace, BackdropBlurRect, Background, BorderStyle,
     EffectQuad, EffectSpec,
     Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
@@ -6120,6 +6120,13 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    /// vue-native fork: this window's sprite atlas footprint (pages and bytes
+    /// per texture kind, keys, image tiles), for an embedder's memory report.
+    /// `None` when the platform's atlas does not keep count.
+    pub fn sprite_atlas_stats(&self) -> Option<AtlasStats> {
+        self.sprite_atlas.stats()
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
