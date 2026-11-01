@@ -1873,7 +1873,8 @@ pub struct GpuTextureHandle(pub *mut std::ffi::c_void);
 /// pixels from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TileSource {
-    /// The image's own bytes (premultiplied BGRA), e.g. from
+    /// The image's own bytes (BGRA, straight alpha, as every sprite tile
+    /// holds them), e.g. from
     /// [`crate::RenderImage::successor`].
     Bytes,
     /// A texture already on the renderer's device, with the contract of

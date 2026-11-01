@@ -6671,6 +6671,16 @@ impl Window {
         self.pointer_inside
     }
 
+    /// vue-native fork: will this frame draw the window? `true` once anything
+    /// invalidated it since its last draw (a notify, a `refresh`, a resize).
+    /// An embedder with work that must follow the frame's layout and precede
+    /// its paint (a browser's ResizeObserver delivery) draws the window itself
+    /// from an `on_next_frame` callback when this is set; the frame then finds
+    /// it clean and presents what that draw produced.
+    pub fn vn_is_dirty(&self) -> bool {
+        self.invalidator.is_dirty()
+    }
+
     /// vue-native fork: for the mouse event being dispatched, keep only the
     /// hitboxes whose tag `keep` accepts (an untagged hitbox is not the
     /// embedder's and stays). With `add`, the accepted tags' boxes that do
