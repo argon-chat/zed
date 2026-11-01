@@ -620,6 +620,41 @@ enum TextPaintPass {
     Foreground,
 }
 
+/// The min-content size of `white-space: normal` text (CSS Sizing 3 §5.1):
+/// as wide as its widest stretch between two wrap opportunities, so it breaks
+/// at every one of them and inside no word, and as tall as it is wrapped at
+/// that width. What a flex item's automatic minimum size and a
+/// `width: min-content` box read: without it, text could not shrink below
+/// its one-line width, and a row narrower than that overflowed instead of
+/// wrapping.
+fn min_content_size(
+    text: &SharedString,
+    font_size: Pixels,
+    runs: &[TextRun],
+    line_height: Pixels,
+    window: &Window,
+) -> Option<Size<Pixels>> {
+    let text_system = window.text_system();
+    let unwrapped = text_system
+        .shape_text(text.clone(), font_size, runs, None, None)
+        .log_err()?;
+    let widest = unwrapped
+        .iter()
+        .map(|line| line.layout.unwrapped_layout.min_content_width(&line.text))
+        .fold(Pixels::ZERO, |a, b| a.max(b))
+        .ceil();
+    let wrapped = text_system
+        .shape_text(text.clone(), font_size, runs, Some(widest), None)
+        .log_err()?;
+    let mut size: Size<Pixels> = Size::default();
+    for line in &wrapped {
+        let line_size = line.size(line_height);
+        size.height += line_size.height;
+        size.width = size.width.max(line_size.width).ceil();
+    }
+    Some(size)
+}
+
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
@@ -683,9 +718,24 @@ impl TextLayout {
                         (None, "".into(), TruncateFrom::End)
                     };
 
+                // The min-content probe: answered without touching the cached
+                // layout, which belongs to the width the text is laid out at.
+                if text_style.white_space == WhiteSpace::Normal
+                    && text_style.text_overflow.is_none()
+                    && known_dimensions.width.is_none()
+                    && available_space.width == crate::AvailableSpace::MinContent
+                    && let Some(size) =
+                        min_content_size(&text, font_size, &runs, line_height, window)
+                {
+                    return size;
+                }
+
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
+                // 2. wrap_width matches, or this is an unwrapped probe and the
+                //    cached layout did not wrap either (a wrapped layout answers
+                //    an unconstrained probe with its wrapped size, which poisons
+                //    the max-content size, as a truncated one does below)
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
                 // 4. the cached layout was not truncated (a truncated layout answers an
@@ -693,7 +743,12 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && (wrap_width == text_layout.wrap_width
+                        || (wrap_width.is_none()
+                            && text_layout
+                                .lines
+                                .iter()
+                                .all(|line| line.wrap_boundaries().is_empty())))
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {

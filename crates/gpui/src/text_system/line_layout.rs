@@ -275,7 +275,10 @@ impl LineLayout {
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            // A space that crosses the edge hangs (CSS Text 3 §4.1.3): the
+            // line breaks before the next word, not before the space, which
+            // would start the next line with it.
+            if width > wrap_width && boundary > last_boundary && ch != ' ' {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -296,6 +299,47 @@ impl LineLayout {
         }
 
         boundaries
+    }
+
+    /// The line's min-content width (CSS Sizing 3 §5.1): its widest stretch
+    /// between two of the wrap opportunities [`Self::compute_wrap_boundaries`]
+    /// breaks at, without the spaces that end it, which hang. Wrapped at this
+    /// width, the line breaks at every opportunity and inside no word.
+    pub(crate) fn min_content_width(&self, text: &str) -> Pixels {
+        let mut widest = px(0.);
+        let mut start_x = px(0.);
+        let mut end_x = px(0.);
+        let mut seen_non_whitespace = false;
+        let mut prev_ch = '\0';
+        let mut glyphs = self
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| {
+                let ch = text[glyph.index..].chars().next().unwrap_or(' ');
+                (ch, glyph.position.x)
+            })
+            .peekable();
+        while let Some((ch, x)) = glyphs.next() {
+            let next_x = glyphs.peek().map_or(self.width, |(_, x)| *x);
+            if ch == '\n' {
+                continue;
+            }
+            // `compute_wrap_boundaries`' candidates, in one expression.
+            let opportunity = seen_non_whitespace
+                && ch != ' '
+                && (prev_ch == ' ' || !LineWrapper::is_word_char(ch));
+            if opportunity {
+                widest = widest.max(end_x - start_x);
+                start_x = x;
+            }
+            if ch != ' ' {
+                seen_non_whitespace = true;
+                end_x = next_x;
+            }
+            prev_ch = ch;
+        }
+        widest.max(end_x - start_x)
     }
 }
 
@@ -1301,5 +1345,53 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// One 10 px glyph per character of an ASCII `text`.
+    fn monospaced(text: &str) -> LineLayout {
+        let glyphs = (0..text.len()).map(|i| glyph_at(i as f32 * 10., i)).collect();
+        LineLayout {
+            width: px(text.len() as f32 * 10.),
+            len: text.len(),
+            ..make_layout(glyphs)
+        }
+    }
+
+    fn boundary(glyph_ix: usize) -> WrapBoundary {
+        WrapBoundary { run_ix: 0, glyph_ix }
+    }
+
+    #[test]
+    fn min_content_width_is_the_widest_word() {
+        assert_eq!(monospaced("ab cd efg").min_content_width("ab cd efg"), px(30.));
+        // Spaces end a stretch and hang: they never count.
+        assert_eq!(monospaced("abc   de ").min_content_width("abc   de "), px(30.));
+        // A break opportunity before a non-word character, as the wrapper has it.
+        assert_eq!(monospaced("a/bcd").min_content_width("a/bcd"), px(40.));
+        // One word: all of it.
+        assert_eq!(monospaced("abcdef").min_content_width("abcdef"), px(60.));
+        assert_eq!(monospaced("   ").min_content_width("   "), px(0.));
+    }
+
+    #[test]
+    fn wrapped_at_min_content_it_breaks_at_every_opportunity_and_in_no_word() {
+        let text = "ab cd efg";
+        let layout = monospaced(text);
+        let width = layout.min_content_width(text);
+        assert_eq!(
+            layout.compute_wrap_boundaries(text, width, None).to_vec(),
+            vec![boundary(3), boundary(6)]
+        );
+    }
+
+    #[test]
+    fn a_space_at_the_edge_hangs_instead_of_starting_the_next_line() {
+        // "ab" fills the 20 px line; the space after it crosses the edge. The
+        // break goes before "cd", not before the space.
+        let text = "ab cd";
+        assert_eq!(
+            monospaced(text).compute_wrap_boundaries(text, px(20.), None).to_vec(),
+            vec![boundary(3)]
+        );
     }
 }
