@@ -6637,6 +6637,16 @@ impl Window {
         self.vn_key_event_seq
     }
 
+    /// vue-native fork: is the pointer in this window? `false` once it has
+    /// left (a `MouseExited`, the end of a file drag over it), `true` again at
+    /// the next pointer event here. [`Window::mouse_position`] keeps the last
+    /// position inside either way, so an embedder that decides hover itself
+    /// (a browser's `:hover` and `mouseenter`, from its own hit test) asks
+    /// this to know that nothing is hovered, as [`Hitbox::is_hovered`] does.
+    pub fn vn_pointer_inside(&self) -> bool {
+        self.pointer_inside
+    }
+
     /// vue-native fork: for the mouse event being dispatched, keep only the
     /// hitboxes whose tag `keep` accepts (an untagged hitbox is not the
     /// embedder's and stays). With `add`, the accepted tags' boxes that do
