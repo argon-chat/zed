@@ -2,7 +2,7 @@ use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
-    StyleRefinement, TextStyle, WeakEntity,
+    StyleRefinement, TextStyle, TransformationMatrix, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -331,6 +331,15 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    /// vue-native fork: the opacity and the CSS `transform` the ancestors
+    /// composed. Both are multiplied into every primitive the view paints (and
+    /// the transform into its hitboxes), so a replay under a different one
+    /// paints the recording's: a subtree cached while its dialog faded in
+    /// stayed at the fade's first frames, dim, after the fade had ended. Both
+    /// are pushed in prepaint as well as in paint (`Interactivity::prepaint`),
+    /// so this check sees what the paint will.
+    opacity: f32,
+    transform: TransformationMatrix,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -542,11 +551,15 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let opacity = window.element_opacity();
+                let transform = window.element_transform();
 
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.opacity == opacity
+                    && element_state.cache_key.transform == transform
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -582,6 +595,8 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
+                            opacity,
+                            transform,
                         },
                     },
                 )
@@ -652,4 +667,93 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+/// vue-native fork: [`ViewElementCacheKey`]'s opacity and transform.
+#[cfg(test)]
+mod vn_cache_key_tests {
+    use crate::{
+        AnyWindowHandle, Context, Entity, Render, StyleRefinement, TestAppContext,
+        TransformSpec, Window, div, prelude::*, px, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct Root {
+        child: Entity<Child>,
+        opacity: f32,
+        scale: f32,
+    }
+
+    impl Render for Root {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut outer = div().size_full().opacity(self.opacity);
+            outer.style().vn_transform = Some(TransformSpec {
+                scale: (self.scale, self.scale),
+                ..TransformSpec::IDENTITY
+            });
+            outer.child(
+                self.child
+                    .clone()
+                    .cached(StyleRefinement::default().size(px(50.))),
+            )
+        }
+    }
+
+    struct Child {
+        renders: Rc<Cell<u32>>,
+    }
+
+    impl Render for Child {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full().bg(crate::red())
+        }
+    }
+
+    /// Sets the root's opacity and scale, rebuilds it, and draws.
+    fn frame(window: AnyWindowHandle, cx: &mut TestAppContext, opacity: f32, scale: f32) {
+        cx.update_window(window, |root, window, cx| {
+            let root = root.downcast::<Root>().expect("test root");
+            root.update(cx, |root, cx| {
+                root.opacity = opacity;
+                root.scale = scale;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        })
+        .expect("draw");
+    }
+
+    #[gpui::test]
+    fn a_cached_view_renders_again_under_a_new_opacity_or_transform(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0u32));
+        let counter = renders.clone();
+        let window = cx.open_window(size(px(200.), px(200.)), move |_, cx| Root {
+            child: cx.new(|_| Child { renders: counter }),
+            opacity: 0.1,
+            scale: 1.0,
+        });
+        let window: AnyWindowHandle = window.into();
+        frame(window, cx, 0.1, 1.0);
+        let first = renders.get();
+        assert!(first >= 1, "the first frame renders the child");
+
+        // Nothing it composes changed: the recording replays.
+        frame(window, cx, 0.1, 1.0);
+        assert_eq!(renders.get(), first, "same opacity and transform: replayed");
+
+        // The parent fades in: the recording holds 0.1 in every primitive.
+        frame(window, cx, 0.6, 1.0);
+        assert_eq!(renders.get(), first + 1, "a new opacity renders");
+        frame(window, cx, 1.0, 1.0);
+        assert_eq!(renders.get(), first + 2, "and the next one");
+        frame(window, cx, 1.0, 1.0);
+        assert_eq!(renders.get(), first + 2, "the fade over: replayed again");
+
+        // The parent zooms: its matrix is in every primitive and hitbox.
+        frame(window, cx, 1.0, 0.95);
+        assert_eq!(renders.get(), first + 3, "a new transform renders");
+        frame(window, cx, 1.0, 0.95);
+        assert_eq!(renders.get(), first + 3, "the same transform replays");
+    }
 }
