@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasStats, AtlasTile, AvailableSpace, BackdropBlurRect, Background, BorderStyle,
+    AsyncWindowContext, AtlasKey, AtlasStats, AtlasTile, AvailableSpace, BackdropBlurRect, Background, BorderStyle,
     EffectQuad, EffectSpec,
     Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
@@ -23,7 +23,7 @@ use crate::{
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    TileSource, TileWrite, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
@@ -6194,15 +6194,79 @@ impl Window {
         frame_index: usize,
         texture: GpuTextureHandle,
     ) -> Result<bool> {
-        let params = RenderImageParams {
-            image_id: data.id,
+        Ok(self.write_image_tile(data, frame_index, TileSource::Gpu(texture))? != TileWrite::Refused)
+    }
+
+    /// vue-native fork: writes a new frame into the sprite-atlas tile that backs
+    /// `image`, outside any draw, and says whether the frame already drawn will
+    /// show it.
+    ///
+    /// The tile is keyed by `image.id`. A producer that keeps one id for the
+    /// life of a picture (a zero-copy video placeholder, or
+    /// [`RenderImage::successor`] for CPU frames) keeps one tile, and the
+    /// scene that painted it samples whatever was written last. When the write
+    /// lands [`TileWrite::InPlace`], [`Window::request_present`] shows it with
+    /// no layout, prepaint or paint. The size is `image.size(frame_index)`.
+    /// Call it from a frame callback, before the frame's draw, never during one.
+    ///
+    /// `TileSource::Bytes` writes `image`'s own pixels (premultiplied BGRA).
+    /// It always succeeds: a backend with no in-place path re-inserts the key,
+    /// which reports [`TileWrite::Placed`]. `TileSource::Gpu` has the contract
+    /// of [`PlatformAtlas::upload_from_gpu`] and reports
+    /// [`TileWrite::Refused`] where that returns `None`.
+    pub fn write_image_tile(
+        &mut self,
+        image: &RenderImage,
+        frame_index: usize,
+        source: TileSource,
+    ) -> Result<TileWrite> {
+        let key: AtlasKey = RenderImageParams {
+            image_id: image.id,
             frame_index,
+        }
+        .into();
+        let size = image.size(frame_index);
+        let before = self.sprite_atlas.tile(&key);
+        let after = match source {
+            TileSource::Gpu(texture) => {
+                match self.sprite_atlas.upload_from_gpu(&key, size, texture)? {
+                    Some(tile) => tile,
+                    None => return Ok(TileWrite::Refused),
+                }
+            }
+            TileSource::Bytes => {
+                let bytes = image
+                    .as_bytes(frame_index)
+                    .ok_or_else(|| anyhow!("write_image_tile: no frame {frame_index}"))?;
+                match self.sprite_atlas.write_bytes(&key, size, bytes)? {
+                    Some(tile) => tile,
+                    None => {
+                        self.sprite_atlas.remove(&key);
+                        self.sprite_atlas
+                            .get_or_insert_with(key, &mut || {
+                                Ok(Some((size, Cow::Borrowed(bytes))))
+                            })?
+                            .ok_or_else(|| anyhow!("write_image_tile: the atlas took no tile"))?;
+                        return Ok(TileWrite::Placed);
+                    }
+                }
+            }
         };
-        let size = data.size(frame_index);
-        Ok(self
-            .sprite_atlas
-            .upload_from_gpu(&params.into(), size, texture)?
-            .is_some())
+        Ok(match before {
+            Some(tile) if tile == after => TileWrite::InPlace,
+            _ => TileWrite::Placed,
+        })
+    }
+
+    /// vue-native fork: presents the frame already drawn once more, with no
+    /// layout, prepaint or paint: the renderer encodes the same scene again, so
+    /// an atlas tile overwritten in place since ([`Window::write_image_tile`],
+    /// [`TileWrite::InPlace`]) shows its new pixels. From an `on_next_frame`
+    /// callback it takes effect in that frame; elsewhere, on the next one. A
+    /// frame that draws anyway presents what it drew.
+    pub fn request_present(&self) {
+        self.needs_present.set(true);
+        self.invalidator.wake_platform();
     }
 
     /// Removes an image from the sprite atlas.

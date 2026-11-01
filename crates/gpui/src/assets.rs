@@ -114,6 +114,21 @@ impl RenderImage {
         self.dynamic
     }
 
+    /// vue-native: the next frame of the same picture, `data` under THIS image's
+    /// id. One id is one atlas key, so
+    /// [`crate::Window::write_image_tile`] writes these pixels into the tile
+    /// this image already has, and a scene that samples that tile shows them on
+    /// its next present. Keeps [`Self::dynamic`] and the scale factor.
+    pub fn successor(&self, data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
+        Self {
+            id: self.id,
+            scale_factor: self.scale_factor,
+            data: data.into(),
+            dynamic: self.dynamic,
+            natural: None,
+        }
+    }
+
     /// Convert this image into a byte slice.
     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
         self.data

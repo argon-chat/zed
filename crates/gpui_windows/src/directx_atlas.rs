@@ -186,6 +186,51 @@ impl PlatformAtlas for DirectXAtlas {
         self.0.lock().remove(key);
     }
 
+    fn tile(&self, key: &AtlasKey) -> Option<AtlasTile> {
+        self.0.lock().tile(key)
+    }
+
+    /// The CPU twin of `upload_from_gpu`: `UpdateSubresource` into the key's
+    /// tile, reused in place while the size holds. A frame source that keeps one
+    /// key (`RenderImage::successor`) costs one tile and no allocation a frame,
+    /// and the scene that painted the tile shows the new pixels on a present.
+    fn write_bytes(
+        &self,
+        key: &AtlasKey,
+        size: Size<DevicePixels>,
+        bytes: &[u8],
+    ) -> anyhow::Result<Option<AtlasTile>> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            return Ok(None);
+        }
+        let mut lock = self.0.lock();
+        let existing = lock.tile(key);
+        let tile = match existing {
+            Some(tile) if tile.bounds.size == size => tile,
+            _ => {
+                if existing.is_some() {
+                    lock.remove(key);
+                }
+                let Some(tile) = lock.backend.allocate(size, key.texture_kind()) else {
+                    log::error!(
+                        "DirectXAtlas::write_bytes: could not allocate a {}x{} tile",
+                        size.width.0,
+                        size.height.0,
+                    );
+                    return Ok(None);
+                };
+                lock.insert_tile(key.clone(), tile);
+                tile
+            }
+        };
+        let Some(texture) = lock.backend.texture(tile.texture_id) else {
+            return Ok(None);
+        };
+        // Checks the length itself: a short slice is logged and skipped.
+        texture.upload(&lock.backend.device_context, tile.bounds, bytes);
+        Ok(Some(tile))
+    }
+
     fn stats(&self) -> Option<AtlasStats> {
         let lock = self.0.lock();
         let mut stats = AtlasStats::default();
@@ -661,6 +706,98 @@ mod tests {
             .unwrap()
             .expect("a resize is still acceptable");
         assert_eq!(resized.bounds.size, bigger);
+    }
+
+    /// The first BGRA pixel of `tile`, read back from the atlas texture.
+    fn first_pixel(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        atlas: &DirectXAtlas,
+        tile: AtlasTile,
+    ) -> Option<[u8; 4]> {
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_USAGE_STAGING,
+        };
+        let source = atlas.0.lock().backend.texture(tile.texture_id)?.texture.clone();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.ok()?;
+        let staging = staging?;
+        let region = D3D11_BOX {
+            left: tile.bounds.left().0 as u32,
+            top: tile.bounds.top().0 as u32,
+            front: 0,
+            right: tile.bounds.left().0 as u32 + 1,
+            bottom: tile.bounds.top().0 as u32 + 1,
+            back: 1,
+        };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, 0, Some(&region));
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+            let px = std::slice::from_raw_parts(mapped.pData as *const u8, 4);
+            let out = [px[0], px[1], px[2], px[3]];
+            context.Unmap(&staging, 0);
+            Some(out)
+        }
+    }
+
+    /// The property paint-only invalidation stands on: bytes written under ONE
+    /// key land in the SAME tile, so a scene that already samples it shows them
+    /// on a present. A new size takes a new tile, which only a draw can show.
+    #[test]
+    fn written_bytes_reuse_the_tile_in_place_and_follow_a_resize() {
+        let Some((device, context)) = create_device() else {
+            return;
+        };
+        let atlas = DirectXAtlas::new(&device, &context);
+        let size = Size {
+            width: DevicePixels(8),
+            height: DevicePixels(4),
+        };
+        let frame = |bgra: [u8; 4]| bgra.repeat(8 * 4);
+        let key = make_image_key(30);
+
+        assert_eq!(atlas.tile(&key), None);
+        let first = atlas
+            .write_bytes(&key, size, &frame([1, 2, 3, 255]))
+            .unwrap()
+            .expect("the first write takes a tile");
+        assert_eq!(atlas.tile(&key), Some(first));
+        assert_eq!(first_pixel(&device, &context, &atlas, first), Some([1, 2, 3, 255]));
+
+        let second = atlas
+            .write_bytes(&key, size, &frame([9, 8, 7, 255]))
+            .unwrap()
+            .expect("a second write is accepted");
+        assert_eq!(second, first, "the same tile, overwritten in place");
+        assert_eq!(first_pixel(&device, &context, &atlas, second), Some([9, 8, 7, 255]));
+
+        let bigger = Size {
+            width: DevicePixels(16),
+            height: DevicePixels(4),
+        };
+        let resized = atlas
+            .write_bytes(&key, bigger, &[5u8; 16 * 4 * 4])
+            .unwrap()
+            .expect("a resize is accepted");
+        assert_ne!(resized, first, "a new size is a new tile");
+        assert_eq!(resized.bounds.size, bigger);
+        assert_eq!(atlas.tile(&key), Some(resized));
     }
 
     /// The three refusals, each of which D3D11 would otherwise turn into

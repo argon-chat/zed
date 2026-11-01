@@ -1793,6 +1793,30 @@ pub trait PlatformAtlas {
         Ok(None)
     }
 
+    /// vue-native fork: the tile `key` maps to now, if any. `None` from a
+    /// backend that does not say, which makes every
+    /// [`crate::Window::write_image_tile`] report a moved tile: correct, only
+    /// never the cheap path.
+    fn tile(&self, _key: &AtlasKey) -> Option<AtlasTile> {
+        None
+    }
+
+    /// vue-native fork: writes `bytes` (`size`, in the key's texture format,
+    /// rows packed) into the tile for `key`, overwriting it in place when it
+    /// exists at this size and taking a new one otherwise. The CPU twin of
+    /// [`PlatformAtlas::upload_from_gpu`]: not memoised, one tile per key.
+    ///
+    /// `Ok(None)` when the backend has no such path; the caller then removes
+    /// the key and inserts it again, which always works but moves the tile.
+    fn write_bytes(
+        &self,
+        _key: &AtlasKey,
+        _size: Size<DevicePixels>,
+        _bytes: &[u8],
+    ) -> Result<Option<AtlasTile>> {
+        Ok(None)
+    }
+
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
@@ -1844,6 +1868,34 @@ pub struct AtlasStats {
 /// Same reasoning as `gpui_windows::renderer_d3d11_device`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GpuTextureHandle(pub *mut std::ffi::c_void);
+
+/// vue-native fork: where [`crate::Window::write_image_tile`] takes a frame's
+/// pixels from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileSource {
+    /// The image's own bytes (premultiplied BGRA), e.g. from
+    /// [`crate::RenderImage::successor`].
+    Bytes,
+    /// A texture already on the renderer's device, with the contract of
+    /// [`PlatformAtlas::upload_from_gpu`].
+    Gpu(GpuTextureHandle),
+}
+
+/// vue-native fork: what [`crate::Window::write_image_tile`] did with a frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TileWrite {
+    /// The tile the key had was overwritten where it lies. A scene that
+    /// painted the image samples the new pixels on its next present
+    /// ([`crate::Window::request_present`]).
+    InPlace,
+    /// The frame went into a tile the key did not have before this write (the
+    /// first write, a new size, a backend with no in-place path, a tile the
+    /// atlas had dropped). Only a draw shows it.
+    Placed,
+    /// The backend refused the GPU texture; nothing was written. The caller
+    /// falls back to [`TileSource::Bytes`].
+    Refused,
+}
 
 impl GpuTextureHandle {
     /// The null handle — "there is no texture", which every backend rejects.
