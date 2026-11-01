@@ -1555,6 +1555,8 @@ pub struct Window {
     vn_pick_every_box: bool,
     /// vue-native fork: see [`Window::set_vn_hit_refiner`].
     vn_hit_refiner: Option<VnHitRefiner>,
+    /// vue-native fork: see [`Window::vn_key_event_seq`].
+    vn_key_event_seq: u64,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2523,6 +2525,7 @@ impl Window {
             vn_tag_every_hitbox: false,
             vn_pick_every_box: false,
             vn_hit_refiner: None,
+            vn_key_event_seq: 0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
@@ -6617,6 +6620,23 @@ impl Window {
         self.vn_hit_refiner.is_some()
     }
 
+    /// vue-native fork: which key event this window is dispatching — one
+    /// number per key-down, key-up or modifiers change, taken before the
+    /// keystroke interceptors run, so everything that hears one event (an
+    /// interceptor, the capture listeners, the bubble listeners) reads the
+    /// same number and the next event reads another.
+    ///
+    /// gpui hands a key event to every listener on the focus path, and an
+    /// editor's interceptor sees it before any of them. An embedder that turns
+    /// it into ONE event of its own (a browser's `keydown`, dispatched once at
+    /// the focused element) records the number it dispatched for and lets the
+    /// others pass. Interceptor order and listener order do not matter, and a
+    /// listener whose element the first dispatch removed still reads the same
+    /// number, because gpui walks the path it computed before any of them ran.
+    pub fn vn_key_event_seq(&self) -> u64 {
+        self.vn_key_event_seq
+    }
+
     /// vue-native fork: for the mouse event being dispatched, keep only the
     /// hitboxes whose tag `keep` accepts (an untagged hitbox is not the
     /// embedder's and stays). With `add`, the accepted tags' boxes that do
@@ -7446,6 +7466,8 @@ impl Window {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
         }
+        // vue-native fork: `Window::vn_key_event_seq`.
+        self.vn_key_event_seq = self.vn_key_event_seq.wrapping_add(1);
 
         let node_id = self.focus_node_id_in_rendered_frame(self.focus);
         let dispatch_path = self.rendered_frame.dispatch_tree.dispatch_path(node_id);
