@@ -2554,6 +2554,12 @@ impl Interactivity {
                                 let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                                     Some(window.insert_hitbox(bounds, self.hitbox_behavior))
                                 } else {
+                                    // vue-native fork: the embedder's hit
+                                    // targeting needs every box, listening
+                                    // or not (`Window::vn_insert_pick`).
+                                    if window.vn_picks_every_box() {
+                                        window.vn_insert_pick(bounds);
+                                    }
                                     None
                                 };
 

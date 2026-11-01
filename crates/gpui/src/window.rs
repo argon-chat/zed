@@ -795,6 +795,11 @@ impl HitboxId {
 }
 
 impl HitboxId {
+    /// vue-native fork: the id of a PICK record ([`Window::vn_insert_pick`]),
+    /// which is in [`Frame::vn_tagged_hitboxes`] but never in
+    /// [`Frame::hitboxes`], so no hit test of gpui's own ever hovers it.
+    pub const VN_PICK: HitboxId = HitboxId(u64::MAX);
+
     /// Checks if the hitbox with this ID is currently hovered. Returns `false` during keyboard
     /// input modality so that keyboard navigation suppresses hover highlights. Except when handling
     /// `ScrollEvent`, this is typically what you want when determining whether to handle mouse
@@ -992,6 +997,29 @@ impl Hitbox {
         self.id.should_handle_scroll(window)
     }
 }
+
+/// vue-native fork: the bit an embedder ORs into a hitbox tag
+/// ([`Window::set_hitbox_tag`]) for a box that belongs to the node but is not
+/// where the node is — a scroll container's wheel viewport, inserted after
+/// the content it covers. [`Window::vn_tags_at`] leaves such boxes out;
+/// [`Window::vn_restrict_mouse_hit`] judges them by the node.
+pub const VN_TAG_PASSIVE: u32 = 1 << 31;
+
+/// vue-native fork: which mouse event a [`VnHitRefiner`] is refining.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VnHitKind {
+    /// A [`MouseDownEvent`](crate::MouseDownEvent).
+    Down,
+    /// A [`MouseUpEvent`].
+    Up,
+    /// A [`ScrollEvent`](crate::ScrollEvent).
+    Scroll,
+}
+
+/// vue-native fork: the embedder's say over which hitboxes a mouse event is
+/// for, run once per press, release and wheel before any listener sees it.
+/// See [`Window::set_vn_hit_refiner`].
+pub type VnHitRefiner = Rc<dyn Fn(VnHitKind, Point<Pixels>, &mut Window, &mut App)>;
 
 /// How the hitbox affects mouse behavior.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1199,6 +1227,14 @@ pub(crate) struct Frame {
     /// let a box that paints UNDER a later overlay take its clicks. The vector
     /// itself is not reordered, because cached views replay ranges of it.
     pub(crate) vn_hit_order: Vec<u32>,
+    /// vue-native fork: the slice of [`Frame::vn_tagged_hitboxes`] the
+    /// deferred draws' prepaint inserted — what
+    /// [`Frame::vn_tagged_paint_order`] reorders, as `vn_hit_order` does the
+    /// hitboxes.
+    pub(crate) vn_deferred_tagged: Range<usize>,
+    /// vue-native fork: [`Frame::vn_tagged_paint_order`], worked out on the
+    /// first question about this frame and kept until it is cleared.
+    vn_tagged_order: std::cell::OnceCell<Option<Vec<u32>>>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1261,6 +1297,8 @@ impl Frame {
             hitboxes: Vec::new(),
             vn_tagged_hitboxes: Vec::new(),
             vn_hit_order: Vec::new(),
+            vn_deferred_tagged: 0..0,
+            vn_tagged_order: std::cell::OnceCell::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1293,6 +1331,8 @@ impl Frame {
         self.hitboxes.clear();
         self.vn_tagged_hitboxes.clear();
         self.vn_hit_order.clear();
+        self.vn_deferred_tagged = 0..0;
+        self.vn_tagged_order = std::cell::OnceCell::new();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1326,6 +1366,83 @@ impl Frame {
             .into_inner()
     }
 
+    /// Is `position` (window space) inside `hitbox`, as the hit test sees it?
+    fn box_contains(hitbox: &Hitbox, position: Point<Pixels>, scale_factor: f32) -> bool {
+        // A transformed element keeps its untransformed `bounds`, so the
+        // POINTER is mapped back into the element's own frame rather than
+        // the rect being mapped forward into a polygon. That keeps the test
+        // a rectangle containment (exact for rotation and scale alike) and
+        // costs nothing at all when there is no transform.
+        //
+        // The matrix is in DEVICE space (it is the same one the primitives
+        // carry), so the pointer goes there and back; at scale 1 the two
+        // conversions cancel and this is what it always was.
+        //
+        // A singular matrix (`scale(0)`) has no inverse, which is the right
+        // answer: an element scaled to nothing is not hittable, exactly as
+        // in a browser.
+        let local = if hitbox.transformation.is_unit() {
+            position
+        } else {
+            match hitbox.transformation.inverse() {
+                Some(inverse) => {
+                    let d = inverse.apply(Point::new(
+                        px(position.x.0 * scale_factor),
+                        px(position.y.0 * scale_factor),
+                    ));
+                    Point::new(px(d.x.0 / scale_factor), px(d.y.0 / scale_factor))
+                }
+                None => return false,
+            }
+        };
+        // The CONTENT MASK is a window-space rect (see
+        // `Window::with_content_mask`, which maps it through the transform
+        // in force when it was pushed), so it is tested against the pointer
+        // as it came in — not against the element-local one. Testing both in
+        // one intersected rect was only right while transforms did not
+        // exist: a `translate(-50%, -50%)` dialog painted 500px to the left
+        // of a clip rect that had not moved, and every clipping element
+        // inside it hit-tested against a region it no longer covered.
+        hitbox.content_mask.contains(&position) && hitbox.bounds.contains(&local)
+    }
+
+    /// vue-native fork: [`Frame::vn_tagged_hitboxes`]' indices in PAINT
+    /// order — what [`Frame::compute_hit_order`]-style reordering does for
+    /// the hitboxes, done for the tagged list, which also holds the pick
+    /// records no hitbox list has. `None` means insertion order is paint
+    /// order (no deferred draw inserted anything). Worked out once per frame,
+    /// on the first question.
+    fn vn_tagged_paint_order(&self) -> Option<&[u32]> {
+        self.vn_tagged_order
+            .get_or_init(|| {
+                let deferred = self.vn_deferred_tagged.clone();
+                if deferred.is_empty() {
+                    return None;
+                }
+                let len = self.vn_tagged_hitboxes.len();
+                let mut order: Vec<u32> = Vec::with_capacity(len);
+                order.extend(0..deferred.start as u32);
+                let draws = &self.deferred_draws;
+                let mut traversal = (0..draws.len()).collect::<Vec<_>>();
+                traversal.sort_by(|a, b| draws[*a].order().cmp(&draws[*b].order()));
+                for ix in traversal {
+                    let range = &draws[ix].prepaint_range;
+                    let (start, end) = (
+                        range.start.vn_tagged_hitboxes_index,
+                        range.end.vn_tagged_hitboxes_index,
+                    );
+                    if start >= deferred.start && end <= deferred.end && start < end {
+                        order.extend(start as u32..end as u32);
+                    }
+                }
+                order.extend(deferred.end as u32..len as u32);
+                // Anything a draw's range did not account for keeps insertion
+                // order rather than vanishing (as `compute_hit_order`).
+                (order.len() == len).then_some(order)
+            })
+            .as_deref()
+    }
+
     pub(crate) fn hit_test(&self, position: Point<Pixels>, scale_factor: f32) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
@@ -1337,42 +1454,7 @@ impl Frame {
             None => Box::new(self.hitboxes.iter().rev()),
         };
         for hitbox in topmost_first {
-            // A transformed element keeps its untransformed `bounds`, so the
-            // POINTER is mapped back into the element's own frame rather than
-            // the rect being mapped forward into a polygon. That keeps the test
-            // a rectangle containment (exact for rotation and scale alike) and
-            // costs nothing at all when there is no transform.
-            //
-            // The matrix is in DEVICE space (it is the same one the primitives
-            // carry), so the pointer goes there and back; at scale 1 the two
-            // conversions cancel and this is what it always was.
-            //
-            // A singular matrix (`scale(0)`) has no inverse, which is the right
-            // answer: an element scaled to nothing is not hittable, exactly as
-            // in a browser.
-            let local = if hitbox.transformation.is_unit() {
-                position
-            } else {
-                match hitbox.transformation.inverse() {
-                    Some(inverse) => {
-                        let d = inverse.apply(Point::new(
-                            px(position.x.0 * scale_factor),
-                            px(position.y.0 * scale_factor),
-                        ));
-                        Point::new(px(d.x.0 / scale_factor), px(d.y.0 / scale_factor))
-                    }
-                    None => continue,
-                }
-            };
-            // The CONTENT MASK is a window-space rect (see
-            // `Window::with_content_mask`, which maps it through the transform
-            // in force when it was pushed), so it is tested against the pointer
-            // as it came in — not against the element-local one. Testing both in
-            // one intersected rect was only right while transforms did not
-            // exist: a `translate(-50%, -50%)` dialog painted 500px to the left
-            // of a clip rect that had not moved, and every clipping element
-            // inside it hit-tested against a region it no longer covered.
-            if hitbox.content_mask.contains(&position) && hitbox.bounds.contains(&local) {
+            if Self::box_contains(hitbox, position, scale_factor) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1468,6 +1550,11 @@ pub struct Window {
     /// picking, and for the same reason: a hit test can only answer for a node
     /// that has a hitbox.
     vn_tag_every_hitbox: bool,
+    /// vue-native fork: while set, an element that gets no hitbox records a
+    /// PICK instead ([`Window::vn_insert_pick`]).
+    vn_pick_every_box: bool,
+    /// vue-native fork: see [`Window::set_vn_hit_refiner`].
+    vn_hit_refiner: Option<VnHitRefiner>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2434,6 +2521,8 @@ impl Window {
             vn_tag_fresh: false,
             vn_tag_transform: None,
             vn_tag_every_hitbox: false,
+            vn_pick_every_box: false,
+            vn_hit_refiner: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
@@ -4154,8 +4243,11 @@ impl Window {
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
         let deferred_hitboxes_start = self.next_frame.hitboxes.len();
+        let deferred_tagged_start = self.next_frame.vn_tagged_hitboxes.len();
         self.prepaint_deferred_draws(cx);
         let deferred_hitboxes = deferred_hitboxes_start..self.next_frame.hitboxes.len();
+        self.next_frame.vn_deferred_tagged =
+            deferred_tagged_start..self.next_frame.vn_tagged_hitboxes.len();
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -4908,6 +5000,11 @@ impl Window {
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
+            // vue-native fork: the tagged boxes (and picks) of the attempt go
+            // with its hitboxes, or a retried prepaint records them twice.
+            self.next_frame
+                .vn_tagged_hitboxes
+                .truncate(index.vn_tagged_hitboxes_index);
             self.next_frame
                 .tooltip_requests
                 .truncate(index.tooltips_index);
@@ -6340,12 +6437,13 @@ impl Window {
     ///
     /// The first entry wins: an element's own hitbox is inserted before any box
     /// its subtree makes, and boxes a node's build produces internally (a
-    /// pseudo-element, a list marker) carry the same tag.
+    /// pseudo-element, a list marker) carry the same tag. A pick
+    /// ([`Window::vn_insert_pick`]) is not a hitbox and is passed over.
     pub fn tagged_hitbox(&self, tag: u32) -> Option<&Hitbox> {
         self.rendered_frame
             .vn_tagged_hitboxes
             .iter()
-            .find(|(t, _)| *t == tag)
+            .find(|(t, hitbox)| *t == tag && hitbox.id != HitboxId::VN_PICK)
             .map(|(_, hitbox)| hitbox)
     }
 
@@ -6360,16 +6458,149 @@ impl Window {
     /// box under the pointer) cannot say. One hit test plus one pass over the
     /// frame's tagged boxes: meant for a press or a drag, not for every mouse
     /// move.
+    ///
+    /// The PICK records ([`Window::vn_insert_pick`]) are boxes too, so with
+    /// [`Window::set_vn_pick_every_box`] on this answers for every element,
+    /// listening or not. It walks the tagged list in paint order itself rather
+    /// than asking [`Frame::hit_test`], whose list has no picks; a
+    /// `BlockMouse` box ends it, as it ends gpui's.
+    ///
+    /// A box tagged [`VN_TAG_PASSIVE`] is left out: it is a node's, but it is
+    /// not where the node is (a scroll container's wheel viewport, which lies
+    /// over the content it scrolls).
     pub fn vn_tags_at(&self, position: Point<Pixels>) -> Vec<u32> {
-        let hit = self.rendered_frame.hit_test(position, self.scale_factor);
-        if hit.ids.is_empty() {
-            return Vec::new();
+        let frame = &self.rendered_frame;
+        let tagged = &frame.vn_tagged_hitboxes;
+        let mut out = Vec::new();
+        let mut visit = |(tag, hitbox): &(u32, Hitbox)| {
+            if tag & VN_TAG_PASSIVE != 0 || !Frame::box_contains(hitbox, position, self.scale_factor) {
+                return true;
+            }
+            out.push(*tag);
+            hitbox.behavior != HitboxBehavior::BlockMouse
+        };
+        match frame.vn_tagged_paint_order() {
+            Some(order) => {
+                for &ix in order.iter().rev() {
+                    if !visit(&tagged[ix as usize]) {
+                        break;
+                    }
+                }
+            }
+            None => {
+                for entry in tagged.iter().rev() {
+                    if !visit(entry) {
+                        break;
+                    }
+                }
+            }
         }
+        out
+    }
+
+    /// vue-native fork: give an element that needs no hitbox a PICK record
+    /// instead — its box, content mask, transform and tag, in
+    /// [`Frame::vn_tagged_hitboxes`] only. gpui's own hit test (the one every
+    /// mouse move runs) never sees a pick, so it costs a move nothing; it is
+    /// there for [`Window::vn_tags_at`], which an embedder asks at a press to
+    /// learn the topmost of ALL its elements, the way a browser targets an
+    /// event. Replayed with the rest of a cached view's prepaint.
+    pub fn set_vn_pick_every_box(&mut self, on: bool) {
+        self.vn_pick_every_box = on;
+    }
+
+    /// vue-native fork: is [`Window::set_vn_pick_every_box`] on?
+    pub fn vn_picks_every_box(&self) -> bool {
+        self.vn_pick_every_box
+    }
+
+    /// vue-native fork: records a pick for `bounds` under the current tag
+    /// (nothing outside a tag). Called where an element would insert its
+    /// hitbox, so the content mask and transform are the ones a hitbox there
+    /// would carry.
+    pub fn vn_insert_pick(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidator.debug_assert_prepaint();
+        if self.vn_hitbox_tag == 0 {
+            return;
+        }
+        let hitbox = Hitbox {
+            id: HitboxId::VN_PICK,
+            bounds,
+            content_mask: self.content_mask(),
+            behavior: HitboxBehavior::Normal,
+            transformation: self.element_transform,
+        };
+        self.next_frame
+            .vn_tagged_hitboxes
+            .push((self.vn_hitbox_tag, hitbox));
+    }
+
+    /// vue-native fork: installs (or removes) the embedder's hit refiner.
+    ///
+    /// gpui hands a mouse event to EVERY hitbox under the pointer, so a box
+    /// that listens takes a press through anything painted over it that does
+    /// not, and a box that does not listen is never anybody's target. A
+    /// browser targets the topmost element and bubbles from there. The
+    /// refiner is run at the start of the dispatch of each press, release and
+    /// wheel event, before any listener, and may narrow what the event is for
+    /// with [`Window::vn_restrict_mouse_hit`]. Moves are not refined.
+    pub fn set_vn_hit_refiner(&mut self, refiner: Option<VnHitRefiner>) {
+        self.vn_hit_refiner = refiner;
+    }
+
+    /// vue-native fork: is a hit refiner installed?
+    pub fn has_vn_hit_refiner(&self) -> bool {
+        self.vn_hit_refiner.is_some()
+    }
+
+    /// vue-native fork: for the mouse event being dispatched, keep only the
+    /// hitboxes whose tag `keep` accepts (an untagged hitbox is not the
+    /// embedder's and stays). With `add`, the accepted tags' boxes that do
+    /// NOT contain the pointer join the hovered set as well: a browser's
+    /// event reaches every ancestor of its target, wherever their boxes are.
+    ///
+    /// Only meant from inside a [`VnHitRefiner`]. The next frame or the next
+    /// mouse event recomputes the hit test from geometry.
+    pub fn vn_restrict_mouse_hit(&mut self, keep: &dyn Fn(u32) -> bool, add: bool) {
+        let frame = &self.rendered_frame;
         let mut tag_of: FxHashMap<HitboxId, u32> = FxHashMap::default();
-        for (tag, hitbox) in &self.rendered_frame.vn_tagged_hitboxes {
-            tag_of.entry(hitbox.id).or_insert(*tag);
+        // A passive box is judged by the node it belongs to.
+        for (tag, hitbox) in &frame.vn_tagged_hitboxes {
+            if hitbox.id != HitboxId::VN_PICK {
+                tag_of.entry(hitbox.id).or_insert(tag & !VN_TAG_PASSIVE);
+            }
         }
-        hit.ids.iter().filter_map(|id| tag_of.get(id).copied()).collect()
+        let old = mem::take(&mut self.mouse_hit_test);
+        let mut ids: SmallVec<[HitboxId; 8]> = SmallVec::new();
+        let mut hover = 0;
+        for (ix, id) in old.ids.iter().enumerate() {
+            if tag_of.get(id).is_none_or(|tag| keep(*tag)) {
+                ids.push(*id);
+                if ix < old.hover_hitbox_count {
+                    hover += 1;
+                }
+            }
+        }
+        // Nothing was cut from hover by a `BlockMouseExceptScroll` box: the
+        // added boxes are hovered too.
+        let all_hovered = old.hover_hitbox_count == old.ids.len();
+        if add {
+            for (tag, hitbox) in &frame.vn_tagged_hitboxes {
+                if hitbox.id != HitboxId::VN_PICK
+                    && keep(tag & !VN_TAG_PASSIVE)
+                    && !ids.contains(&hitbox.id)
+                {
+                    ids.push(hitbox.id);
+                }
+            }
+        }
+        if all_hovered {
+            hover = ids.len();
+        }
+        self.mouse_hit_test = HitTest {
+            ids,
+            hover_hitbox_count: hover,
+        };
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -7055,6 +7286,24 @@ impl Window {
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
+        }
+
+        // vue-native fork: the embedder narrows a press, a release or a wheel
+        // to the hitboxes it is FOR, before anyone hears it.
+        if let Some(refiner) = self.vn_hit_refiner.clone() {
+            let kind = if event.is::<crate::MouseDownEvent>() {
+                Some(VnHitKind::Down)
+            } else if event.is::<MouseUpEvent>() {
+                Some(VnHitKind::Up)
+            } else if event.is::<crate::ScrollEvent>() {
+                Some(VnHitKind::Scroll)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let position = self.mouse_position();
+                refiner(kind, position, self, cx);
+            }
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
