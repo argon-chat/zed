@@ -732,6 +732,13 @@ fragment float4 polychrome_sprite_fragment(
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
+  // vue-native fork: the tint takes the pixels by its alpha, keeping theirs
+  // (canvas `source-atop`, in straight alpha). `PolychromeSprite` comes from
+  // cbindgen (build.rs), so its `tint` is already there.
+  if (sprite.tint.a > 0.0) {
+    float4 tint = hsla_to_rgba(sprite.tint);
+    color.rgb = mix(color.rgb, tint.rgb, tint.a);
+  }
   if (sprite.grayscale) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.r = grayscale;

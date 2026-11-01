@@ -1666,6 +1666,9 @@ struct PolychromeSprite {
     // what rotates an <img> (or a colour emoji) with its box. Kept last; must
     // mirror `gpui::PolychromeSprite` field for field (zed#65814 moved `tile`).
     TransformationMatrix transformation;
+    // vue-native fork: `Window::with_image_tint`, after the transformation.
+    // Transparent leaves the sprite as it is.
+    Hsla tint;
 };
 
 struct PolychromeSpriteVertexOutput {
@@ -1712,9 +1715,15 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     float distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;
+    // vue-native fork: the tint takes the pixels by its alpha, keeping theirs
+    // (canvas `source-atop`, in straight alpha).
+    if (sprite.tint.a > 0.0) {
+        float4 tint = hsla_to_rgba(sprite.tint);
+        color.rgb = lerp(color.rgb, tint.rgb, tint.a);
+    }
     if (sprite.grayscale != 0u) {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
-        color = float4(grayscale, sample.a);
+        color = float4(grayscale, color.a);
     }
     color.a *= sprite.opacity * saturate(0.5 - distance) *
         content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);

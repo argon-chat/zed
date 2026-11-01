@@ -2821,6 +2821,9 @@ mod tests {
         // Then every content mask grew its four corner radii, which moved each
         // record below by 4, and the path vertex by 8: it carries the mask's
         // own rect as well as the clipped one.
+        //
+        // `PolychromeSprite` then grew its `tint` (4 words) after the
+        // transformation.
         assert_eq!(std::mem::size_of::<Background>(), 57 * 4);
         assert_eq!(std::mem::size_of::<Quad>(), 89 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
@@ -2829,7 +2832,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
     }
 
     #[test]

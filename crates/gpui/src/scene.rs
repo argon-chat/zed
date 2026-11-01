@@ -1219,8 +1219,9 @@ const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
 // bytes and produces garbage rather than an error, so the sizes are asserted
 // here where a mismatch is a compile failure.
 //
-// Word counts, for the shader side: 89 / 38 / 26 / 34. (vue-native fork: each
-// grew by four, the content mask's corner radii.)
+// Word counts, for the shader side: 89 / 38 / 26 / 38. (vue-native fork: each
+// grew by four, the content mask's corner radii; `PolychromeSprite` by four
+// more, its `tint`.)
 //
 // `Quad` carries a `Background`, which is 57 words since it grew from a
 // two-stop linear ramp to an eight-stop linear / radial / conic one with
@@ -1230,7 +1231,7 @@ const _: () = assert!(std::mem::size_of::<Quad>() == 89 * 4);
 const _: () = assert!(std::mem::size_of::<Background>() == 57 * 4);
 const _: () = assert!(std::mem::size_of::<Shadow>() == 38 * 4);
 const _: () = assert!(std::mem::size_of::<Underline>() == 26 * 4);
-const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 34 * 4);
+const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 38 * 4);
 const _: () = assert!(std::mem::size_of::<TransformationMatrix>() == 6 * 4);
 
 /// Seconds since the first effect was painted — the clock [`EffectQuad::time`]
@@ -1590,8 +1591,12 @@ pub struct PolychromeSprite {
     /// vue-native fork: kept LAST. Upstream (zed#65814) moved `tile` up to
     /// offset 8 so the texture sort key sits beside `order`; every shader's
     /// `PolychromeSprite` mirrors this order — tile, grayscale, opacity,
-    /// bounds, content_mask, corner_radii, transformation.
+    /// bounds, content_mask, corner_radii, transformation, tint.
     pub transformation: TransformationMatrix,
+    /// vue-native fork: the colour the sprite's pixels take by its alpha,
+    /// keeping their own alpha (`Window::with_image_tint`); transparent for
+    /// none. After `transformation`, so every shader mirrors it last.
+    pub tint: Hsla,
 }
 
 impl From<PolychromeSprite> for Primitive {

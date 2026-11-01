@@ -1526,6 +1526,9 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// vue-native fork: the colour [`Window::paint_image`] tints with
+    /// ([`Window::with_image_tint`]); transparent outside a tint scope.
+    element_image_tint: Hsla,
     /// The composed CSS `transform` of every ancestor currently being painted,
     /// in DEVICE space. Identity outside a `Style::vn_transform`.
     ///
@@ -2518,6 +2521,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_image_tint: Hsla::transparent_black(),
             element_transform: TransformationMatrix::unit(),
             vn_hitbox_tag: 0,
             vn_tag_fresh: false,
@@ -4897,6 +4901,24 @@ impl Window {
         result
     }
 
+    /// vue-native fork: every image [`Window::paint_image`] paints inside `f`
+    /// is tinted with `tint`: its pixels take the colour by the colour's alpha,
+    /// keeping their own alpha. In straight alpha that is
+    /// `rgb = mix(rgb, tint.rgb, tint.a)`, `a = a`, which is a canvas filling
+    /// the image with `tint` in `source-atop`. A transparent `tint` (the value
+    /// outside any scope) leaves an image as it is; an opaque one paints the
+    /// image's alpha in that colour, a monochrome emoji in `currentColor`.
+    ///
+    /// The tile is the same one an untinted paint samples: tinting costs no
+    /// upload, and two tints of one image share it.
+    pub fn with_image_tint<R>(&mut self, tint: Hsla, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous = std::mem::replace(&mut self.element_image_tint, tint);
+        let result = f(self);
+        self.element_image_tint = previous;
+        result
+    }
+
     /// Paints everything `f` paints — this element's own quads, shadows, text
     /// and its whole subtree — through `transformation`, which is composed on
     /// top of whatever an ancestor already pushed.
@@ -5949,6 +5971,7 @@ impl Window {
                 tile,
                 opacity,
                 transformation: self.element_transform,
+                tint: Hsla::transparent_black(),
             });
         }
         Ok(())
@@ -6144,6 +6167,7 @@ impl Window {
             tile: sub_tile,
             opacity,
             transformation: self.element_transform,
+            tint: self.element_image_tint,
         });
         Ok(())
     }

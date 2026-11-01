@@ -1536,6 +1536,9 @@ struct PolychromeSprite {
     // backend APPLIES it today (gpui_windows' shaders.hlsl); here it keeps the
     // record size right so nothing else is read at the wrong offset.
     transformation: TransformationMatrix,
+    // vue-native fork: `Window::with_image_tint`, after the transformation.
+    // Transparent leaves the sprite as it is.
+    tint: Hsla,
 }
 
 
@@ -1571,9 +1574,15 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
+    // vue-native fork: the tint takes the pixels by its alpha, keeping theirs
+    // (canvas `source-atop`, in straight alpha).
+    if (sprite.tint.a > 0.0) {
+        let tint = hsla_to_rgba(sprite.tint);
+        color = vec4<f32>(mix(color.rgb, tint.rgb, tint.a), color.a);
+    }
     if (sprite.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
-        color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+        color = vec4<f32>(vec3<f32>(grayscale), color.a);
     }
     let mask = content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);
     return blend_color(color, sprite.opacity * saturate(0.5 - distance) * mask);
