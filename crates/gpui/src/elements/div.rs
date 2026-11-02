@@ -2548,6 +2548,11 @@ impl Interactivity {
                     // Nothing reads it in prepaint otherwise.
                     window.with_element_opacity(style.opacity, |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
+                        // vue-native fork: `clip-path` cuts the hit test
+                        // of the element and its subtree, as `Style::paint`
+                        // cuts their painting.
+                        let clip = style.vn_clip_mask(bounds, window.rem_size());
+                        window.with_content_mask(clip, |window| {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
@@ -2569,6 +2574,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                        })
                     })
                     })
                 })

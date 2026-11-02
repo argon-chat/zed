@@ -362,6 +362,76 @@ pub fn vn_resolve_corner_radii(
     .clamp_radii_for_quad_size(size)
 }
 
+/// vue-native fork: the box a `clip-path` is laid against (CSS Masking 1
+/// §5.1, `<geometry-box>`). `fill-box` is the content box and `stroke-box` and
+/// `view-box` the border box, as for any element with a CSS box.
+#[derive(Copy, Clone, Default, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum VnClipBox {
+    /// The margin box.
+    Margin,
+    /// The border box, the default.
+    #[default]
+    Border,
+    /// The padding box.
+    Padding,
+    /// The content box.
+    Content,
+}
+
+/// vue-native fork: a `<shape-radius>` of `circle()` or `ellipse()`.
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum VnShapeRadius {
+    /// A length. A percentage is of the reference box's width for an
+    /// ellipse's horizontal radius, of its height for the vertical one, and
+    /// of `sqrt(width² + height²) / sqrt(2)` for a circle's.
+    Length(DefiniteLength),
+    /// The distance from the centre to the reference box's closest side
+    /// (in the radius's own axis, for an ellipse).
+    ClosestSide,
+    /// The distance to the farthest side.
+    FarthestSide,
+}
+
+/// vue-native fork: CSS `clip-path` (CSS Masking 1 §5), in the shapes a
+/// rounded content mask can carry. See [`Style::vn_clip_mask`].
+#[derive(Copy, Clone, Default, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum VnClipPath {
+    /// `none`: no clip.
+    #[default]
+    None,
+    /// A `<geometry-box>` alone: that box, rounded as `border-radius` rounds
+    /// it.
+    Box(VnClipBox),
+    /// `inset()`: the reference box less `insets`, with `radii` (`round`).
+    /// A percentage inset is of the box's width (left and right) or height
+    /// (top and bottom), and a percentage radius of the box's size, as
+    /// Chromium resolves them.
+    Inset {
+        /// The box the insets are taken from.
+        reference: VnClipBox,
+        /// The insets: top, right, bottom, left.
+        insets: [DefiniteLength; 4],
+        /// The `round` radii: top left, top right, bottom right, bottom
+        /// left. Zero for a square corner.
+        radii: [VnCornerRadius; 4],
+    },
+    /// `circle()`, or `ellipse()`: a centre in the reference box and two
+    /// radii. gpui's masks are rounded rectangles, so an ellipse whose radii
+    /// differ is drawn as the rounded rectangle around it with corners of the
+    /// smaller radius, a capsule. A circle is exact.
+    Ellipse {
+        /// The box the centre and the radii are resolved against.
+        reference: VnClipBox,
+        /// The centre, from the reference box's top left corner: x, y.
+        center: [DefiniteLength; 2],
+        /// The horizontal and vertical radii; the same for a circle.
+        radius: [VnShapeRadius; 2],
+        /// `circle()`: a percentage radius is of the box's diagonal over
+        /// `sqrt(2)`, and the closest or farthest side is of all four.
+        circle: bool,
+    },
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -638,6 +708,12 @@ pub struct Style {
     /// percentage padding resolves against the element's own width here,
     /// not its containing block's.
     pub vn_mask_ring: bool,
+
+    /// vue-native fork: CSS `clip-path`, in the shapes a rounded content
+    /// mask carries ([`VnClipPath`]). It clips the element's whole painting,
+    /// its shadows, background, border, outline and subtree, and its hit
+    /// test, inside its `transform`.
+    pub vn_clip_path: VnClipPath,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -1179,6 +1255,151 @@ impl Style {
         }
     }
 
+    /// vue-native fork: the mask `clip-path` cuts this element's painting and
+    /// hit test to ([`Style::vn_clip_path`]), for the border box `bounds`, in
+    /// the element's own frame. `None` without a clip.
+    pub fn vn_clip_mask(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Option<ContentMask<Pixels>> {
+        let clip = &self.vn_clip_path;
+        let reference = match clip {
+            VnClipPath::None => return None,
+            VnClipPath::Box(reference)
+            | VnClipPath::Inset { reference, .. }
+            | VnClipPath::Ellipse { reference, .. } => *reference,
+        };
+        let (rect, rounded) = self.vn_clip_box(reference, bounds, rem_size);
+        let (w, h) = (rect.size.width, rect.size.height);
+        let resolve = |length: &DefiniteLength, base: Pixels| length.to_pixels(AbsoluteLength::Pixels(base), rem_size);
+        Some(match clip {
+            VnClipPath::None => return None,
+            VnClipPath::Box(_) => ContentMask { bounds: rect, corner_radii: rounded },
+            VnClipPath::Inset { insets, radii, .. } => {
+                // Chromium's `BasicShapeInset::GetPath`: the insets come off
+                // the reference box, an empty side stays empty, and the radii
+                // resolve against the reference box and are then scaled down
+                // to fit the inset rectangle (css-backgrounds-3 §5.5).
+                let [top, right, bottom, left] = insets;
+                let (top, right) = (resolve(top, h), resolve(right, w));
+                let (bottom, left) = (resolve(bottom, h), resolve(left, w));
+                let shape = Bounds {
+                    origin: point(rect.left() + left, rect.top() + top),
+                    size: size((w - left - right).max(px(0.)), (h - top - bottom).max(px(0.))),
+                };
+                let pairs = radii.map(|r| {
+                    let x = f32::from(resolve(&r.x, w)).max(0.);
+                    let y = f32::from(resolve(&r.y, h)).max(0.);
+                    (x, y)
+                });
+                let [tl, tr, br, bl] = pairs;
+                let (sw, sh) = (f32::from(shape.size.width), f32::from(shape.size.height));
+                let ratio = |side: f32, a: f32, b: f32| if a + b > side { side / (a + b) } else { 1. };
+                let factor = ratio(sw, tl.0, tr.0)
+                    .min(ratio(sw, bl.0, br.0))
+                    .min(ratio(sh, tl.1, bl.1))
+                    .min(ratio(sh, tr.1, br.1));
+                let circle = |(x, y): (f32, f32)| px(x.min(y) * factor);
+                let corner_radii = Corners {
+                    top_left: circle(tl),
+                    top_right: circle(tr),
+                    bottom_right: circle(br),
+                    bottom_left: circle(bl),
+                }
+                .clamp_radii_for_quad_size(shape.size);
+                ContentMask { bounds: shape, corner_radii }
+            }
+            VnClipPath::Ellipse { center, radius, circle, .. } => {
+                let cx = rect.left() + resolve(&center[0], w);
+                let cy = rect.top() + resolve(&center[1], h);
+                let (near_x, far_x) = ((cx - rect.left()).abs(), (rect.right() - cx).abs());
+                let (near_y, far_y) = ((cy - rect.top()).abs(), (rect.bottom() - cy).abs());
+                // CSS Shapes 1 §3.1: a circle's sides are all four, and its
+                // percentage is of the box's diagonal over sqrt(2).
+                let diagonal = px((f32::from(w).powi(2) + f32::from(h).powi(2)).sqrt() / 2f32.sqrt());
+                let one = |r: &VnShapeRadius, horizontal: bool| -> Pixels {
+                    let (a, b) = if *circle {
+                        (near_x.min(far_x).min(near_y.min(far_y)), near_x.max(far_x).max(near_y.max(far_y)))
+                    } else if horizontal {
+                        (near_x.min(far_x), near_x.max(far_x))
+                    } else {
+                        (near_y.min(far_y), near_y.max(far_y))
+                    };
+                    match r {
+                        VnShapeRadius::ClosestSide => a,
+                        VnShapeRadius::FarthestSide => b,
+                        VnShapeRadius::Length(l) => {
+                            resolve(l, if *circle { diagonal } else if horizontal { w } else { h }).max(px(0.))
+                        }
+                    }
+                };
+                let (rx, ry) = (one(&radius[0], true), one(&radius[1], false));
+                let shape = Bounds { origin: point(cx - rx, cy - ry), size: size(rx * 2., ry * 2.) };
+                ContentMask { bounds: shape, corner_radii: Corners::all(rx.min(ry)) }
+            }
+        })
+    }
+
+    /// vue-native fork: a `clip-path` reference box and its rounded corners,
+    /// for the border box `bounds`. Inside the border box a corner loses the
+    /// larger of its two insets, as `overflow_mask` rounds the padding box;
+    /// the margin box's grows by the larger margin, where it is rounded at
+    /// all. A percentage padding or margin resolves against the element's own
+    /// width, not its containing block's.
+    fn vn_clip_box(&self, reference: VnClipBox, bounds: Bounds<Pixels>, rem_size: Pixels) -> (Bounds<Pixels>, Corners<Pixels>) {
+        let outer = self.corner_radii_for(bounds.size, rem_size);
+        let width = AbsoluteLength::Pixels(bounds.size.width);
+        let edges = match reference {
+            VnClipBox::Border => return (bounds, outer),
+            VnClipBox::Margin => {
+                let margin = |l: &Length| match l {
+                    Length::Definite(l) => -l.to_pixels(width, rem_size),
+                    Length::Auto => px(0.),
+                };
+                Edges {
+                    top: margin(&self.margin.top),
+                    right: margin(&self.margin.right),
+                    bottom: margin(&self.margin.bottom),
+                    left: margin(&self.margin.left),
+                }
+            }
+            VnClipBox::Padding | VnClipBox::Content => {
+                let border = self.border_widths.to_pixels(rem_size);
+                if reference == VnClipBox::Padding {
+                    border
+                } else {
+                    let padding = self.padding.to_pixels(size(width, width), rem_size);
+                    Edges {
+                        top: border.top + padding.top,
+                        right: border.right + padding.right,
+                        bottom: border.bottom + padding.bottom,
+                        left: border.left + padding.left,
+                    }
+                }
+            }
+        };
+        let rect = Bounds::from_corners(
+            point(bounds.left() + edges.left, bounds.top() + edges.top),
+            point(
+                (bounds.right() - edges.right).max(bounds.left() + edges.left),
+                (bounds.bottom() - edges.bottom).max(bounds.top() + edges.top),
+            ),
+        );
+        // A negative inset is an outset (the margin box).
+        let corner = |radius: Pixels, a: Pixels, b: Pixels| {
+            if a < px(0.) || b < px(0.) {
+                if radius > px(0.) { radius - a.min(b) } else { px(0.) }
+            } else {
+                (radius - a.max(b)).max(px(0.))
+            }
+        };
+        let corner_radii = Corners {
+            top_left: corner(outer.top_left, edges.top, edges.left),
+            top_right: corner(outer.top_right, edges.top, edges.right),
+            bottom_right: corner(outer.bottom_right, edges.bottom, edges.right),
+            bottom_left: corner(outer.bottom_left, edges.bottom, edges.left),
+        }
+        .clamp_radii_for_quad_size(rect.size);
+        (rect, corner_radii)
+    }
+
     /// The device-space matrix this style's CSS `transform` produces for an
     /// element laid out at `bounds`, or the identity when there is none.
     ///
@@ -1206,13 +1427,17 @@ impl Style {
         // `continuation`, which is where the children paint. Layout has already
         // happened at this point and is deliberately not consulted again: a
         // transform never moves a box, only its picture.
+        //
+        // vue-native fork: `clip-path` cuts everything below too, in the
+        // element's transformed frame (`Style::vn_clip_mask`).
         let transformation = self.transform_matrix(bounds, window.scale_factor());
+        let clip = self.vn_clip_mask(bounds, window.rem_size());
         if !transformation.is_unit() {
             return window.with_element_transform(transformation, |window| {
-                self.paint_untransformed(bounds, window, cx, continuation)
+                window.with_content_mask(clip, |window| self.paint_untransformed(bounds, window, cx, continuation))
             });
         }
-        self.paint_untransformed(bounds, window, cx, continuation)
+        window.with_content_mask(clip, |window| self.paint_untransformed(bounds, window, cx, continuation))
     }
 
     fn paint_untransformed(
@@ -1479,6 +1704,7 @@ impl Default for Style {
             vn_justify_self: None,
             vn_outline: None,
             vn_mask_ring: false,
+            vn_clip_path: VnClipPath::None,
             vn_corner_radii: Corners::default(),
 
             #[cfg(debug_assertions)]
@@ -2491,5 +2717,168 @@ mod vn_rounded_clip_tests {
         let rows = quad(Hsla::green());
         assert_eq!(rows.content_mask.corner_radii, Corners::all(px(24.)).scale(scale));
         assert_eq!(rows.content_mask.bounds.size, size(px(200.), px(160.)).scale(scale));
+    }
+}
+
+/// vue-native fork: `clip-path` is a rounded mask around the element's whole
+/// painting (`Style::vn_clip_path`, `Style::vn_clip_mask`).
+#[cfg(test)]
+mod vn_clip_path_tests {
+    use crate::{
+        Bounds, BoxShadow, Context, Corners, DefiniteLength, Edges, Hsla, Length, Pixels, Style,
+        TestAppContext, VnClipBox, VnClipPath, VnCornerRadius, VnShapeRadius, Window, div, point,
+        prelude::*, px, relative, size,
+    };
+
+    const BOX: VnClipBox = VnClipBox::Border;
+
+    fn len(v: f32) -> DefiniteLength {
+        px(v).into()
+    }
+
+    fn round(x: DefiniteLength, y: DefiniteLength) -> [VnCornerRadius; 4] {
+        [VnCornerRadius { x, y }; 4]
+    }
+
+    /// The mask's bounds, as `[x, y, w, h]`, and its four radii, to 0.01px.
+    fn mask(clip: VnClipPath, style: Style, bounds: [f32; 4]) -> ([f32; 4], [f32; 4]) {
+        let bounds = Bounds::new(point(px(bounds[0]), px(bounds[1])), size(px(bounds[2]), px(bounds[3])));
+        let m = Style { vn_clip_path: clip, ..style }.vn_clip_mask(bounds, px(16.)).expect("a mask");
+        let (b, r) = (m.bounds, m.corner_radii);
+        let at = |v: Pixels| (f32::from(v) * 100.).round() / 100.;
+        (
+            [b.origin.x, b.origin.y, b.size.width, b.size.height].map(at),
+            [r.top_left, r.top_right, r.bottom_right, r.bottom_left].map(at),
+        )
+    }
+
+    fn inset(insets: [DefiniteLength; 4], radii: [VnCornerRadius; 4]) -> VnClipPath {
+        VnClipPath::Inset { reference: BOX, insets, radii }
+    }
+
+    fn ellipse(center: [DefiniteLength; 2], radius: [VnShapeRadius; 2], circle: bool) -> VnClipPath {
+        VnClipPath::Ellipse { reference: BOX, center, radius, circle }
+    }
+
+    #[test]
+    fn inset_takes_its_insets_off_the_box_and_fits_its_radii() {
+        let none = Style::default;
+        let square = round(len(0.), len(0.));
+        assert_eq!(Style::default().vn_clip_mask(Bounds::default(), px(16.)), None, "none is no mask");
+        // `inset(10px 20% round 8px)` on a 200x100 box at (10, 20).
+        let insets = [len(10.), relative(0.2), len(10.), relative(0.2)];
+        assert_eq!(
+            mask(inset(insets, round(len(8.), len(8.))), none(), [10., 20., 200., 100.]),
+            ([50., 30., 120., 80.], [8.; 4])
+        );
+        // The screen-reader-only `inset(50%)` encloses nothing.
+        let half = relative(0.5);
+        assert_eq!(mask(inset([half; 4], square), none(), [0., 0., 30., 10.]).0, [15., 5., 0., 0.]);
+        // Insets past the box leave it empty, not inside out.
+        assert_eq!(mask(inset([len(80.); 4], square), none(), [0., 0., 100., 100.]).0, [80., 80., 0., 0.]);
+        // `round 30px` on a 200x20 strip scales by 20 / (30 + 30). A
+        // percentage radius is of the REFERENCE box: 10% of 200x100 is 20 by
+        // 10, drawn as the 10px circle.
+        let strip = [len(40.), len(0.), len(40.), len(0.)];
+        assert_eq!(mask(inset(strip, round(len(30.), len(30.))), none(), [0., 0., 200., 100.]).1, [10.; 4]);
+        let ten = relative(0.1);
+        assert_eq!(mask(inset([len(0.); 4], round(ten, ten)), none(), [0., 0., 200., 100.]).1, [10.; 4]);
+    }
+
+    #[test]
+    fn circle_and_ellipse_resolve_against_the_box() {
+        let none = Style::default;
+        let mid = [relative(0.5), relative(0.5)];
+        // `circle(50%)` on a square is its disc.
+        let circle = ellipse(mid, [VnShapeRadius::Length(relative(0.5)); 2], true);
+        assert_eq!(mask(circle, none(), [0., 0., 60., 60.]), ([0., 0., 60., 60.], [30.; 4]));
+        // On 200x100 the percentage is of sqrt(200^2 + 100^2) / sqrt(2), 158.11.
+        assert_eq!(mask(circle, none(), [0., 0., 200., 100.]).1, [79.06; 4]);
+        // `circle(closest-side at 25% 50%)`: 50 to the left, top and bottom.
+        let at = [relative(0.25), relative(0.5)];
+        assert_eq!(
+            mask(ellipse(at, [VnShapeRadius::ClosestSide; 2], true), none(), [0., 0., 200., 100.]),
+            ([0., 0., 100., 100.], [50.; 4])
+        );
+        let far = ellipse(at, [VnShapeRadius::FarthestSide; 2], true);
+        assert_eq!(mask(far, none(), [0., 0., 200., 100.]).1, [150.; 4]);
+        // `ellipse(closest-side farthest-side)`: each radius in its own axis,
+        // drawn as the capsule around it.
+        let e = ellipse(mid, [VnShapeRadius::ClosestSide, VnShapeRadius::FarthestSide], false);
+        assert_eq!(mask(e, none(), [0., 0., 200., 100.]), ([0., 0., 200., 100.], [50.; 4]));
+        // `ellipse(10px 20% at right 10px center)`: `right 10px` is 100% - 10px.
+        let right = [DefiniteLength::Calc { fraction: 1., pixels: px(-10.) }, relative(0.5)];
+        let e = ellipse(right, [VnShapeRadius::Length(len(10.)), VnShapeRadius::Length(relative(0.2))], false);
+        assert_eq!(mask(e, none(), [0., 0., 200., 100.]), ([180., 30., 20., 40.], [10.; 4]));
+    }
+
+    #[test]
+    fn a_box_alone_is_rounded_as_the_border_radius_rounds_it() {
+        let style = || Style {
+            corner_radii: Corners::all(px(24.)).map(|r| (*r).into()),
+            border_widths: Edges::all(px(4.).into()),
+            padding: Edges::all(px(6.).into()),
+            margin: Edges { top: Length::Auto, ..Edges::all(len(8.).into()) },
+            ..Style::default()
+        };
+        let at = [0., 0., 100., 80.];
+        assert_eq!(mask(VnClipPath::Box(VnClipBox::Border), style(), at), ([0., 0., 100., 80.], [24.; 4]));
+        assert_eq!(mask(VnClipPath::Box(VnClipBox::Padding), style(), at), ([4., 4., 92., 72.], [20.; 4]));
+        assert_eq!(mask(VnClipPath::Box(VnClipBox::Content), style(), at), ([10., 10., 80., 60.], [14.; 4]));
+        // An `auto` margin is none; a rounded corner grows by the margin.
+        assert_eq!(mask(VnClipPath::Box(VnClipBox::Margin), style(), at), ([-8., 0., 116., 88.], [32.; 4]));
+        // An inset's reference box: the content box less 5px.
+        let clip = VnClipPath::Inset { reference: VnClipBox::Content, insets: [len(5.); 4], radii: round(len(0.), len(0.)) };
+        assert_eq!(mask(clip, style(), at), ([15., 15., 70., 50.], [0.; 4]));
+    }
+
+    /// A clipped box with a border and a shadow, and a child that overflows
+    /// it.
+    struct Clipped;
+
+    impl Render for Clipped {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut d = div()
+                .size(px(60.))
+                .bg(Hsla::red())
+                .border_2()
+                .border_color(Hsla::white())
+                .shadow(vec![BoxShadow {
+                    color: Hsla::black(),
+                    offset: point(px(0.), px(4.)),
+                    blur_radius: px(8.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+                .child(div().size(px(100.)).bg(Hsla::green()));
+            d.style().vn_clip_path = Some(VnClipPath::Ellipse {
+                reference: VnClipBox::Border,
+                center: [relative(0.5), relative(0.5)],
+                radius: [VnShapeRadius::Length(relative(0.5)); 2],
+                circle: true,
+            });
+            div().child(d)
+        }
+    }
+
+    #[gpui::test]
+    fn everything_the_element_paints_carries_the_mask(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(200.), px(200.)), |_, _| Clipped);
+        cx.run_until_parked();
+        let (quads, shadows, scale) = window
+            .update(cx, |_, window, _| {
+                (window.painted_quads(), window.rendered_frame.scene.shadows.clone(), window.scale_factor())
+            })
+            .unwrap();
+        let disc = Bounds::new(point(px(0.), px(0.)), size(px(60.), px(60.))).scale(scale);
+        let radius = Corners::all(px(30.)).scale(scale);
+        for color in [Hsla::red(), Hsla::green()] {
+            let q = quads.iter().find(|q| q.background.as_solid() == Some(color)).expect("the quad");
+            assert_eq!((q.content_mask.bounds, q.content_mask.corner_radii), (disc, radius), "{color:?}");
+        }
+        let border = quads.iter().find(|q| q.border_color == Hsla::white()).expect("the border");
+        assert_eq!(border.content_mask.bounds, disc);
+        assert_eq!(shadows.len(), 1);
+        assert_eq!((shadows[0].content_mask.bounds, shadows[0].content_mask.corner_radii), (disc, radius));
     }
 }
