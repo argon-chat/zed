@@ -502,6 +502,17 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// vue-native fork: draw the outer shadows under the border box too.
+    ///
+    /// CSS clips an outer `box-shadow` to the outside of the border box (CSS
+    /// Backgrounds 3 §7.1): the shadow is cast as if the box were opaque, so
+    /// a translucent background shows what is behind the element, not the
+    /// shadow. [`Window::paint_drop_shadows`] does that by default. This
+    /// switch is for a shadow that stands in for the element's own painting:
+    /// vue-native draws `filter: blur()` on a solid box as the box's own
+    /// Gaussian shadow, whose middle must stay filled.
+    pub vn_shadow_under_box: bool,
+
     /// CSS `backdrop-filter: blur(<length>)`: blur everything already painted
     /// behind this element's border box, clipped to `corner_radii`.
     ///
@@ -1137,7 +1148,11 @@ impl Style {
         let ring = ring_widths.is_some();
 
         if !ring {
-            window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+            if self.vn_shadow_under_box {
+                window.paint_drop_shadows_under_box(bounds, corner_radii, &self.box_shadow);
+            } else {
+                window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+            }
         }
 
         // CSS paints the filtered backdrop underneath the element's own
@@ -1340,6 +1355,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            vn_shadow_under_box: false,
             backdrop_blur: None,
             vn_effect: None,
             vn_transform: None,

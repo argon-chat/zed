@@ -5390,11 +5390,38 @@ impl Window {
     /// after the element's background so they layer on top of the fill.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
+    ///
+    /// vue-native fork: a drop shadow is drawn outside the element's border box
+    /// only, as CSS clips an outer `box-shadow` (CSS Backgrounds 3 §7.1). So a
+    /// translucent background shows what is behind the element, not the
+    /// shadow; a focus ring (`0 0 0 3px`) on a transparent control is a ring.
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_outer_shadows(bounds, corner_radii, shadows, SHADOW_OUTSIDE_BOX);
+    }
+
+    /// vue-native fork: [`Self::paint_drop_shadows`] without the cut-out: the
+    /// shadow also fills the area under the border box. For a shadow that
+    /// stands in for the element's own painting ([`Style::vn_shadow_under_box`]).
+    pub fn paint_drop_shadows_under_box(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+    ) {
+        self.paint_outer_shadows(bounds, corner_radii, shadows, SHADOW_UNDER_BOX);
+    }
+
+    fn paint_outer_shadows(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        kind: u32,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -5408,16 +5435,24 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            let spread = shadow.spread_radius;
+            let shadow_radius = |r: Pixels| spread_shadow_radius(r, spread);
+            let shadow_corner_radii = Corners {
+                top_left: shadow_radius(corner_radii.top_left),
+                top_right: shadow_radius(corner_radii.top_right),
+                bottom_right: shadow_radius(corner_radii.bottom_right),
+                bottom_left: shadow_radius(corner_radii.bottom_left),
+            };
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: shadow_corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
-                inset: 0,
+                inset: kind,
                 pad: 0,
                 transformation: self.element_transform,
             });
@@ -5463,7 +5498,7 @@ impl Window {
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
-                inset: 1,
+                inset: SHADOW_INSET,
                 pad: 0,
                 transformation: self.element_transform,
             });
@@ -9423,6 +9458,32 @@ pub fn outline(
     }
 }
 
+/// vue-native fork: [`Shadow::inset`] for an outer shadow drawn outside the
+/// element's border box only (CSS). The shaders cut the element out of it.
+pub(crate) const SHADOW_OUTSIDE_BOX: u32 = 0;
+/// vue-native fork: [`Shadow::inset`] for an inset shadow.
+pub(crate) const SHADOW_INSET: u32 = 1;
+/// vue-native fork: [`Shadow::inset`] for an outer shadow that also fills the
+/// area under the border box ([`Window::paint_drop_shadows_under_box`]).
+pub(crate) const SHADOW_UNDER_BOX: u32 = 2;
+
+/// vue-native fork: an outer shadow's corner radius for a border-box corner of
+/// radius `radius` and a spread of `spread` (CSS Backgrounds 3 §7.1.1). A
+/// positive spread grows a rounded corner by the spread, and a corner rounded
+/// by less than the spread by less, so a square corner stays square. A
+/// negative spread shrinks it, down to 0.
+fn spread_shadow_radius(radius: Pixels, spread: Pixels) -> Pixels {
+    if spread <= Pixels::ZERO {
+        return (radius + spread).max(Pixels::ZERO);
+    }
+    let ratio = radius / spread;
+    if ratio >= 1.0 {
+        radius + spread
+    } else {
+        radius + spread * (1.0 + (ratio - 1.0).powi(3))
+    }
+}
+
 #[inline(never)]
 fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(), AccessError> {
     if let Some(arena_pointer) = CURRENT_ELEMENT_ARENA.try_with(Cell::get)? {
@@ -11586,6 +11647,85 @@ mod vn_assume_active_tests {
 
 /// vue-native fork: rounded content masks, `ContentMask::intersect`'s corner
 /// rule, `contains` and `transform_mask`.
+/// vue-native fork: outer shadows are cut out of the border box
+/// ([`Window::paint_drop_shadows`]), with CSS's spread radii.
+#[cfg(test)]
+mod vn_shadow_tests {
+    use super::{SHADOW_INSET, SHADOW_OUTSIDE_BOX, SHADOW_UNDER_BOX, spread_shadow_radius};
+    use crate::{
+        BoxShadow, Context, Hsla, TestAppContext, Window, div, point, prelude::*, px, size,
+    };
+
+    #[test]
+    fn a_spread_grows_a_rounded_corner_and_keeps_a_square_one_square() {
+        // A focus ring: rounded-md (6px) and a 3px spread.
+        assert_eq!(spread_shadow_radius(px(6.), px(3.)), px(9.));
+        assert_eq!(spread_shadow_radius(px(0.), px(3.)), px(0.));
+        // Rounded by less than the spread: 1 + (r/s - 1)^3 of the spread.
+        assert_eq!(spread_shadow_radius(px(1.5), px(3.)), px(1.5 + 3. * 0.875));
+        assert_eq!(spread_shadow_radius(px(6.), px(0.)), px(6.));
+        assert_eq!(spread_shadow_radius(px(6.), px(-2.)), px(4.));
+        assert_eq!(spread_shadow_radius(px(1.), px(-2.)), px(0.));
+    }
+
+    struct Ring {
+        under_box: bool,
+    }
+
+    impl Render for Ring {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let shadow = |inset: bool| BoxShadow {
+                color: Hsla::white().opacity(0.5),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(3.),
+                inset,
+            };
+            let mut d = div()
+                .w(px(100.))
+                .h(px(36.))
+                .rounded_md()
+                .shadow(vec![shadow(false), shadow(true)]);
+            d.style().vn_shadow_under_box = Some(self.under_box);
+            d
+        }
+    }
+
+    /// The frame's shadows as (kind, top-left radius, element top-left radius), in device px.
+    fn paint(under_box: bool, cx: &mut TestAppContext) -> (Vec<(u32, f32, f32)>, f32) {
+        let window = cx.open_window(size(px(300.), px(300.)), move |_, _| Ring { under_box });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let shadows = window
+                    .rendered_frame
+                    .scene
+                    .shadows
+                    .iter()
+                    .map(|s| (s.inset, s.corner_radii.top_left.0, s.element_corner_radii.top_left.0))
+                    .collect();
+                (shadows, window.scale_factor())
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn an_outer_shadow_is_cut_out_of_the_border_box_unless_it_stands_in_for_the_box(
+        cx: &mut TestAppContext,
+    ) {
+        let (shadows, scale) = paint(false, cx);
+        let outer = shadows.iter().find(|s| s.0 != SHADOW_INSET).expect("the outer shadow");
+        assert_eq!(outer.0, SHADOW_OUTSIDE_BOX, "the shaders cut the border box out of it");
+        assert_eq!(outer.1, 9. * scale, "6px corner + 3px spread");
+        assert_eq!(outer.2, 6. * scale, "the cut-out is the border box itself");
+        assert!(shadows.iter().any(|s| s.0 == SHADOW_INSET), "the inset shadow is unchanged");
+
+        let (shadows, _) = paint(true, cx);
+        let outer = shadows.iter().find(|s| s.0 != SHADOW_INSET).expect("the outer shadow");
+        assert_eq!(outer.0, SHADOW_UNDER_BOX);
+    }
+}
+
 #[cfg(test)]
 mod vn_rounded_mask_tests {
     use super::transform_mask;

@@ -1279,7 +1279,7 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id: 
     Shadow shadow = shadows[shadow_id];
 
     Bounds bounds;
-    if (shadow.inset != 0u) {
+    if (shadow.inset == 1u) {
         bounds = shadow.element_bounds;
     } else {
         // Leave room for the gaussian tail outside the shadow rect.
@@ -1336,13 +1336,20 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         }
     }
 
-    if (shadow.inset != 0u) {
+    if (shadow.inset == 1u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
         float element_distance = quad_sdf(input.local_position, shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else if (shadow.inset == 0u) {
+        // vue-native fork: an outer shadow is clipped to the outside of the element's
+        // border box (CSS Backgrounds 3 §7.1), so a translucent background shows what is
+        // behind the element. inset == 2 is the unclipped variant.
+        float element_distance = quad_sdf(input.local_position, shadow.element_bounds,
+                                          shadow.element_corner_radii);
+        alpha *= saturate(0.5 + element_distance);
     }
 
     alpha *= content_mask_coverage(input.position.xy, shadow.content_mask, shadow.content_mask_radii);
