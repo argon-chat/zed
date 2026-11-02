@@ -729,6 +729,90 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
+/// vue-native fork: CSS `overflow-wrap` (CSS Text 3 §5.5). May a line break
+/// inside a word that does not fit on a line of its own?
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub enum OverflowWrap {
+    /// Lines break only at soft wrap opportunities. A word wider than the
+    /// line overflows it.
+    #[default]
+    Normal,
+    /// A word that does not fit on a line of its own is broken where it
+    /// overflows. The min-content size still counts the word whole.
+    BreakWord,
+    /// As `BreakWord`, and the min-content size counts those breaks too, so a
+    /// flex item or a `min-content` box can be as narrow as one character.
+    Anywhere,
+}
+
+/// vue-native fork: CSS `word-break` (CSS Text 3 §5.2).
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub enum WordBreak {
+    /// The usual soft wrap opportunities.
+    #[default]
+    Normal,
+    /// A line may break between any two letters, and the min-content size
+    /// counts those breaks.
+    BreakAll,
+    /// CJK letters are kept together like the letters of any other word: no
+    /// break between two of them.
+    KeepAll,
+    /// The legacy keyword: `normal` with `overflow-wrap: anywhere`, whatever
+    /// `overflow-wrap` says.
+    BreakWord,
+}
+
+/// vue-native fork: CSS `hyphens` (CSS Text 3 §6.1). There is no hyphenation
+/// dictionary, so `auto` is the caller's to map to `Manual`.
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub enum Hyphens {
+    /// A soft hyphen (U+00AD) is no break opportunity.
+    None,
+    /// A line may break after a soft hyphen, and shows a hyphen there.
+    #[default]
+    Manual,
+}
+
+/// vue-native fork: the rules a text breaks its lines under, from its style
+/// ([`TextStyle::wrap`]). Part of the line layout cache's key.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextWrap {
+    /// CSS `overflow-wrap`.
+    pub overflow_wrap: OverflowWrap,
+    /// CSS `word-break`.
+    pub word_break: WordBreak,
+    /// CSS `hyphens`.
+    pub hyphens: Hyphens,
+}
+
+impl TextWrap {
+    /// gpui's rules before the fork took CSS's: a word that does not fit on
+    /// a line is broken where it overflows. What [`crate::WindowTextSystem::shape_text`]
+    /// keeps for its callers, a text field among them (a `<textarea>` is
+    /// `overflow-wrap: break-word` in every browser's UA sheet).
+    pub const BREAK_WORD: Self = Self {
+        overflow_wrap: OverflowWrap::BreakWord,
+        word_break: WordBreak::Normal,
+        hyphens: Hyphens::Manual,
+    };
+
+    /// May a word that does not fit be broken where it overflows?
+    pub(crate) fn breaks_words(&self) -> bool {
+        self.overflow_wrap != OverflowWrap::Normal || self.word_break == WordBreak::BreakWord
+    }
+
+    /// Do those breaks count for the min-content size?
+    pub(crate) fn min_content_breaks_words(&self) -> bool {
+        self.overflow_wrap == OverflowWrap::Anywhere || self.word_break == WordBreak::BreakWord
+    }
+}
+
 /// How to truncate text that overflows the width of the element
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum TextOverflow {
@@ -815,6 +899,15 @@ pub struct TextStyle {
 
     /// Extra space after each word separator — CSS `word-spacing`.
     pub word_spacing: Pixels,
+
+    /// vue-native fork: CSS `overflow-wrap`. Initial `normal`, as in CSS.
+    pub overflow_wrap: OverflowWrap,
+
+    /// vue-native fork: CSS `word-break`.
+    pub word_break: WordBreak,
+
+    /// vue-native fork: CSS `hyphens`.
+    pub hyphens: Hyphens,
 }
 
 impl Default for TextStyle {
@@ -838,11 +931,23 @@ impl Default for TextStyle {
             line_clamp: None,
             letter_spacing: px(0.),
             word_spacing: px(0.),
+            overflow_wrap: OverflowWrap::default(),
+            word_break: WordBreak::default(),
+            hyphens: Hyphens::default(),
         }
     }
 }
 
 impl TextStyle {
+    /// vue-native fork: the line-breaking rules of this style.
+    pub fn wrap(&self) -> TextWrap {
+        TextWrap {
+            overflow_wrap: self.overflow_wrap,
+            word_break: self.word_break,
+            hyphens: self.hyphens,
+        }
+    }
+
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();

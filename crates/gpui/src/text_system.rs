@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    StrikethroughStyle, TextRenderingMode, TextWrap, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -792,6 +792,28 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            TextWrap::BREAK_WORD,
+        )
+    }
+
+    /// vue-native fork: [`Self::shape_text`], with the lines broken under
+    /// `rules` (CSS `overflow-wrap`, `word-break` and `hyphens`) rather than
+    /// gpui's own, which break a word that does not fit.
+    pub fn shape_text_with(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        rules: TextWrap,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -862,6 +884,7 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
+                rules,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 

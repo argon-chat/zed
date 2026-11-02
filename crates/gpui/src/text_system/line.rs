@@ -150,6 +150,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            &[],
             window,
             cx,
             &mut paint_underline,
@@ -403,6 +404,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -479,6 +481,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.layout.hyphen_breaks,
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -526,6 +529,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    hyphen_breaks: &[usize],
     window: &mut Window,
     cx: &mut App,
     paint_underline: &mut dyn FnMut(
@@ -569,6 +573,10 @@ fn paint_line(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        // vue-native fork: the index of the next wrap, and the font of the
+        // glyph before it, for the hyphen a soft-hyphen break shows.
+        let mut wrap_ix = 0;
+        let mut prev_font_id = layout.runs.first().map(|run| run.font_id);
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -580,6 +588,23 @@ fn paint_line(
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
+                    // vue-native fork: a line that breaks after a soft hyphen
+                    // ends with a hyphen (CSS Text 3 §6.1), painted where the
+                    // next glyph would have gone on it.
+                    if hyphen_breaks.contains(&wrap_ix)
+                        && let Some(font_id) = prev_font_id
+                        && let Some(hyphen) =
+                            text_system.platform_text_system.glyph_for_char(font_id, '-')
+                    {
+                        window.paint_glyph(
+                            glyph_origin + baseline_offset,
+                            font_id,
+                            hyphen,
+                            layout.font_size,
+                            color,
+                        )?;
+                    }
+                    wrap_ix += 1;
                     if let Some((underline_origin, underline_style, underline_range)) =
                         current_underline.as_mut()
                     {
@@ -630,6 +655,7 @@ fn paint_line(
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
+                prev_font_id = Some(run.font_id);
 
                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> =
                     None;
@@ -1391,6 +1417,7 @@ mod tests {
                             glyph_ix: 2,
                         }]),
                         wrap_width: Some(px(16.)),
+                        ..Default::default()
                     }),
                     text: line.text,
                     decoration_runs: line.decoration_runs.into_vec(),
@@ -1410,6 +1437,7 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    &wrapped.hyphen_breaks,
                     window,
                     cx,
                     &mut |range, origin, width, style, window| {

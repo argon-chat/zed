@@ -2,7 +2,7 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    TextRun, TextStyle, TextWrap, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -622,29 +622,35 @@ enum TextPaintPass {
 
 /// The min-content size of `white-space: normal` text (CSS Sizing 3 §5.1):
 /// as wide as its widest stretch between two wrap opportunities, so it breaks
-/// at every one of them and inside no word, and as tall as it is wrapped at
-/// that width. What a flex item's automatic minimum size and a
-/// `width: min-content` box read: without it, text could not shrink below
-/// its one-line width, and a row narrower than that overflowed instead of
-/// wrapping.
+/// at every one of them, and as tall as it is wrapped at that width. What a
+/// flex item's automatic minimum size and a `width: min-content` box read:
+/// without it, text could not shrink below its one-line width, and a row
+/// narrower than that overflowed instead of wrapping. Under `overflow-wrap:
+/// anywhere` a break inside a word counts too (vue-native fork, `rules`).
 fn min_content_size(
     text: &SharedString,
     font_size: Pixels,
     runs: &[TextRun],
     line_height: Pixels,
+    rules: TextWrap,
     window: &Window,
 ) -> Option<Size<Pixels>> {
     let text_system = window.text_system();
     let unwrapped = text_system
-        .shape_text(text.clone(), font_size, runs, None, None)
+        .shape_text_with(text.clone(), font_size, runs, None, None, rules)
         .log_err()?;
+    let hyphen_width = soft_hyphen_width(text, font_size, runs, rules, window);
     let widest = unwrapped
         .iter()
-        .map(|line| line.layout.unwrapped_layout.min_content_width(&line.text))
+        .map(|line| {
+            line.layout
+                .unwrapped_layout
+                .min_content_width(&line.text, rules, hyphen_width)
+        })
         .fold(Pixels::ZERO, |a, b| a.max(b))
         .ceil();
     let wrapped = text_system
-        .shape_text(text.clone(), font_size, runs, Some(widest), None)
+        .shape_text_with(text.clone(), font_size, runs, Some(widest), None, rules)
         .log_err()?;
     let mut size: Size<Pixels> = Size::default();
     for line in &wrapped {
@@ -653,6 +659,29 @@ fn min_content_size(
         size.width = size.width.max(line_size.width).ceil();
     }
     Some(size)
+}
+
+/// vue-native fork: the width of the hyphen a soft-hyphen break shows, in the
+/// first run's font, as the line layout measures it for fitting. Zero when
+/// no break can show one.
+fn soft_hyphen_width(
+    text: &str,
+    font_size: Pixels,
+    runs: &[TextRun],
+    rules: TextWrap,
+    window: &Window,
+) -> Pixels {
+    if rules.hyphens != crate::Hyphens::Manual || !text.contains('\u{AD}') {
+        return Pixels::ZERO;
+    }
+    let Some(run) = runs.first() else {
+        return Pixels::ZERO;
+    };
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&run.font);
+    text_system
+        .advance(font_id, font_size, '-')
+        .map_or(Pixels::ZERO, |size| size.width)
 }
 
 struct TextLayoutInner {
@@ -724,8 +753,14 @@ impl TextLayout {
                     && text_style.text_overflow.is_none()
                     && known_dimensions.width.is_none()
                     && available_space.width == crate::AvailableSpace::MinContent
-                    && let Some(size) =
-                        min_content_size(&text, font_size, &runs, line_height, window)
+                    && let Some(size) = min_content_size(
+                        &text,
+                        font_size,
+                        &runs,
+                        line_height,
+                        text_style.wrap(),
+                        window,
+                    )
                 {
                     return size;
                 }
@@ -803,12 +838,13 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_text_with(
                         text,
                         font_size,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                        text_style.wrap(),     // vue-native fork: under the CSS rules.
                     )
                     .log_err()
                 else {

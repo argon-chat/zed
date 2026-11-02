@@ -1,4 +1,7 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, GlyphId, Hyphens, Pixels, PlatformTextSystem, Point, SharedString, Size, TextWrap,
+    WordBreak, point, px,
+};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -217,21 +220,40 @@ impl LineLayout {
         (left, right)
     }
 
-    fn compute_wrap_boundaries(
+    /// vue-native fork: where the line breaks when wrapped at `wrap_width`
+    /// under `rules` (CSS Text 3 §5). A line breaks at its last soft wrap
+    /// opportunity that fits ([`break_before`]). A word that fits nowhere is
+    /// broken where it overflows when `rules` allow that (`overflow-wrap:
+    /// break-word | anywhere`, `word-break: break-word`), and otherwise
+    /// overflows its line, which then breaks at the next opportunity.
+    /// `hyphen_width` is the width of the hyphen a soft-hyphen break shows: a
+    /// line that ends in one must fit it.
+    pub(crate) fn wrap(
         &self,
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
-    ) -> SmallVec<[WrapBoundary; 1]> {
-        let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
+        rules: TextWrap,
+        hyphen_width: Pixels,
+    ) -> Wrapping {
+        let mut out = Wrapping::default();
+        let mut seen_non_whitespace = false;
+        // The last opportunity on the current line: the glyph the next line
+        // would start at, its x, where the line's content ends before it
+        // (trailing spaces hang; a hyphen counts), and whether it shows a
+        // hyphen.
+        let mut candidate: Option<(WrapBoundary, Pixels, Pixels, bool)> = None;
         let mut last_boundary = WrapBoundary {
             run_ix: 0,
             glyph_ix: 0,
         };
         let mut last_boundary_x = px(0.);
+        // The end of the current line's last glyph that is not a space.
+        let mut content_end = px(0.);
+        // The current line holds a word that may not break and is past the
+        // edge: it breaks at the next opportunity, wherever that is.
+        let mut overflowing = false;
+        let mut widest = px(0.);
         let mut prev_ch = '\0';
         let mut glyphs = self
             .runs
@@ -244,68 +266,100 @@ impl LineLayout {
                         WrapBoundary { run_ix, glyph_ix },
                         character,
                         glyph.position.x,
+                        text[..glyph.index].ends_with('\u{AD}'),
                     )
                 })
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        'glyphs: while let Some((boundary, ch, x, after_soft_hyphen)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
+            let next_x = glyphs.peek().map_or(self.width, |(_, _, x, _)| *x);
+            let full = |out: &Wrapping| {
+                max_lines.is_some_and(|max| out.boundaries.len() >= max.saturating_sub(1))
+            };
 
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
+            if let Some(hyphen) =
+                break_before(prev_ch, ch, after_soft_hyphen, seen_non_whitespace, rules)
+            {
+                let end = if hyphen {
+                    content_end + hyphen_width
+                } else {
+                    content_end
+                };
+                if overflowing && boundary > last_boundary {
+                    // The overflowing word ends here: so does its line.
+                    if full(&out) {
+                        break 'glyphs;
+                    }
+                    widest = widest.max(end - last_boundary_x);
+                    out.push(boundary, hyphen);
+                    last_boundary = boundary;
+                    last_boundary_x = x;
+                    overflowing = false;
+                    candidate = None;
+                } else if !hyphen || end - last_boundary_x <= wrap_width {
+                    candidate = Some((boundary, x, end, hyphen));
                 }
             }
-
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
+            if ch != ' ' {
+                seen_non_whitespace = true;
             }
-
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
 
             // A space that crosses the edge hangs (CSS Text 3 §4.1.3): the
             // line breaks before the next word, not before the space, which
             // would start the next line with it.
-            if width > wrap_width && boundary > last_boundary && ch != ' ' {
+            while !overflowing
+                && next_x - last_boundary_x > wrap_width
+                && boundary > last_boundary
+                && ch != ' '
+            {
                 // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
+                if full(&out) {
+                    break 'glyphs;
                 }
-
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
+                if let Some((at, at_x, end, hyphen)) = candidate.take() {
+                    widest = widest.max(end - last_boundary_x);
+                    out.push(at, hyphen);
+                    last_boundary = at;
+                    last_boundary_x = at_x;
+                    // The rest of the word may still not fit on the new
+                    // line: looked at again.
+                } else if rules.breaks_words() && !continues_cluster(prev_ch, ch) {
+                    widest = widest.max(x - last_boundary_x);
+                    out.push(boundary, false);
                     last_boundary = boundary;
                     last_boundary_x = x;
+                } else {
+                    overflowing = true;
                 }
-                boundaries.push(last_boundary);
+            }
+            if ch != ' ' {
+                content_end = next_x;
             }
             prev_ch = ch;
         }
-
-        boundaries
+        widest = widest.max(content_end - last_boundary_x);
+        if widest > wrap_width {
+            out.overflow = widest;
+        }
+        out
     }
 
     /// The line's min-content width (CSS Sizing 3 §5.1): its widest stretch
-    /// between two of the wrap opportunities [`Self::compute_wrap_boundaries`]
-    /// breaks at, without the spaces that end it, which hang. Wrapped at this
-    /// width, the line breaks at every opportunity and inside no word.
-    pub(crate) fn min_content_width(&self, text: &str) -> Pixels {
+    /// between two of the soft wrap opportunities [`Self::wrap`] breaks at,
+    /// without the spaces that end it, which hang. Under `overflow-wrap:
+    /// anywhere` (and `word-break: break-word`) a break inside a word counts
+    /// too, so the widest stretch is one character. Wrapped at this width,
+    /// the line breaks at every opportunity it counted.
+    pub(crate) fn min_content_width(
+        &self,
+        text: &str,
+        rules: TextWrap,
+        hyphen_width: Pixels,
+    ) -> Pixels {
         let mut widest = px(0.);
         let mut start_x = px(0.);
         let mut end_x = px(0.);
@@ -317,20 +371,31 @@ impl LineLayout {
             .flat_map(|run| run.glyphs.iter())
             .map(|glyph| {
                 let ch = text[glyph.index..].chars().next().unwrap_or(' ');
-                (ch, glyph.position.x)
+                (
+                    ch,
+                    glyph.position.x,
+                    text[..glyph.index].ends_with('\u{AD}'),
+                )
             })
             .peekable();
-        while let Some((ch, x)) = glyphs.next() {
-            let next_x = glyphs.peek().map_or(self.width, |(_, x)| *x);
+        while let Some((ch, x, after_soft_hyphen)) = glyphs.next() {
+            let next_x = glyphs.peek().map_or(self.width, |(_, x, _)| *x);
             if ch == '\n' {
                 continue;
             }
-            // `compute_wrap_boundaries`' candidates, in one expression.
-            let opportunity = seen_non_whitespace
-                && ch != ' '
-                && (prev_ch == ' ' || !LineWrapper::is_word_char(ch));
-            if opportunity {
-                widest = widest.max(end_x - start_x);
+            let opportunity =
+                break_before(prev_ch, ch, after_soft_hyphen, seen_non_whitespace, rules).or_else(
+                    || {
+                        (rules.min_content_breaks_words()
+                            && seen_non_whitespace
+                            && ch != ' '
+                            && !continues_cluster(prev_ch, ch))
+                        .then_some(false)
+                    },
+                );
+            if let Some(hyphen) = opportunity {
+                let hyphen = if hyphen { hyphen_width } else { px(0.) };
+                widest = widest.max(end_x - start_x + hyphen);
                 start_x = x;
             }
             if ch != ' ' {
@@ -341,6 +406,135 @@ impl LineLayout {
         }
         widest.max(end_x - start_x)
     }
+}
+
+/// vue-native fork: what [`LineLayout::wrap`] decided for one line of text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Wrapping {
+    pub(crate) boundaries: SmallVec<[WrapBoundary; 1]>,
+    /// The boundaries a soft hyphen made, as indices into `boundaries`: the
+    /// line before each one ends with a visible hyphen.
+    pub(crate) hyphens: SmallVec<[usize; 1]>,
+    /// The widest line, trailing spaces not counted, when one is wider than
+    /// the wrap width (a word that may not break). Zero otherwise.
+    pub(crate) overflow: Pixels,
+}
+
+impl Wrapping {
+    fn push(&mut self, at: WrapBoundary, hyphen: bool) {
+        if hyphen {
+            self.hyphens.push(self.boundaries.len());
+        }
+        self.boundaries.push(at);
+    }
+}
+
+/// vue-native fork: is there a soft wrap opportunity before `ch`, which
+/// follows `prev`? `Some(true)` when the break shows a hyphen.
+///
+/// The usual opportunities are gpui's: after a space, and before a character
+/// that is not a word character ([`LineWrapper::is_word_char`]), which is how a
+/// URL breaks before its `/` and CJK text between any two letters. Then CSS
+/// Text 3's:
+/// - after a soft hyphen (U+00AD) under `hyphens: manual`, with a hyphen
+///   shown; never before one, and never after one under `hyphens: none`;
+/// - after a zero width space (U+200B);
+/// - `word-break: break-all`: between any two letters, though not before
+///   punctuation that never starts a line (UAX #14 LB13 and LB21);
+/// - `word-break: keep-all`: CJK letters are word characters, so no break
+///   between two of them.
+///
+/// Never before the first character that is not a space, or inside a
+/// grapheme cluster ([`continues_cluster`]).
+fn break_before(
+    prev: char,
+    ch: char,
+    after_soft_hyphen: bool,
+    seen_non_whitespace: bool,
+    rules: TextWrap,
+) -> Option<bool> {
+    if !seen_non_whitespace || ch == ' ' || ch == '\u{AD}' || continues_cluster(prev, ch) {
+        return None;
+    }
+    if after_soft_hyphen {
+        return (rules.hyphens == Hyphens::Manual).then_some(true);
+    }
+    if prev == '\u{200B}' {
+        return Some(false);
+    }
+    let word = LineWrapper::is_word_char(ch)
+        || (rules.word_break == WordBreak::KeepAll && is_cjk_letter(ch));
+    if !word || prev == ' ' {
+        return Some(false);
+    }
+    (rules.word_break == WordBreak::BreakAll && !never_starts_a_line(ch)).then_some(false)
+}
+
+/// Does `ch` belong to the grapheme cluster `prev` is in? A combining mark,
+/// a joiner, a variation selector, an emoji modifier or tag, or anything
+/// after a zero width joiner. A shaper usually gives a cluster one glyph, but
+/// not always; a break between two of its glyphs would split a character.
+fn continues_cluster(prev: char, ch: char) -> bool {
+    prev == '\u{200D}'
+        || matches!(
+            ch,
+            '\u{0300}'..='\u{036F}'
+                | '\u{0483}'..='\u{0489}'
+                | '\u{0591}'..='\u{05BD}'
+                | '\u{0610}'..='\u{061A}'
+                | '\u{064B}'..='\u{065F}'
+                | '\u{0900}'..='\u{0903}'
+                | '\u{093A}'..='\u{094F}'
+                | '\u{1AB0}'..='\u{1AFF}'
+                | '\u{1DC0}'..='\u{1DFF}'
+                | '\u{200C}'..='\u{200D}'
+                | '\u{20D0}'..='\u{20FF}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FE20}'..='\u{FE2F}'
+                | '\u{1F3FB}'..='\u{1F3FF}'
+                | '\u{E0020}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+/// A CJK letter, for `word-break: keep-all`: Han, kana and Hangul.
+fn is_cjk_letter(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3130}'..='\u{318F}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2FA1F}'
+    )
+}
+
+/// Punctuation a line never starts with, even under `word-break: break-all`.
+fn never_starts_a_line(ch: char) -> bool {
+    matches!(
+        ch,
+        '!' | ')'
+            | ']'
+            | '}'
+            | '"'
+            | '\''
+            | '’'
+            | '”'
+            | '»'
+            | '…'
+            | ','
+            | '.'
+            | ':'
+            | ';'
+            | '?'
+            | '%'
+            | '-'
+            | '⋯'
+    )
 }
 
 /// A line of text that has been wrapped to fit a given width
@@ -354,6 +548,14 @@ pub struct WrappedLineLayout {
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
+
+    /// vue-native fork: the wrap boundaries a soft hyphen made, as indices
+    /// into `wrap_boundaries`. The line before each ends with a hyphen.
+    pub(crate) hyphen_breaks: SmallVec<[usize; 1]>,
+
+    /// vue-native fork: the widest line, when a word that may not break made
+    /// it wider than the wrap width. Zero otherwise.
+    pub(crate) overflow_width: Pixels,
 }
 
 /// A boundary at which a line was wrapped
@@ -377,6 +579,8 @@ impl WrappedLineLayout {
         self.wrap_width
             .unwrap_or(Pixels::MAX)
             .min(self.unwrapped_layout.width)
+            // A line that overflows the wrap width is as wide as it is.
+            .max(self.overflow_width)
     }
 
     /// The size of the whole wrapped text, for the given line_height.
@@ -670,6 +874,31 @@ impl LineLayoutCache {
         curr_frame.used_wrapped_lines_by_hash.clear();
     }
 
+    /// vue-native fork: the width of the hyphen a soft-hyphen break shows,
+    /// in the first run's font. Zero when no break can show one.
+    fn hyphen_width(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        rules: TextWrap,
+    ) -> Pixels {
+        if rules.hyphens != Hyphens::Manual || !text.contains('\u{AD}') {
+            return px(0.);
+        }
+        let Some(font_id) = runs.first().map(|run| run.font_id) else {
+            return px(0.);
+        };
+        let Some(glyph) = self.platform_text_system.glyph_for_char(font_id, '-') else {
+            return px(0.);
+        };
+        let Ok(advance) = self.platform_text_system.advance(font_id, glyph) else {
+            return px(0.);
+        };
+        let units_per_em = self.platform_text_system.font_metrics(font_id).units_per_em as f32;
+        px(advance.width / units_per_em * font_size.0)
+    }
+
     pub fn layout_wrapped_line<Text>(
         &self,
         text: Text,
@@ -677,6 +906,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        rules: TextWrap,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -689,6 +919,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            wrap: rules,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -708,15 +939,18 @@ impl LineLayoutCache {
             drop(current_frame);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+            let wrapping = if let Some(wrap_width) = wrap_width {
+                let hyphen_width = self.hyphen_width(&text, font_size, runs, rules);
+                unwrapped_layout.wrap(text.as_ref(), wrap_width, max_lines, rules, hyphen_width)
             } else {
-                SmallVec::new()
+                Wrapping::default()
             };
             let layout = Arc::new(WrappedLineLayout {
                 unwrapped_layout,
-                wrap_boundaries,
+                wrap_boundaries: wrapping.boundaries,
                 wrap_width,
+                hyphen_breaks: wrapping.hyphens,
+                overflow_width: wrapping.overflow,
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -724,6 +958,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                wrap: rules,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -754,6 +989,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            wrap: TextWrap::default(),
         } as &dyn AsCacheKeyRef;
 
         count_lookup();
@@ -789,6 +1025,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                wrap: TextWrap::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1099,6 +1336,8 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    /// vue-native fork: the same text wraps differently under other rules.
+    wrap: TextWrap,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1108,6 +1347,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    wrap: TextWrap,
 }
 
 #[derive(Clone, Debug)]
@@ -1200,6 +1440,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            wrap: self.wrap,
         }
     }
 }
@@ -1231,7 +1472,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GlyphId;
+    use crate::{GlyphId, OverflowWrap};
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -1347,11 +1588,22 @@ mod tests {
         assert_eq!(positions, vec![0.5, 0.5]);
     }
 
-    /// One 10 px glyph per character of an ASCII `text`.
+    /// One 10 px glyph per character of `text`; a soft hyphen and a zero
+    /// width space take no room, as a shaper gives them.
     fn monospaced(text: &str) -> LineLayout {
-        let glyphs = (0..text.len()).map(|i| glyph_at(i as f32 * 10., i)).collect();
+        let mut x = 0.;
+        let glyphs = text
+            .char_indices()
+            .map(|(i, ch)| {
+                let glyph = glyph_at(x, i);
+                if ch != '\u{AD}' && ch != '\u{200B}' {
+                    x += 10.;
+                }
+                glyph
+            })
+            .collect();
         LineLayout {
-            width: px(text.len() as f32 * 10.),
+            width: px(x),
             len: text.len(),
             ..make_layout(glyphs)
         }
@@ -1361,37 +1613,134 @@ mod tests {
         WrapBoundary { run_ix: 0, glyph_ix }
     }
 
+    const HYPHEN: Pixels = px(10.);
+
+    fn rules(overflow_wrap: OverflowWrap, word_break: WordBreak, hyphens: Hyphens) -> TextWrap {
+        TextWrap {
+            overflow_wrap,
+            word_break,
+            hyphens,
+        }
+    }
+
+    const NORMAL: TextWrap = TextWrap {
+        overflow_wrap: OverflowWrap::Normal,
+        word_break: WordBreak::Normal,
+        hyphens: Hyphens::Manual,
+    };
+
+    /// Where `text` breaks at `width`, and how wide its widest overflowing line is.
+    fn wrap(text: &str, width: f32, rules: TextWrap) -> (Vec<usize>, Vec<usize>, Pixels) {
+        let w = monospaced(text).wrap(text, px(width), None, rules, HYPHEN);
+        (
+            w.boundaries.iter().map(|b| b.glyph_ix).collect(),
+            w.hyphens.to_vec(),
+            w.overflow,
+        )
+    }
+
+    fn min_content(text: &str, rules: TextWrap) -> Pixels {
+        monospaced(text).min_content_width(text, rules, HYPHEN)
+    }
+
     #[test]
     fn min_content_width_is_the_widest_word() {
-        assert_eq!(monospaced("ab cd efg").min_content_width("ab cd efg"), px(30.));
+        assert_eq!(min_content("ab cd efg", NORMAL), px(30.));
         // Spaces end a stretch and hang: they never count.
-        assert_eq!(monospaced("abc   de ").min_content_width("abc   de "), px(30.));
+        assert_eq!(min_content("abc   de ", NORMAL), px(30.));
         // A break opportunity before a non-word character, as the wrapper has it.
-        assert_eq!(monospaced("a/bcd").min_content_width("a/bcd"), px(40.));
+        assert_eq!(min_content("a/bcd", NORMAL), px(40.));
         // One word: all of it.
-        assert_eq!(monospaced("abcdef").min_content_width("abcdef"), px(60.));
-        assert_eq!(monospaced("   ").min_content_width("   "), px(0.));
+        assert_eq!(min_content("abcdef", NORMAL), px(60.));
+        assert_eq!(min_content("   ", NORMAL), px(0.));
     }
 
     #[test]
     fn wrapped_at_min_content_it_breaks_at_every_opportunity_and_in_no_word() {
         let text = "ab cd efg";
-        let layout = monospaced(text);
-        let width = layout.min_content_width(text);
-        assert_eq!(
-            layout.compute_wrap_boundaries(text, width, None).to_vec(),
-            vec![boundary(3), boundary(6)]
-        );
+        let width = min_content(text, NORMAL);
+        assert_eq!(wrap(text, width.0, NORMAL).0, vec![3, 6]);
     }
 
     #[test]
     fn a_space_at_the_edge_hangs_instead_of_starting_the_next_line() {
         // "ab" fills the 20 px line; the space after it crosses the edge. The
         // break goes before "cd", not before the space.
-        let text = "ab cd";
-        assert_eq!(
-            monospaced(text).compute_wrap_boundaries(text, px(20.), None).to_vec(),
-            vec![boundary(3)]
-        );
+        assert_eq!(wrap("ab cd", 20., NORMAL).0, vec![3]);
+    }
+
+    /// CSS Text 3 §5.5. `normal`: a word wider than the line overflows it,
+    /// and the line breaks at the next opportunity. `break-word` and
+    /// `anywhere`: the word is broken where it overflows.
+    #[test]
+    fn overflow_wrap_decides_whether_a_long_word_breaks() {
+        let text = "aaaaaaaa bb";
+        assert_eq!(wrap(text, 30., NORMAL), (vec![9], vec![], px(80.)));
+        let break_word = rules(OverflowWrap::BreakWord, WordBreak::Normal, Hyphens::Manual);
+        assert_eq!(wrap(text, 30., break_word), (vec![3, 6, 9], vec![], px(0.)));
+        let anywhere = rules(OverflowWrap::Anywhere, WordBreak::Normal, Hyphens::Manual);
+        assert_eq!(wrap(text, 30., anywhere).0, vec![3, 6, 9]);
+        // The legacy `word-break: break-word` is `overflow-wrap: anywhere`.
+        let legacy = rules(OverflowWrap::Normal, WordBreak::BreakWord, Hyphens::Manual);
+        assert_eq!(wrap(text, 30., legacy).0, vec![3, 6, 9]);
+        // gpui's own callers keep breaking.
+        assert_eq!(wrap(text, 30., TextWrap::BREAK_WORD).0, vec![3, 6, 9]);
+        // A word that fits is never broken, under any of them.
+        assert_eq!(wrap("ab cd", 30., anywhere).0, vec![3]);
+    }
+
+    /// `anywhere` lowers the min-content size to one character; `break-word`
+    /// does not (CSS Text 3 §5.5).
+    #[test]
+    fn only_anywhere_counts_its_breaks_for_min_content() {
+        let anywhere = rules(OverflowWrap::Anywhere, WordBreak::Normal, Hyphens::Manual);
+        let break_word = rules(OverflowWrap::BreakWord, WordBreak::Normal, Hyphens::Manual);
+        let legacy = rules(OverflowWrap::Normal, WordBreak::BreakWord, Hyphens::Manual);
+        assert_eq!(min_content("abcdef gh", anywhere), px(10.));
+        assert_eq!(min_content("abcdef gh", legacy), px(10.));
+        assert_eq!(min_content("abcdef gh", break_word), px(60.));
+        // Never inside a grapheme cluster: e + a combining acute is one.
+        assert_eq!(min_content("ae\u{301}b", anywhere), px(20.));
+    }
+
+    /// `word-break: break-all` breaks between any two letters, so a line
+    /// fills up instead of wrapping at its last space; `keep-all` keeps CJK
+    /// letters together (CSS Text 3 §5.2).
+    #[test]
+    fn word_break_moves_the_opportunities() {
+        let break_all = rules(OverflowWrap::Normal, WordBreak::BreakAll, Hyphens::Manual);
+        assert_eq!(wrap("ab cdefgh", 50., break_all).0, vec![5]);
+        let break_word = rules(OverflowWrap::BreakWord, WordBreak::Normal, Hyphens::Manual);
+        assert_eq!(wrap("ab cdefgh", 50., break_word).0, vec![3, 8]);
+        assert_eq!(min_content("abc", break_all), px(10.));
+        // Not before punctuation that never starts a line.
+        assert_eq!(min_content("a,b", break_all), px(20.));
+
+        let keep_all = rules(OverflowWrap::Normal, WordBreak::KeepAll, Hyphens::Manual);
+        assert_eq!(min_content("日本語", NORMAL), px(10.));
+        assert_eq!(min_content("日本語", keep_all), px(30.));
+        assert_eq!(min_content("日本 語", keep_all), px(20.));
+    }
+
+    /// A soft hyphen is a break opportunity under `hyphens: manual`, after
+    /// it, with a hyphen shown that the line must fit; never under `none`
+    /// (CSS Text 3 §6.1).
+    #[test]
+    fn a_soft_hyphen_breaks_with_a_hyphen() {
+        let text = "ab\u{AD}cd";
+        // "ab" and its hyphen fill the 30 px line.
+        assert_eq!(wrap(text, 30., NORMAL), (vec![3], vec![0], px(0.)));
+        assert_eq!(min_content(text, NORMAL), px(30.));
+        // Without room for the hyphen, the break does not happen there.
+        assert_eq!(wrap(text, 25., NORMAL).0, Vec::<usize>::new());
+        let none = rules(OverflowWrap::Normal, WordBreak::Normal, Hyphens::None);
+        assert_eq!(wrap(text, 30., none), (vec![], vec![], px(40.)));
+        assert_eq!(min_content(text, none), px(40.));
+    }
+
+    #[test]
+    fn a_zero_width_space_is_a_break_opportunity() {
+        assert_eq!(wrap("aaa\u{200B}bbb", 30., NORMAL).0, vec![4]);
+        assert_eq!(min_content("aaa\u{200B}bbb", NORMAL), px(30.));
     }
 }
