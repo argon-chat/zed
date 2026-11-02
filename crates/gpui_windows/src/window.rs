@@ -937,7 +937,7 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
 
-        // Mica and MicaAlt are DWM system backdrops
+        // Mica, MicaAlt and Acrylic are DWM system backdrops
         // (`DWMWA_SYSTEMBACKDROP_TYPE`); the other three are the older
         // undocumented accent policy (`SetWindowCompositionAttribute`).
         //
@@ -955,6 +955,7 @@ impl PlatformWindow for WindowsWindow {
         // materials want behind them.
         const DWMSBT_NONE: u32 = 1;
         const DWMSBT_MAINWINDOW: u32 = 2; // Mica
+        const DWMSBT_TRANSIENTWINDOW: u32 = 3; // Acrylic
         const DWMSBT_TABBEDWINDOW: u32 = 4; // MicaAlt
         const ACCENT_DISABLED: u32 = 0;
         const ACCENT_ENABLE_TRANSPARENTGRADIENT: u32 = 2;
@@ -974,6 +975,23 @@ impl PlatformWindow for WindowsWindow {
             }
             WindowBackgroundAppearance::Blurred => {
                 dwm_set_window_composition_attribute(hwnd, DWMSBT_NONE);
+                set_window_composition_attribute(
+                    hwnd,
+                    Some((0, 0, 0, 0)),
+                    ACCENT_ENABLE_ACRYLICBLURBEHIND,
+                );
+            }
+            // DWM's own acrylic, which is what Electron's `backgroundMaterial:
+            // 'acrylic'` asks for. DWM composites it behind the window, as it
+            // does Mica, so it follows the window's dark mode and costs nothing
+            // while the window is dragged or resized — the accent policy's
+            // acrylic (`Blurred`) does neither, and it is what is left before
+            // 22621, where `DWMWA_SYSTEMBACKDROP_TYPE` does not exist.
+            WindowBackgroundAppearance::AcrylicBackdrop if has_system_backdrop() => {
+                set_window_composition_attribute(hwnd, None, ACCENT_DISABLED);
+                dwm_set_window_composition_attribute(hwnd, DWMSBT_TRANSIENTWINDOW);
+            }
+            WindowBackgroundAppearance::AcrylicBackdrop => {
                 set_window_composition_attribute(
                     hwnd,
                     Some((0, 0, 0, 0)),
@@ -1654,13 +1672,21 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
-fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
-    let mut version = unsafe { std::mem::zeroed() };
-    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+/// Whether DWM draws system backdrops: `DWMWA_SYSTEMBACKDROP_TYPE` exists from
+/// Windows 11 22H2, build 22621.
+fn has_system_backdrop() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        let mut version = unsafe { std::mem::zeroed() };
+        let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+        status.is_ok() && version.dwBuildNumber >= 22621
+    })
+}
 
+fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
     // using SetWindowCompositionAttributeType as a fallback
-    if !status.is_ok() || version.dwBuildNumber < 22621 {
+    if !has_system_backdrop() {
         return;
     }
 
