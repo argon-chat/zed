@@ -31,6 +31,9 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 const BLUR_TEXTURE_LEVELS: usize = MAX_BACKDROP_BLUR_KERNEL_LEVELS as usize;
+/// vue-native fork: isolated layers nested deeper than this draw into their
+/// parent's target, unclipped by their shape (one advisory).
+const MAX_VN_LAYER_DEPTH: usize = 8;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -66,6 +69,10 @@ pub(crate) struct DirectXRenderer {
     /// the window then jumps after the cursor instead of tracking it. In this
     /// mode a busy compositor costs us the frame, not the drag.
     present_no_wait: bool,
+
+    /// vue-native fork: the target the batches draw into while an isolated
+    /// layer's group draws (`draw_vn_layer`); `None` is the swap chain's.
+    vn_target: Option<VnLayerTarget>,
 }
 
 /// Direct3D objects
@@ -95,6 +102,10 @@ struct DirectXResources {
     // paint a `backdrop-filter`.
     backdrop_blur_resources: Option<BackdropBlurResources>,
 
+    // vue-native fork: one isolated layer target per nesting depth, made the
+    // first time a layer that deep draws.
+    vn_layer_targets: Vec<VnLayerTarget>,
+
     // Cached viewport
     viewport: D3D11_VIEWPORT,
 }
@@ -119,6 +130,10 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    /// vue-native fork: the isolated layer composite, and the clip segments
+    /// it reads at t3.
+    vn_layer_pipeline: PipelineState<VnLayer>,
+    vn_clip_segments: VnStructuredBuffer,
 }
 
 struct DirectXGlobalElements {
@@ -142,6 +157,25 @@ struct BackdropBlurResources {
     snapshot_texture: ID3D11Texture2D,
     snapshot_srv: Option<ID3D11ShaderResourceView>,
     textures: Vec<BlurTexture>,
+}
+
+/// vue-native fork: one isolated layer's offscreen target, the size and
+/// format of the swap chain's, so a group draws into it at window
+/// coordinates with every pipeline unchanged, and a backdrop snapshot inside
+/// it copies it as it copies the swap chain's.
+#[derive(Clone)]
+struct VnLayerTarget {
+    texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
+    srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// vue-native fork: a growable dynamic structured buffer the shaders read
+/// through an SRV — the isolated layers' clip segments.
+struct VnStructuredBuffer {
+    buffer: ID3D11Buffer,
+    view: Option<ID3D11ShaderResourceView>,
+    len: usize,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -239,6 +273,7 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
             present_no_wait: false,
+            vn_target: None,
         })
     }
 
@@ -416,12 +451,37 @@ impl DirectXRenderer {
         })?;
         self.upload_scene_buffers(scene)?;
 
+        // vue-native fork: the root group, and through its composites every
+        // isolated layer's (`Scene::vn_batches`).
+        self.vn_target = None;
+        let result = self.draw_vn_group(scene, 0, 0);
+        self.vn_target = None;
+        result
+    }
+
+    /// vue-native fork: draws one group's batches into the current target,
+    /// each isolated layer's composite included (`draw_vn_layer`).
+    fn draw_vn_group(&mut self, scene: &Scene, group: usize, depth: usize) -> Result<()> {
+        for batch in scene.vn_batches(group) {
+            match batch {
+                VnBatch::Primitives(batch) => self.draw_batch(scene, batch)?,
+                VnBatch::Layers(range) => {
+                    for index in range {
+                        self.draw_vn_layer(scene, index, depth)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_batch(&mut self, scene: &Scene, batch: PrimitiveBatch) -> Result<()> {
         let annotation = self
             .devices
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for batch in scene.batches() {
+        {
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -472,6 +532,110 @@ impl DirectXRenderer {
             })?;
         }
         Ok(())
+    }
+
+    /// vue-native fork: one isolated layer. Its group draws into the target
+    /// one level deeper, cleared to transparent; the target is then
+    /// composited over the current one through the layer's clip shape and
+    /// content mask (`vn_layer_fragment`). A filter on the element's own
+    /// painting would run on that target here, before the composite.
+    fn draw_vn_layer(&mut self, scene: &Scene, index: usize, depth: usize) -> Result<()> {
+        let layer = scene.vn_layers[index];
+        if depth >= MAX_VN_LAYER_DEPTH {
+            effects_advisory(&format!(
+                "`clip-path` shapes nested more than {MAX_VN_LAYER_DEPTH} deep are not \
+                 applied below that depth — the content inside paints unclipped"
+            ));
+            return self.draw_vn_group(scene, layer.group as usize, depth);
+        }
+        let target = self.vn_layer_target(depth)?;
+        let parent = self.vn_target.replace(target.clone());
+        {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            unsafe {
+                unbind_shader_resources(&devices.device_context);
+                devices.device_context.ClearRenderTargetView(
+                    target.rtv.as_ref().context("missing layer render target view")?,
+                    &[0.0; 4],
+                );
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&target.rtv)), None);
+                if let Some(resources) = self.resources.as_ref() {
+                    devices
+                        .device_context
+                        .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+                }
+            }
+        }
+        let drawn = self.draw_vn_group(scene, layer.group as usize, depth + 1);
+        self.vn_target = parent;
+        drawn?;
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        unsafe {
+            unbind_shader_resources(&devices.device_context);
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+        }
+        let layer_texture = slice::from_ref(&target.srv);
+        let segments = slice::from_ref(&self.pipelines.vn_clip_segments.view);
+        self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources(
+            &devices.device_context,
+            None,
+            &[(0, layer_texture), (3, segments)],
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            &self.samplers(),
+            index as u32,
+            1,
+        )?;
+        unsafe {
+            unbind_shader_resources(&devices.device_context);
+        }
+        Ok(())
+    }
+
+    /// vue-native fork: the isolated layer target for `depth`, made on first
+    /// use and dropped with the swap chain's size.
+    fn vn_layer_target(&mut self, depth: usize) -> Result<VnLayerTarget> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        while resources.vn_layer_targets.len() <= depth {
+            resources
+                .vn_layer_targets
+                .push(create_vn_layer_target(&devices.device, self.width, self.height)?);
+        }
+        Ok(resources.vn_layer_targets[depth].clone())
+    }
+
+    /// vue-native fork: the view the batches draw into now — an isolated
+    /// layer's, or the swap chain's.
+    fn target_view(&self) -> Result<&Option<ID3D11RenderTargetView>> {
+        if let Some(target) = &self.vn_target {
+            return Ok(&target.rtv);
+        }
+        Ok(&self.resources.as_ref().context("resources missing")?.render_target_view)
+    }
+
+    /// vue-native fork: the texture behind [`Self::target_view`].
+    fn target_texture(&self) -> Result<&ID3D11Texture2D> {
+        if let Some(target) = &self.vn_target {
+            return Ok(&target.texture);
+        }
+        self.resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target
+            .as_ref()
+            .context("missing render target")
     }
 
     /// Render `scene` to an offscreen CPU image **without presenting** so
@@ -678,6 +842,19 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.vn_layers.is_empty() {
+            self.pipelines.vn_layer_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.vn_layers,
+            )?;
+            self.pipelines.vn_clip_segments.update(
+                &devices.device,
+                &devices.device_context,
+                &scene.vn_clip_segments,
             )?;
         }
 
@@ -891,7 +1068,7 @@ impl DirectXRenderer {
             unbind_shader_resources(&devices.device_context);
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
             devices
                 .device_context
                 .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
@@ -940,10 +1117,9 @@ impl DirectXRenderer {
             .backdrop_blur_resources
             .as_ref()
             .context("missing backdrop blur resources")?;
-        let render_target = resources
-            .render_target
-            .as_ref()
-            .context("missing render target")?;
+        // vue-native fork: inside an isolated layer, its target (the layer
+        // is a Backdrop Root).
+        let render_target = self.target_texture()?;
 
         unsafe {
             unbind_shader_resources(&devices.device_context);
@@ -1046,7 +1222,7 @@ impl DirectXRenderer {
             unbind_shader_resources(&devices.device_context);
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
             devices
                 .device_context
                 .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
@@ -1138,10 +1314,11 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
+            // Restore the target (vue-native fork: an isolated layer's, when
+            // one is drawing).
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
         }
 
         Ok(())
@@ -1381,6 +1558,7 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             path_intermediate_srv,
             backdrop_blur_resources: None,
+            vn_layer_targets: Vec::new(),
             viewport,
         })
     }
@@ -1410,6 +1588,7 @@ impl DirectXResources {
         // The pyramid is sized from the swap chain; drop it and re-allocate
         // lazily on the next frame that actually paints a blur.
         self.backdrop_blur_resources = None;
+        self.vn_layer_targets.clear();
         self.viewport = viewport;
         Ok(())
     }
@@ -1495,6 +1674,15 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        // Premultiplied over premultiplied, as a path sprite.
+        let vn_layer_pipeline = PipelineState::new(
+            device,
+            "vn_layer_pipeline",
+            ShaderModule::VnLayer,
+            4,
+            create_blend_state_for_path_sprite(device)?,
+        )?;
+        let vn_clip_segments = VnStructuredBuffer::new(device, 64)?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1509,6 +1697,8 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            vn_layer_pipeline,
+            vn_clip_segments,
         })
     }
 }
@@ -2225,6 +2415,68 @@ fn create_blur_snapshot_texture(
     Ok((texture, shader_resource_view))
 }
 
+/// vue-native fork: an isolated layer's target: the swap chain's format and
+/// size, a render target and a shader resource.
+fn create_vn_layer_target(device: &ID3D11Device, width: u32, height: u32) -> Result<VnLayerTarget> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.context("creating an isolated layer target")?
+    };
+    let mut srv = None;
+    let mut rtv = None;
+    unsafe {
+        device.CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+        device.CreateRenderTargetView(&texture, None, Some(&mut rtv))?;
+    }
+    Ok(VnLayerTarget { texture, rtv, srv })
+}
+
+impl VnStructuredBuffer {
+    fn new(device: &ID3D11Device, len: usize) -> Result<Self> {
+        let buffer = create_buffer(device, std::mem::size_of::<[f32; 4]>(), len)?;
+        let view = create_buffer_view(device, &buffer)?;
+        Ok(Self { buffer, view, len })
+    }
+
+    /// Uploads `data`, growing the buffer to the next power of two first
+    /// when it does not fit.
+    fn update(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[[f32; 4]],
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.len < data.len() {
+            let len = data.len().next_power_of_two();
+            anyhow::ensure!(
+                len * std::mem::size_of::<[f32; 4]>() <= MAX_INSTANCE_BUFFER_SIZE,
+                "clip-path segment buffer needs {len} segments, above the maximum"
+            );
+            *self = Self::new(device, len)?;
+        }
+        update_buffer(device_context, &self.buffer, data)
+    }
+}
+
 fn create_blur_textures(
     device: &ID3D11Device,
     width: u32,
@@ -2567,6 +2819,9 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        /// vue-native fork: an isolated layer's composite through its clip
+        /// shape (`vn_layer_*` in shaders.hlsl).
+        VnLayer,
         /// A `--shading` effect. Its two halves come from two different files:
         /// the shared engine vertex stage from `src/effects.hlsl`, the
         /// per-effect fragment stage from the checked-in slangc output under
@@ -2889,6 +3144,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
                 },
+                ShaderModule::VnLayer => match target {
+                    ShaderTarget::Vertex => VN_LAYER_VERTEX_BYTES,
+                    ShaderTarget::Fragment => VN_LAYER_FRAGMENT_BYTES,
+                },
                 // One vertex shader serves every effect; only the fragment
                 // half differs.
                 ShaderModule::Effect(effect) => match target {
@@ -2985,6 +3244,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::VnLayer => "vn_layer",
             }
         }
     }

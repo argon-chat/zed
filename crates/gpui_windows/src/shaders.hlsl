@@ -1736,3 +1736,98 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         content_mask_coverage(input.position.xy, sprite.content_mask, sprite.content_mask_radii);
     return color;
 }
+
+/*
+**
+**              Isolated layers (vue-native fork)
+**
+*/
+
+// The composite of one isolated layer: a group of primitives drawn into an
+// offscreen target the size of the window (premultiplied, like the swap
+// chain), put back over its parent through a clip shape — CSS `clip-path:
+// polygon()` / `path()`. The shape is line segments in device pixels; each
+// pixel takes its winding number (nonzero or evenodd) and its distance to
+// the nearest edge, which antialiases the edge over one pixel. The layer is
+// where a filter on an element's own painting would apply, too.
+
+struct VnLayer {
+    uint order;
+    uint group;
+    uint segment_start;
+    uint segment_count;
+    uint fill_rule;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners content_mask_radii;
+};
+
+StructuredBuffer<VnLayer> vn_layers: register(t1);
+// `[x0, y0, x1, y1]`, every layer's edges; a layer names its run.
+StructuredBuffer<float4> vn_clip_segments: register(t3);
+
+struct VnLayerVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation uint layer_id: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct VnLayerFragmentInput {
+    float4 position: SV_Position;
+    nointerpolation uint layer_id: TEXCOORD0;
+};
+
+VnLayerVertexOutput vn_layer_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint layer_id = batch_start_index + instance_id;
+    VnLayer layer = vn_layers[layer_id];
+
+    VnLayerVertexOutput output;
+    output.position = to_device_position(unit_vertex, layer.bounds);
+    output.layer_id = layer_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, layer.bounds, layer.content_mask);
+    return output;
+}
+
+// The coverage of the shape at the pixel centre `p`: inside by the winding
+// number of the edges crossing the ray to the right (half-open in y, so a
+// vertex on the ray counts once), blended across the nearest edge. The CPU
+// twin is `gpui::VnClipGeometry::coverage`.
+float vn_clip_coverage(float2 p, uint start, uint count, uint fill_rule) {
+    int winding = 0;
+    float nearest = 3.0e38;
+    for (uint i = 0; i < count; i++) {
+        float4 s = vn_clip_segments[start + i];
+        float2 a = s.xy;
+        float2 b = s.zw;
+        if ((a.y <= p.y) != (b.y <= p.y)) {
+            float x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+            if (p.x < x) {
+                winding += b.y > a.y ? 1 : -1;
+            }
+        }
+        float2 ab = b - a;
+        float2 ap = p - a;
+        float len2 = dot(ab, ab);
+        float t = len2 > 0.0 ? saturate(dot(ap, ab) / len2) : 0.0;
+        float2 q = ap - t * ab;
+        nearest = min(nearest, dot(q, q));
+    }
+    bool inside = fill_rule == 1u ? (winding & 1) != 0 : winding != 0;
+    float d = sqrt(nearest);
+    return saturate(0.5 + (inside ? d : -d));
+}
+
+float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
+    VnLayer layer = vn_layers[input.layer_id];
+    float coverage = vn_clip_coverage(input.position.xy, layer.segment_start,
+        layer.segment_count, layer.fill_rule);
+    coverage *= content_mask_coverage(input.position.xy, layer.content_mask, layer.content_mask_radii);
+    // The layer is the size of the window: the texel under the pixel.
+    float4 color = t_sprite.Load(int3(int2(input.position.xy), 0));
+    // Premultiplied over premultiplied (the path sprite blend).
+    return color * coverage;
+}

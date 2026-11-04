@@ -283,6 +283,11 @@ impl WindowInvalidator {
         self.inner.borrow().draw_phase == DrawPhase::None
     }
 
+    /// vue-native fork: whether the window is in its paint phase.
+    pub fn is_painting(&self) -> bool {
+        self.inner.borrow().draw_phase == DrawPhase::Paint
+    }
+
     #[track_caller]
     pub fn debug_assert_paint(&self) {
         debug_assert!(
@@ -949,6 +954,10 @@ pub struct Hitbox {
     /// pointer BACKWARDS through this rather than mapping the rect forwards —
     /// see [`Frame::hit_test`].
     pub transformation: TransformationMatrix,
+    /// vue-native fork: the `clip-path` shapes that are no rounded rectangle
+    /// around the hitbox when it was inserted, in window device pixels. A
+    /// point outside any of them does not hit it (CSS Masking 1 §5).
+    pub vn_clip: Option<Arc<crate::VnClipNode>>,
 }
 
 impl Hitbox {
@@ -1188,6 +1197,11 @@ pub(crate) struct DeferredDraw {
     /// frame: CSS applies an ancestor's `opacity` to everything inside it,
     /// out-of-flow descendants included.
     element_opacity: f32,
+    /// vue-native fork: the `clip-path` shapes in force where the element
+    /// was deferred FROM, taken with the content mask (none when the draw
+    /// escapes its ancestors' clips). Its prepaint re-enters them, and its
+    /// paint re-opens an isolated layer for each ([`Window::vn_with_clip_shape`]).
+    vn_clip: Option<Arc<crate::VnClipNode>>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -1403,7 +1417,13 @@ impl Frame {
         // exist: a `translate(-50%, -50%)` dialog painted 500px to the left
         // of a clip rect that had not moved, and every clipping element
         // inside it hit-tested against a region it no longer covered.
-        hitbox.content_mask.contains(&position) && hitbox.bounds.contains(&local)
+        hitbox.content_mask.contains(&position)
+            && hitbox.bounds.contains(&local)
+            // vue-native fork: and inside every `clip-path` shape around it,
+            // which is in window device pixels.
+            && hitbox.vn_clip.as_ref().is_none_or(|clip| {
+                clip.contains([position.x.0 * scale_factor, position.y.0 * scale_factor])
+            })
     }
 
     /// vue-native fork: [`Frame::vn_tagged_hitboxes`]' indices in PAINT
@@ -1561,6 +1581,10 @@ pub struct Window {
     /// vue-native fork: see [`Window::vn_key_event_seq`].
     vn_key_event_seq: u64,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// vue-native fork: the `clip-path` shapes in force that are no rounded
+    /// rectangle, innermost first ([`Window::vn_with_clip_shape`]). A hitbox
+    /// and a deferred draw take it as they take the content mask.
+    pub(crate) vn_clip_stack: Option<Arc<crate::VnClipNode>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2520,6 +2544,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            vn_clip_stack: None,
             element_opacity: 1.0,
             element_image_tint: Hsla::transparent_black(),
             element_transform: TransformationMatrix::unit(),
@@ -4455,6 +4480,7 @@ impl Window {
                     element_transform,
                     element_opacity,
                     content_mask,
+                    vn_clip,
                     prepaint_range,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
@@ -4471,6 +4497,7 @@ impl Window {
                         deferred_draw.element_transform,
                         deferred_draw.element_opacity,
                         deferred_draw.content_mask,
+                        deferred_draw.vn_clip.clone(),
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -4492,6 +4519,9 @@ impl Window {
                             // window space, and `with_content_mask` maps what it
                             // is given through whatever transform is in force.
                             window.with_content_mask(content_mask, |window| {
+                                // vue-native fork: and the clip shapes, which
+                                // are in window space too.
+                                window.vn_with_absolute_clip_stack(vn_clip, |window| {
                                 window.with_absolute_element_opacity(element_opacity, |window| {
                                     window.with_absolute_element_transform(
                                         element_transform,
@@ -4502,6 +4532,7 @@ impl Window {
                                             );
                                         },
                                     );
+                                });
                                 });
                             });
                         });
@@ -4554,16 +4585,21 @@ impl Window {
             let content_mask = deferred_draw.content_mask;
             let element_transform = deferred_draw.element_transform;
             let element_opacity = deferred_draw.element_opacity;
+            let vn_clip = deferred_draw.vn_clip.clone();
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     // Mask first, transform second — see the prepaint side.
                     window.with_content_mask(content_mask, |window| {
+                        // vue-native fork: an isolated layer for each clip
+                        // shape the draw was deferred from inside.
+                        window.vn_reopen_clip_layers(vn_clip, |window| {
                         window.with_absolute_element_opacity(element_opacity, |window| {
                             window.with_absolute_element_transform(element_transform, |window| {
                                 window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                                     element.paint(window, cx);
                                 });
                             })
+                        })
                         })
                     })
                 })
@@ -4695,6 +4731,7 @@ impl Window {
                     a11y_parent: deferred_draw.a11y_parent,
                     vn_stack: deferred_draw.vn_stack.clone(),
                     element_opacity: deferred_draw.element_opacity,
+                    vn_clip: deferred_draw.vn_clip.clone(),
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -4849,6 +4886,99 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// vue-native fork: runs `f` under a `clip-path` that is no rounded
+    /// rectangle ([`crate::Style::vn_clip_outline`]), laid out in the
+    /// element's own frame. The outline is flattened through the transform in
+    /// force into window device pixels and pushed on the clip stack, which
+    /// every hitbox inserted in `f` takes (prepaint). While painting, `f`'s
+    /// primitives also go into an isolated layer that the renderer composites
+    /// through the shape ([`crate::Scene::vn_push_isolation`]). The caller
+    /// pushes the outline's box as a content mask around this, which culls.
+    pub fn vn_with_clip_shape<R>(
+        &mut self,
+        outline: Option<&crate::VnClipOutline>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(outline) = outline else {
+            return f(self);
+        };
+        let geometry = Arc::new(crate::VnClipGeometry::new(
+            outline,
+            self.scale_factor,
+            self.element_transform,
+        ));
+        let node = Arc::new(crate::VnClipNode {
+            geometry,
+            parent: self.vn_clip_stack.clone(),
+        });
+        let previous = self.vn_clip_stack.replace(node.clone());
+        let result = self.vn_with_clip_layer(&node, f);
+        self.vn_clip_stack = previous;
+        result
+    }
+
+    /// vue-native fork: `f` inside an isolated layer for `node`'s shape when
+    /// painting, and as it is otherwise.
+    fn vn_with_clip_layer<R>(
+        &mut self,
+        node: &Arc<crate::VnClipNode>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if !self.invalidator.is_painting() {
+            return f(self);
+        }
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+            geometry: node.geometry.clone(),
+            content_mask,
+        });
+        let result = f(self);
+        self.next_frame.scene.vn_pop_isolation();
+        result
+    }
+
+    /// vue-native fork: `f` with the clip stack set to `clip`, as a deferred
+    /// draw's prepaint re-enters the clips it was deferred from inside.
+    fn vn_with_absolute_clip_stack<R>(
+        &mut self,
+        clip: Option<Arc<crate::VnClipNode>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = mem::replace(&mut self.vn_clip_stack, clip);
+        let result = f(self);
+        self.vn_clip_stack = previous;
+        result
+    }
+
+    /// vue-native fork: a deferred draw's paint, inside an isolated layer for
+    /// each clip shape it was deferred from inside, the outermost first. It
+    /// paints after the clipped ancestor closed its own layer, so it is
+    /// composited through the same shapes on its own.
+    fn vn_reopen_clip_layers<R>(
+        &mut self,
+        clip: Option<Arc<crate::VnClipNode>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(innermost) = clip.clone() else {
+            return self.vn_with_absolute_clip_stack(None, f);
+        };
+        let chain = crate::VnClipNode::outermost_first(&innermost);
+        self.vn_with_absolute_clip_stack(clip, |window| {
+            for node in &chain {
+                let content_mask = window.snapped_content_mask();
+                window.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+                    geometry: node.geometry.clone(),
+                    content_mask,
+                });
+            }
+            let result = f(window);
+            for _ in &chain {
+                window.next_frame.scene.vn_pop_isolation();
+            }
+            result
+        })
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
@@ -5332,6 +5462,7 @@ impl Window {
                 .then(|| self.a11y.nodes.current_id()),
             vn_stack: stack_key,
             element_opacity: self.element_opacity,
+            vn_clip: content_mask.is_some().then(|| self.vn_clip_stack.clone()).flatten(),
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
@@ -5933,6 +6064,12 @@ impl Window {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
+        // vue-native fork: an isolated layer starts transparent, and
+        // subpixel text has no alpha of its own to composite it with
+        // (Chromium too draws grayscale text into a layer that is not opaque).
+        if self.next_frame.scene.vn_is_isolating() {
+            return false;
+        }
 
         if !self.platform_window.is_subpixel_rendering_supported() {
             return false;
@@ -6474,6 +6611,7 @@ impl Window {
             // pushes the same matrix paint does, so a rotated element's hitbox
             // knows it is rotated (see `Frame::hit_test`).
             transformation: self.element_transform,
+            vn_clip: self.vn_clip_stack.clone(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         // vue-native fork.
@@ -6655,6 +6793,7 @@ impl Window {
             content_mask: self.content_mask(),
             behavior: HitboxBehavior::Normal,
             transformation: self.element_transform,
+            vn_clip: self.vn_clip_stack.clone(),
         };
         self.next_frame
             .vn_tagged_hitboxes

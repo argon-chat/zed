@@ -340,6 +340,9 @@ struct ViewElementCacheKey {
     /// so this check sees what the paint will.
     opacity: f32,
     transform: TransformationMatrix,
+    /// vue-native fork: the `clip-path` shapes around the view, which its
+    /// hitboxes carry (`Window::vn_with_clip_shape`).
+    vn_clip: Option<std::sync::Arc<crate::VnClipNode>>,
 }
 
 #[cfg(not(gpui_hot_reload))]
@@ -553,6 +556,7 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let opacity = window.element_opacity();
                 let transform = window.element_transform();
+                let vn_clip = window.vn_clip_stack.clone();
 
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
@@ -560,6 +564,7 @@ fn prepaint_view(
                     && element_state.cache_key.text_style == text_style
                     && element_state.cache_key.opacity == opacity
                     && element_state.cache_key.transform == transform
+                    && crate::VnClipNode::same(&element_state.cache_key.vn_clip, &vn_clip)
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -597,6 +602,7 @@ fn prepaint_view(
                             text_style,
                             opacity,
                             transform,
+                            vn_clip,
                         },
                     },
                 )

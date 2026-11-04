@@ -11,6 +11,7 @@ use crate::{
 use std::{
     fmt::Debug,
     iter::Peekable,
+    mem,
     ops::{Add, Range, Sub},
     slice,
 };
@@ -55,6 +56,150 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// vue-native fork: the composites of isolated layers
+    /// ([`Scene::vn_push_isolation`]), each drawing one group through its clip
+    /// shape. After [`Scene::finish`] every vector above holds the root group
+    /// first and then each isolated group's, in [`Scene::vn_group_ranges`].
+    pub vn_layers: Vec<VnLayer>,
+    /// vue-native fork: every isolated layer's clip edges, `[x0, y0, x1, y1]`
+    /// in device pixels; a [`VnLayer`] names its run.
+    pub vn_clip_segments: Vec<[f32; 4]>,
+    /// vue-native fork: the groups still open, innermost last, each holding
+    /// the lists of the group around it while it paints.
+    vn_open: Vec<VnOpenGroup>,
+    /// vue-native fork: the closed groups, until `finish` appends them.
+    vn_groups: Vec<VnGroupLists>,
+    /// vue-native fork: where each group's primitives are after `finish`:
+    /// the root at 0, then the groups a [`VnLayer::group`] names.
+    vn_group_ranges: Vec<VnGroupRanges>,
+}
+
+/// vue-native fork: an isolated layer as it is opened: the clip it composites
+/// through, in window device pixels, and the content mask around it.
+#[derive(Clone, Debug)]
+pub struct VnIsolation {
+    /// The clip shape.
+    pub geometry: std::sync::Arc<crate::VnClipGeometry>,
+    /// The content mask in force where the layer was opened; it cuts the
+    /// composite as it cuts any primitive.
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+/// vue-native fork: the composite of one isolated layer. The renderer draws
+/// group `group` into an offscreen target the size of the window, then
+/// composites it over its parent's, multiplied by the coverage of the
+/// segments `segment_start..segment_start + segment_count` of
+/// [`Scene::vn_clip_segments`] under `fill_rule` (0 nonzero, 1 evenodd), and
+/// by the content mask.
+///
+/// Keep in sync with `struct VnLayer` in `gpui_windows/src/shaders.hlsl`
+/// (20 words); the renderer uploads this vector as it is.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct VnLayer {
+    pub order: DrawOrder,
+    /// The group, an index into [`Scene::vn_group_ranges`] (never 0, the root).
+    pub group: u32,
+    pub segment_start: u32,
+    pub segment_count: u32,
+    pub fill_rule: u32,
+    pub pad: [u32; 3],
+    /// The device pixels the composite covers: the shape's box, out to whole
+    /// pixels and one more for the antialiased edge, cut by the mask.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+/// vue-native fork: what the renderer iterates for one group: runs of
+/// primitives as before, and runs of [`VnLayer`] composites.
+#[derive(Debug)]
+pub enum VnBatch {
+    /// Primitives drawn into the group's target.
+    Primitives(PrimitiveBatch),
+    /// The composites `range` of [`Scene::vn_layers`], in order.
+    Layers(Range<usize>),
+}
+
+/// vue-native fork: one group's primitives in each of the scene's vectors.
+#[derive(Clone, Debug, Default)]
+pub struct VnGroupRanges {
+    shadows: Range<usize>,
+    quads: Range<usize>,
+    backdrop_blur_rects: Range<usize>,
+    effect_quads: Range<usize>,
+    paths: Range<usize>,
+    underlines: Range<usize>,
+    monochrome_sprites: Range<usize>,
+    subpixel_sprites: Range<usize>,
+    polychrome_sprites: Range<usize>,
+    surfaces: Range<usize>,
+    vn_layers: Range<usize>,
+}
+
+/// vue-native fork: everything a group gathers while it paints. The scene's
+/// own fields are the open group's; opening another swaps them out.
+#[derive(Default)]
+struct VnGroupLists {
+    primitive_bounds: BoundsTree<ScaledPixels>,
+    layer_stack: Vec<Layer>,
+    backdrop_blur_floor: DrawOrder,
+    shadows: Vec<Shadow>,
+    quads: Vec<Quad>,
+    backdrop_blur_rects: Vec<BackdropBlurRect>,
+    effect_quads: Vec<EffectQuad>,
+    paths: Vec<Path<ScaledPixels>>,
+    underlines: Vec<Underline>,
+    monochrome_sprites: Vec<MonochromeSprite>,
+    subpixel_sprites: Vec<SubpixelSprite>,
+    polychrome_sprites: Vec<PolychromeSprite>,
+    surfaces: Vec<PaintSurface>,
+    vn_layers: Vec<VnLayer>,
+}
+
+impl VnGroupLists {
+    fn is_empty(&self) -> bool {
+        self.shadows.is_empty()
+            && self.quads.is_empty()
+            && self.backdrop_blur_rects.is_empty()
+            && self.effect_quads.is_empty()
+            && self.paths.is_empty()
+            && self.underlines.is_empty()
+            && self.monochrome_sprites.is_empty()
+            && self.subpixel_sprites.is_empty()
+            && self.polychrome_sprites.is_empty()
+            && self.surfaces.is_empty()
+            && self.vn_layers.is_empty()
+    }
+
+    /// The draw-order sort `Scene::finish` gives every group.
+    fn sort(&mut self) {
+        self.shadows.sort_by_key(|shadow| shadow.order);
+        self.quads.sort_by_key(|quad| quad.order);
+        self.backdrop_blur_rects
+            .sort_by_key(|backdrop_blur_rect| backdrop_blur_rect.order);
+        // Secondary key `effect_id`: the batch iterator breaks a run when the
+        // id changes (each id is a different pipeline), so sorting by it keeps
+        // same-effect quads at the same draw order in ONE instanced draw.
+        self.effect_quads
+            .sort_by_key(|effect_quad| (effect_quad.order, effect_quad.effect_id));
+        self.paths.sort_by_key(|path| path.order);
+        self.underlines.sort_by_key(|underline| underline.order);
+        self.monochrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+        self.subpixel_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+        self.polychrome_sprites
+            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+        self.surfaces.sort_by_key(|surface| surface.order);
+        self.vn_layers.sort_by_key(|layer| layer.order);
+    }
+}
+
+struct VnOpenGroup {
+    /// The lists of the group around this one.
+    saved: VnGroupLists,
+    isolation: VnIsolation,
 }
 
 /// An entry on the scene's layer stack. The bounds are retained so that a
@@ -81,6 +226,181 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.vn_layers.clear();
+        self.vn_clip_segments.clear();
+        self.vn_open.clear();
+        self.vn_groups.clear();
+        self.vn_group_ranges.clear();
+    }
+
+    /// vue-native fork: swaps the open group's lists with `lists`.
+    fn vn_swap_lists(&mut self, lists: &mut VnGroupLists) {
+        mem::swap(&mut self.primitive_bounds, &mut lists.primitive_bounds);
+        mem::swap(&mut self.layer_stack, &mut lists.layer_stack);
+        mem::swap(&mut self.backdrop_blur_floor, &mut lists.backdrop_blur_floor);
+        mem::swap(&mut self.shadows, &mut lists.shadows);
+        mem::swap(&mut self.quads, &mut lists.quads);
+        mem::swap(&mut self.backdrop_blur_rects, &mut lists.backdrop_blur_rects);
+        mem::swap(&mut self.effect_quads, &mut lists.effect_quads);
+        mem::swap(&mut self.paths, &mut lists.paths);
+        mem::swap(&mut self.underlines, &mut lists.underlines);
+        mem::swap(&mut self.monochrome_sprites, &mut lists.monochrome_sprites);
+        mem::swap(&mut self.subpixel_sprites, &mut lists.subpixel_sprites);
+        mem::swap(&mut self.polychrome_sprites, &mut lists.polychrome_sprites);
+        mem::swap(&mut self.surfaces, &mut lists.surfaces);
+        mem::swap(&mut self.vn_layers, &mut lists.vn_layers);
+    }
+
+    /// vue-native fork: opens an isolated layer. Every primitive inserted
+    /// until the matching [`Scene::vn_pop_isolation`] goes into a group of its
+    /// own, with its own draw orders: the renderer draws the group into an
+    /// offscreen target and composites it through `isolation`'s clip, at the
+    /// draw order the composite takes among its parent's primitives.
+    ///
+    /// The group is what CSS calls an isolated group: a backdrop filter in it
+    /// sees what the group painted under it, not the page (the element is a
+    /// Backdrop Root, Filter Effects 2 §3.1). The same group is where filters
+    /// on an element's own painting would apply.
+    pub fn vn_push_isolation(&mut self, isolation: VnIsolation) {
+        self.paint_operations
+            .push(PaintOperation::VnStartIsolation(isolation.clone()));
+        let mut saved = VnGroupLists::default();
+        self.vn_swap_lists(&mut saved);
+        self.vn_open.push(VnOpenGroup { saved, isolation });
+    }
+
+    /// vue-native fork: whether an isolated layer is open.
+    pub fn vn_is_isolating(&self) -> bool {
+        !self.vn_open.is_empty()
+    }
+
+    /// vue-native fork: closes the innermost isolated layer
+    /// ([`Scene::vn_push_isolation`]) and inserts its composite.
+    pub fn vn_pop_isolation(&mut self) {
+        self.paint_operations.push(PaintOperation::VnEndIsolation);
+        self.vn_close_group();
+    }
+
+    fn vn_close_group(&mut self) {
+        let Some(open) = self.vn_open.pop() else {
+            return;
+        };
+        let mut group = open.saved;
+        self.vn_swap_lists(&mut group);
+        let geometry = &open.isolation.geometry;
+        let mask = open.isolation.content_mask;
+        // The antialiased edge reaches half a pixel past the shape.
+        let shape = geometry.bounds;
+        let bounds = Bounds::from_corners(
+            point(
+                ScaledPixels((shape.origin.x.0 - 1.).floor()),
+                ScaledPixels((shape.origin.y.0 - 1.).floor()),
+            ),
+            point(
+                ScaledPixels((shape.origin.x.0 + shape.size.width.0 + 1.).ceil()),
+                ScaledPixels((shape.origin.y.0 + shape.size.height.0 + 1.).ceil()),
+            ),
+        )
+        .intersect(&mask.bounds);
+        if group.is_empty() || geometry.segments.is_empty() || bounds.is_empty() {
+            return;
+        }
+        group.primitive_bounds = BoundsTree::default();
+        group.layer_stack = Vec::new();
+        self.vn_groups.push(group);
+        let segment_start = self.vn_clip_segments.len() as u32;
+        self.vn_clip_segments.extend_from_slice(&geometry.segments);
+        let order = self
+            .layer_stack
+            .last()
+            .map(|layer| layer.order)
+            .unwrap_or_else(|| self.primitive_bounds.insert(bounds));
+        self.vn_layers.push(VnLayer {
+            order,
+            group: self.vn_groups.len() as u32,
+            segment_start,
+            segment_count: geometry.segments.len() as u32,
+            fill_rule: (geometry.fill_rule == crate::VnFillRule::EvenOdd) as u32,
+            pad: [0; 3],
+            bounds,
+            content_mask: mask,
+        });
+    }
+
+    /// vue-native fork: appends a closed group to the scene's vectors.
+    fn vn_append(&mut self, group: VnGroupLists) -> VnGroupRanges {
+        fn append<T>(into: &mut Vec<T>, from: Vec<T>) -> Range<usize> {
+            let start = into.len();
+            into.extend(from);
+            start..into.len()
+        }
+        VnGroupRanges {
+            shadows: append(&mut self.shadows, group.shadows),
+            quads: append(&mut self.quads, group.quads),
+            backdrop_blur_rects: append(&mut self.backdrop_blur_rects, group.backdrop_blur_rects),
+            effect_quads: append(&mut self.effect_quads, group.effect_quads),
+            paths: append(&mut self.paths, group.paths),
+            underlines: append(&mut self.underlines, group.underlines),
+            monochrome_sprites: append(&mut self.monochrome_sprites, group.monochrome_sprites),
+            subpixel_sprites: append(&mut self.subpixel_sprites, group.subpixel_sprites),
+            polychrome_sprites: append(&mut self.polychrome_sprites, group.polychrome_sprites),
+            surfaces: append(&mut self.surfaces, group.surfaces),
+            vn_layers: append(&mut self.vn_layers, group.vn_layers),
+        }
+    }
+
+    /// vue-native fork: the ranges that hold everything the vectors hold —
+    /// the root group before `finish` appended any other.
+    fn vn_whole_ranges(&self) -> VnGroupRanges {
+        VnGroupRanges {
+            shadows: 0..self.shadows.len(),
+            quads: 0..self.quads.len(),
+            backdrop_blur_rects: 0..self.backdrop_blur_rects.len(),
+            effect_quads: 0..self.effect_quads.len(),
+            paths: 0..self.paths.len(),
+            underlines: 0..self.underlines.len(),
+            monochrome_sprites: 0..self.monochrome_sprites.len(),
+            subpixel_sprites: 0..self.subpixel_sprites.len(),
+            polychrome_sprites: 0..self.polychrome_sprites.len(),
+            surfaces: 0..self.surfaces.len(),
+            vn_layers: 0..self.vn_layers.len(),
+        }
+    }
+
+    /// vue-native fork: how many groups a finished scene holds, the root
+    /// included.
+    pub fn vn_group_count(&self) -> usize {
+        self.vn_group_ranges.len().max(1)
+    }
+
+    /// vue-native fork: the batches of one group (0 is the root), with its
+    /// isolated layers' composites as [`VnBatch::Layers`]; a renderer that
+    /// isolates draws each composite's [`VnLayer::group`] through these too.
+    pub fn vn_batches(&self, group: usize) -> impl Iterator<Item = VnBatch> + '_ {
+        let ranges = self
+            .vn_group_ranges
+            .get(group)
+            .cloned()
+            .unwrap_or_else(|| if group == 0 { self.vn_whole_ranges() } else { VnGroupRanges::default() });
+        BatchIterator::new(self, ranges)
+    }
+
+    fn vn_flatten_into(&self, group: usize, depth: usize, out: &mut Vec<PrimitiveBatch>) {
+        for batch in self.vn_batches(group) {
+            match batch {
+                VnBatch::Primitives(batch) => out.push(batch),
+                VnBatch::Layers(range) => {
+                    // A cycle cannot be built, but a corrupt index must not
+                    // recurse for ever.
+                    if depth > 64 {
+                        continue;
+                    }
+                    for layer in &self.vn_layers[range] {
+                        self.vn_flatten_into(layer.group as usize, depth + 1, out);
+                    }
+                }
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -178,29 +498,39 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::VnStartIsolation(isolation) => {
+                    self.vn_push_isolation(isolation.clone())
+                }
+                PaintOperation::VnEndIsolation => self.vn_pop_isolation(),
             }
         }
     }
 
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.backdrop_blur_rects
-            .sort_by_key(|backdrop_blur_rect| backdrop_blur_rect.order);
-        // Secondary key `effect_id`: the batch iterator breaks a run when the
-        // id changes (each id is a different pipeline), so sorting by it keeps
-        // same-effect quads at the same draw order in ONE instanced draw.
-        self.effect_quads
-            .sort_by_key(|effect_quad| (effect_quad.order, effect_quad.effect_id));
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
-        self.surfaces.sort_by_key(|surface| surface.order);
+        // vue-native fork: once the groups are appended, sorting the vectors
+        // again would mix them; a scene is finished once.
+        if !self.vn_group_ranges.is_empty() {
+            return;
+        }
+        // An isolated layer left open closes here.
+        while !self.vn_open.is_empty() {
+            self.vn_close_group();
+        }
+        let mut root = VnGroupLists::default();
+        self.vn_swap_lists(&mut root);
+        root.sort();
+        self.vn_swap_lists(&mut root);
+        // Then each isolated group, sorted on its own, after the root.
+        if self.vn_groups.is_empty() {
+            self.vn_group_ranges.clear();
+            return;
+        }
+        let mut ranges = vec![self.vn_whole_ranges()];
+        for mut group in mem::take(&mut self.vn_groups) {
+            group.sort();
+            ranges.push(self.vn_append(group));
+        }
+        self.vn_group_ranges = ranges;
     }
 
     #[cfg_attr(
@@ -210,29 +540,15 @@ impl Scene {
         ),
         allow(dead_code)
     )]
+    ///
+    /// vue-native fork: an isolated layer's group comes inline where its
+    /// composite would draw, unclipped by its shape (cut to the shape's box by
+    /// the content mask). That is what a renderer without isolated layers
+    /// (Metal, wgpu) draws; DirectX walks [`Scene::vn_batches`] instead.
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
-        BatchIterator {
-            shadows_start: 0,
-            shadows_iter: self.shadows.iter().peekable(),
-            quads_start: 0,
-            quads_iter: self.quads.iter().peekable(),
-            backdrop_blur_rects_start: 0,
-            backdrop_blur_rects_iter: self.backdrop_blur_rects.iter().peekable(),
-            effect_quads_start: 0,
-            effect_quads_iter: self.effect_quads.iter().peekable(),
-            paths_start: 0,
-            paths_iter: self.paths.iter().peekable(),
-            underlines_start: 0,
-            underlines_iter: self.underlines.iter().peekable(),
-            monochrome_sprites_start: 0,
-            monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
-            subpixel_sprites_start: 0,
-            subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
-            polychrome_sprites_start: 0,
-            polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
-            surfaces_start: 0,
-            surfaces_iter: self.surfaces.iter().peekable(),
-        }
+        let mut out = Vec::new();
+        self.vn_flatten_into(0, 0, &mut out);
+        out.into_iter()
     }
 
     /// Picks the draw order for a primitive about to be inserted.
@@ -325,12 +641,18 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    /// vue-native fork: an isolated layer's composite.
+    VnLayer,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    /// vue-native fork: [`Scene::vn_push_isolation`].
+    VnStartIsolation(VnIsolation),
+    /// vue-native fork: [`Scene::vn_pop_isolation`].
+    VnEndIsolation,
 }
 
 #[derive(Clone)]
@@ -429,12 +751,95 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    vn_layers_start: usize,
+    vn_layers_iter: Peekable<slice::Iter<'a, VnLayer>>,
+}
+
+impl<'a> BatchIterator<'a> {
+    /// vue-native fork: the batches of one group's ranges of `scene`'s
+    /// vectors. The ranges it yields index the whole vectors.
+    fn new(scene: &'a Scene, r: VnGroupRanges) -> Self {
+        BatchIterator {
+            shadows_start: r.shadows.start,
+            shadows_iter: scene.shadows[r.shadows].iter().peekable(),
+            quads_start: r.quads.start,
+            quads_iter: scene.quads[r.quads].iter().peekable(),
+            backdrop_blur_rects_start: r.backdrop_blur_rects.start,
+            backdrop_blur_rects_iter: scene.backdrop_blur_rects[r.backdrop_blur_rects]
+                .iter()
+                .peekable(),
+            effect_quads_start: r.effect_quads.start,
+            effect_quads_iter: scene.effect_quads[r.effect_quads].iter().peekable(),
+            paths_start: r.paths.start,
+            paths_iter: scene.paths[r.paths].iter().peekable(),
+            underlines_start: r.underlines.start,
+            underlines_iter: scene.underlines[r.underlines].iter().peekable(),
+            monochrome_sprites_start: r.monochrome_sprites.start,
+            monochrome_sprites_iter: scene.monochrome_sprites[r.monochrome_sprites]
+                .iter()
+                .peekable(),
+            subpixel_sprites_start: r.subpixel_sprites.start,
+            subpixel_sprites_iter: scene.subpixel_sprites[r.subpixel_sprites].iter().peekable(),
+            polychrome_sprites_start: r.polychrome_sprites.start,
+            polychrome_sprites_iter: scene.polychrome_sprites[r.polychrome_sprites]
+                .iter()
+                .peekable(),
+            surfaces_start: r.surfaces.start,
+            surfaces_iter: scene.surfaces[r.surfaces].iter().peekable(),
+            vn_layers_start: r.vn_layers.start,
+            vn_layers_iter: scene.vn_layers[r.vn_layers].iter().peekable(),
+        }
+    }
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
-    type Item = PrimitiveBatch;
+    type Item = VnBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // vue-native fork: a run of composites at the lowest order goes
+        // first; otherwise the primitive kinds, as upstream picks them.
+        let layer_order = self.vn_layers_iter.peek().map(|l| l.order);
+        if let Some(layer_order) = layer_order {
+            let lowest_primitive = [
+                self.shadows_iter.peek().map(|s| s.order),
+                self.quads_iter.peek().map(|q| q.order),
+                self.backdrop_blur_rects_iter.peek().map(|b| b.order),
+                self.effect_quads_iter.peek().map(|e| e.order),
+                self.paths_iter.peek().map(|p| p.order),
+                self.underlines_iter.peek().map(|u| u.order),
+                self.monochrome_sprites_iter.peek().map(|s| s.order),
+                self.subpixel_sprites_iter.peek().map(|s| s.order),
+                self.polychrome_sprites_iter.peek().map(|s| s.order),
+                self.surfaces_iter.peek().map(|s| s.order),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            // At equal orders the primitives go first, as `PrimitiveKind`
+            // sorts the composite last.
+            if lowest_primitive.is_none_or(|order| layer_order < order) {
+                let start = self.vn_layers_start;
+                let mut end = start + 1;
+                self.vn_layers_iter.next();
+                while self
+                    .vn_layers_iter
+                    .next_if(|layer| lowest_primitive.is_none_or(|order| layer.order < order))
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.vn_layers_start = end;
+                return Some(VnBatch::Layers(start..end));
+            }
+        }
+        self.next_primitives(layer_order).map(VnBatch::Primitives)
+    }
+}
+
+impl<'a> BatchIterator<'a> {
+    /// The next run of one primitive kind, which ends before `layer_order`
+    /// (the next composite's) as before any other kind's next order.
+    fn next_primitives(&mut self, layer_order: Option<DrawOrder>) -> Option<PrimitiveBatch> {
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -470,6 +875,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
+            (layer_order, PrimitiveKind::VnLayer),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -657,6 +1063,8 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            // `next` takes a composite that comes first.
+            PrimitiveKind::VnLayer => None,
         }
     }
 }

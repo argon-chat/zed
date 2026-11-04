@@ -2552,7 +2552,9 @@ impl Interactivity {
                         // of the element and its subtree, as `Style::paint`
                         // cuts their painting.
                         let clip = style.vn_clip_mask(bounds, window.rem_size());
+                        let outline = style.vn_clip_outline(bounds, window.rem_size());
                         window.with_content_mask(clip, |window| {
+                        window.vn_with_clip_shape(outline.as_ref(), |window| {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
@@ -2574,6 +2576,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                        })
                         })
                     })
                     })
