@@ -1,9 +1,11 @@
+mod composed_family;
 mod font_fallbacks;
 mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
 
+pub use composed_family::*;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
@@ -320,6 +322,20 @@ impl TextSystem {
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// vue-native fork: replaces the composed families (see
+    /// [`FamilyComposer`]), keyed by family name (matched without regard to
+    /// ASCII case). A font of such a family is drawn, character by character,
+    /// with the faces its composer names; one that covers no character falls
+    /// to the font's `fallbacks`, else to the platform's own fallback.
+    ///
+    /// Cached font resolution and line layouts are invalidated, as by
+    /// [`Self::add_fonts`].
+    pub fn set_composed_families(&self, families: Vec<(SharedString, FamilyComposer)>) {
+        self.platform_text_system.set_composed_families(families);
+        self.font_ids_by_font.write().clear();
+        self.font_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Takes the receiver for missing-glyph reports.

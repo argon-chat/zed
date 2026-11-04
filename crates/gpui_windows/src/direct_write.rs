@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     ffi::{c_uint, c_void},
     mem::ManuallyDrop,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -27,7 +28,7 @@ use windows_numerics::Vector2;
 use crate::*;
 use gpui::*;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
     font_face: IDWriteFontFace3,
@@ -47,6 +48,27 @@ struct FontInfo {
     /// Does the font declare an `opsz` (optical size) axis? Only such a font
     /// needs — or notices — the treatment in [`DirectWriteState::axes_for`].
     has_optical_size: bool,
+    /// vue-native fork: set for a font of a composed family
+    /// ([`gpui::FamilyComposer`]). Such a font is never shaped itself: a run
+    /// of it is split into runs of its members first
+    /// ([`DirectWriteState::split_composed_runs`]). Everything else about the
+    /// font — metrics, the fields above — is the face that stands for the
+    /// family, CSS's "first available font".
+    composite: Option<Arc<Composite>>,
+}
+
+/// vue-native fork: the members of a composed family's font, as resolved for
+/// its weight and style.
+#[derive(Debug)]
+struct Composite {
+    /// In the order they are tried for a character.
+    faces: Vec<ComposedFace>,
+    /// `faces[i]`'s font.
+    ids: Vec<FontId>,
+    /// What draws a character no member covers: the next family of the
+    /// font's `fallbacks`, else the face that stands for the family (whose
+    /// own DirectWrite fallback takes what it has no glyph for).
+    rest: FontId,
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -98,6 +120,8 @@ struct DirectWriteState {
     /// glyph is DRAWN from the same optical size it was MEASURED at.
     optical_faces: HashMap<(FontId, u32), IDWriteFontFace5>,
     layout_line_scratch: Vec<u16>,
+    /// vue-native fork: the composed families, by lowercase family name.
+    composed: HashMap<String, FamilyComposer>,
 }
 
 impl GPUState {
@@ -237,6 +261,7 @@ impl DirectWriteTextSystem {
                 font_info_cache: HashMap::default(),
                 optical_faces: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                composed: HashMap::default(),
             }),
         })
     }
@@ -256,6 +281,10 @@ impl DirectWriteTextSystem {
 impl PlatformTextSystem for DirectWriteTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.state.write().add_fonts(&self.components, fonts)
+    }
+
+    fn set_composed_families(&self, families: Vec<(SharedString, FamilyComposer)>) {
+        self.state.write().set_composed_families(families);
     }
 
     fn all_font_names(&self) -> Vec<String> {
@@ -336,6 +365,11 @@ impl DirectWriteState {
         components: &DirectWriteComponents,
         font: &Font,
     ) -> Option<FontId> {
+        if let Some(composer) = self.composed.get(&font.family.to_lowercase()).cloned() {
+            let font_id = self.select_composed_font(components, font, &composer)?;
+            self.font_to_font_id.insert(font.clone(), font_id);
+            return Some(font_id);
+        }
         let select_font = |this: &mut DirectWriteState, font: &Font| -> Option<FontId> {
             let info = [&this.custom_font_collection, &this.system_font_collection]
                 .into_iter()
@@ -375,6 +409,183 @@ impl DirectWriteState {
         let font_id = font_id?;
         self.font_to_font_id.insert(font.clone(), font_id);
         Some(font_id)
+    }
+
+    /// vue-native fork: a font for exactly `face`, a face DirectWrite drew a
+    /// run with that no font of ours is. Not filed under a [`Font`]: it is
+    /// reached by the face (`font_info_cache`), and only glyphs of runs
+    /// shaped with it are ever drawn with it.
+    fn font_for_face(
+        &mut self,
+        components: &DirectWriteComponents,
+        face: &IDWriteFontFace3,
+        locale: &HSTRING,
+    ) -> Option<FontId> {
+        let family = unsafe { face.GetFamilyNames() }
+            .log_err()
+            .and_then(|names| get_name(names, locale).log_err())
+            .unwrap_or_default();
+        let features =
+            unsafe { Self::generate_font_features(&components.factory, &FontFeatures::default()) }
+                .log_err()?;
+        let (axis_values, font_resource, has_optical_size) = unsafe { read_variations(face) };
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(FontInfo {
+            font_family_h: HSTRING::from(family),
+            font_face: face.clone(),
+            features,
+            fallbacks: None,
+            // Its runs are never laid out again; DirectWrite found the face
+            // in one of the two.
+            font_collection: self.custom_font_collection.clone(),
+            axis_values,
+            font_resource,
+            has_optical_size,
+            composite: None,
+        });
+        Some(font_id)
+    }
+
+    /// `font`'s id, resolved now if it has not been yet.
+    fn resolve_font(&mut self, components: &DirectWriteComponents, font: &Font) -> Option<FontId> {
+        match self.font_to_font_id.get(font) {
+            Some(&font_id) => Some(font_id),
+            None => self.select_and_cache_font(components, font),
+        }
+    }
+
+    /// vue-native fork: replaces the composed families. Every font that was
+    /// of one (or is now) resolves again; the fonts of the members, each a
+    /// family of one file, stay as they are.
+    fn set_composed_families(&mut self, families: Vec<(SharedString, FamilyComposer)>) {
+        self.composed = families
+            .into_iter()
+            .map(|(family, composer)| (family.to_lowercase(), composer))
+            .collect();
+        let fonts = &self.fonts;
+        let composed = &self.composed;
+        self.font_to_font_id.retain(|font, font_id| {
+            fonts[font_id.0].composite.is_none() && !composed.contains_key(&font.family.to_lowercase())
+        });
+    }
+
+    /// vue-native fork: the font of a composed family for `font`'s weight and
+    /// style. Its members are the faces the composer names, each resolved as
+    /// the family it is registered under, with `font`'s weight, style and
+    /// features. The face that stands for the family (its metrics, CSS's first
+    /// available font) is the first member that covers U+0020, else the next
+    /// family of `font.fallbacks`, else the first member. `None` when there is
+    /// none of those.
+    fn select_composed_font(
+        &mut self,
+        components: &DirectWriteComponents,
+        font: &Font,
+        composer: &FamilyComposer,
+    ) -> Option<FontId> {
+        let mut faces = Vec::new();
+        let mut ids = Vec::new();
+        for face in composer(font.weight, font.style) {
+            // A member is a family of one file; one named as the family
+            // itself would resolve to this very font.
+            if face.family.eq_ignore_ascii_case(&font.family) {
+                continue;
+            }
+            let member = Font {
+                family: face.family.clone(),
+                features: font.features.clone(),
+                fallbacks: None,
+                weight: font.weight,
+                style: font.style,
+            };
+            if let Some(font_id) = self.resolve_font(components, &member) {
+                faces.push(face);
+                ids.push(font_id);
+            }
+        }
+        let next = font.fallbacks.as_ref().and_then(|fallbacks| {
+            let (first, rest) = fallbacks.fallback_list().split_first()?;
+            let next = Font {
+                family: first.clone().into(),
+                features: font.features.clone(),
+                fallbacks: (!rest.is_empty()).then(|| FontFallbacks::from_fonts(rest.to_vec())),
+                weight: font.weight,
+                style: font.style,
+            };
+            self.resolve_font(components, &next)
+        });
+        let spacer = faces.iter().position(|face| face.covers(' ')).map(|i| ids[i]);
+        let stands_for = spacer.or(next).or_else(|| ids.first().copied())?;
+        let rest = next.unwrap_or(stands_for);
+        let mut info = self.fonts[stands_for.0].clone();
+        info.composite = Some(Arc::new(Composite { faces, ids, rest }));
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(info);
+        Some(font_id)
+    }
+
+    /// vue-native fork: `runs` with every run of a composed family's font
+    /// replaced by runs of its members, split by character
+    /// ([`gpui::split_by_face`]). A character no member covers goes to the
+    /// font's `rest`, split again if that is composed too. Pieces of one run
+    /// that land in the same font are one run; runs are never merged across
+    /// the runs given, which may differ in spacing.
+    fn split_composed_runs(&self, text: &str, runs: &[FontRun]) -> Vec<FontRun> {
+        fn split(
+            state: &DirectWriteState,
+            text: &str,
+            run: &FontRun,
+            font_id: FontId,
+            depth: usize,
+            out: &mut Vec<FontRun>,
+        ) {
+            match &state.fonts[font_id.0].composite {
+                // Each level is one family of a `fallbacks` list; the bound
+                // is only against a list that names itself.
+                Some(composite) if depth < 16 => {
+                    let mut at = 0;
+                    for (len, face) in split_by_face(text, &composite.faces) {
+                        let piece = &text[at..at + len];
+                        at += len;
+                        match face {
+                            Some(i) => out.push(FontRun {
+                                len,
+                                font_id: composite.ids[i],
+                                ..*run
+                            }),
+                            None => split(state, piece, run, composite.rest, depth + 1, out),
+                        }
+                    }
+                }
+                // A composed font shapes as the face that stands for it.
+                _ => out.push(FontRun {
+                    len: text.len(),
+                    font_id,
+                    ..*run
+                }),
+            }
+        }
+
+        let mut out: Vec<FontRun> = Vec::with_capacity(runs.len() + 2);
+        let mut pieces = Vec::new();
+        let mut offset = 0;
+        for run in runs {
+            let piece = &text[offset..offset + run.len];
+            offset += run.len;
+            pieces.clear();
+            split(self, piece, run, run.font_id, 0, &mut pieces);
+            let start = out.len();
+            for piece in pieces.drain(..) {
+                if out.len() > start
+                    && let Some(last) = out.last_mut()
+                    && last.font_id == piece.font_id
+                {
+                    last.len += piece.len;
+                } else {
+                    out.push(piece);
+                }
+            }
+        }
+        out
     }
 
     fn add_fonts(
@@ -542,6 +753,7 @@ impl DirectWriteState {
                     axis_values,
                     font_resource,
                     has_optical_size,
+                    composite: None,
                 };
                 Some(font_info)
             });
@@ -684,6 +896,18 @@ impl DirectWriteState {
         font_size: Pixels,
         font_runs: &[FontRun],
     ) -> Result<LineLayout> {
+        // vue-native fork: a composed family's run becomes runs of the faces
+        // that draw its characters, before DirectWrite picks any font.
+        let composed_runs;
+        let font_runs = if font_runs
+            .iter()
+            .any(|run| self.fonts[run.font_id.0].composite.is_some())
+        {
+            composed_runs = self.split_composed_runs(text, font_runs);
+            &composed_runs[..]
+        } else {
+            font_runs
+        };
         if font_runs.is_empty() {
             return Ok(LineLayout {
                 font_size,
@@ -1758,6 +1982,24 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                             .select_and_cache_font(context.components, &font)
                             .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
                     };
+                    // vue-native fork: the family, weight and style name a
+                    // face, not THIS face. When a family holds two files of
+                    // the same weight and style (one family's `unicode-range`
+                    // subsets, registered under one name), they resolve to
+                    // the first, and this run's glyph ids were then drawn
+                    // with the other file's outlines: letter-shaped garbage
+                    // of the right width. A face that is not the one drawn
+                    // with is a font of its own.
+                    let font_id = if unsafe {
+                        same_face(&context.text_system.fonts[font_id.0].font_face, font_face)
+                    } {
+                        font_id
+                    } else {
+                        context
+                            .text_system
+                            .font_for_face(context.components, font_face, &self.locale)
+                            .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?
+                    };
                     context
                         .text_system
                         .font_info_cache
@@ -2051,6 +2293,19 @@ fn get_font_names_from_collection(
         }
 
         result
+    }
+}
+
+/// vue-native fork: are `a` and `b` the same face of the same file (glyph ids
+/// of one mean the same glyphs in the other)? The same object, or equal face
+/// references: file, index in it, and simulations.
+unsafe fn same_face(a: &IDWriteFontFace3, b: &IDWriteFontFace3) -> bool {
+    if a.as_raw() == b.as_raw() {
+        return true;
+    }
+    match unsafe { (a.GetFontFaceReference(), b.GetFontFaceReference()) } {
+        (Ok(a), Ok(b)) => unsafe { a.Equals(&b) }.as_bool(),
+        _ => false,
     }
 }
 
@@ -2661,6 +2916,183 @@ mod tests {
             &[0, 0, 0, 0],
             "uncovered texel retained the poison from the uninitialized render target"
         );
+        Ok(())
+    }
+}
+
+/// vue-native fork: composed families (`gpui::FamilyComposer`), with system
+/// families standing in for a web family's `unicode-range` subsets.
+#[cfg(test)]
+mod composed_tests {
+    use super::DirectWriteTextSystem;
+    use anyhow::Result;
+    use gpui::{
+        ComposedFace, FamilyComposer, Font, FontFallbacks, FontId, FontWeight, PlatformTextSystem,
+        TextRun, TextSystem, WindowTextSystem, px,
+    };
+    use std::sync::Arc;
+
+    fn face(family: &str, ranges: &[(u32, u32)]) -> ComposedFace {
+        ComposedFace {
+            family: family.to_string().into(),
+            ranges: ranges.into(),
+        }
+    }
+
+    fn font(family: &str) -> Font {
+        Font {
+            family: family.to_string().into(),
+            ..Default::default()
+        }
+    }
+
+    /// "VN Composed": Cyrillic in Consolas, Latin-1 in Segoe UI. "VN Digits":
+    /// digits only, in Consolas — no face covers the space, as a Private Use
+    /// Area family's does not.
+    fn composed() -> Result<(Arc<TextSystem>, WindowTextSystem)> {
+        let platform = Arc::new(DirectWriteTextSystem::new(None)?);
+        let text_system = Arc::new(TextSystem::new(platform));
+        let composed: FamilyComposer = Arc::new(|weight, _| {
+            // A composer answers per weight: bold text has no Cyrillic face.
+            let mut faces = vec![face("Segoe UI", &[(0x0000, 0x00FF)])];
+            if weight < FontWeight::BOLD {
+                faces.insert(0, face("Consolas", &[(0x0400, 0x045F)]));
+            }
+            faces
+        });
+        let digits: FamilyComposer = Arc::new(|_, _| vec![face("Consolas", &[(0x30, 0x39)])]);
+        text_system.set_composed_families(vec![
+            ("VN Composed".into(), composed),
+            ("vn digits".into(), digits),
+        ]);
+        let window = WindowTextSystem::new(text_system.clone());
+        Ok((text_system, window))
+    }
+
+    /// The font each character of `text` was drawn with.
+    fn drawn_with(window: &WindowTextSystem, text: &str, font: &Font) -> Vec<(char, FontId)> {
+        let runs = [TextRun {
+            len: text.len(),
+            font: font.clone(),
+            ..Default::default()
+        }];
+        let shaped = window.shape_line(text.to_string().into(), px(16.0), &runs, None);
+        shaped
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(|glyph| (text[glyph.index..].chars().next().unwrap(), run.font_id))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_character_is_drawn_with_the_face_that_covers_it() -> Result<()> {
+        let (text_system, window) = composed()?;
+        let segoe = text_system.resolve_font(&font("Segoe UI"));
+        let consolas = text_system.resolve_font(&font("Consolas"));
+        let drawn = drawn_with(&window, "Ab Жж 1–", &font("vn composed"));
+        let expect: Vec<(char, FontId)> = "Ab Жж 1–"
+            .chars()
+            .map(|c| match c {
+                'Ж' | 'ж' => (c, consolas),
+                // U+2013 is no face's: the family's own face (Segoe UI) and
+                // DirectWrite's fallback from there.
+                _ => (c, segoe),
+            })
+            .collect();
+        assert_eq!(drawn, expect);
+
+        // The family's metrics are the face that covers the space.
+        let composed = text_system.resolve_font(&font("VN Composed"));
+        assert_ne!(composed, segoe, "a font of its own");
+        assert_eq!(
+            text_system.ascent(composed, px(16.0)),
+            text_system.ascent(segoe, px(16.0))
+        );
+
+        // Bold: the composer names no Cyrillic face, so Segoe UI's own glyphs.
+        let bold = Font {
+            weight: FontWeight::BOLD,
+            ..font("VN Composed")
+        };
+        let segoe_bold = text_system.resolve_font(&Font {
+            weight: FontWeight::BOLD,
+            ..font("Segoe UI")
+        });
+        assert!(drawn_with(&window, "aЖ", &bold).iter().all(|&(_, id)| id == segoe_bold));
+        Ok(())
+    }
+
+    /// The Argon client's `"Alcarin Tengwar", Inter, …`: a family that covers
+    /// a few characters and not the space leads the list. Its faces draw
+    /// those; everything else — and the line's metrics — is the next family's.
+    #[test]
+    fn a_family_without_the_space_leaves_the_rest_to_its_fallbacks() -> Result<()> {
+        let (text_system, window) = composed()?;
+        let segoe = text_system.resolve_font(&font("Segoe UI"));
+        let consolas = text_system.resolve_font(&font("Consolas"));
+        let stack = Font {
+            fallbacks: Some(FontFallbacks::from_fonts(vec!["VN Composed".into()])),
+            ..font("VN Digits")
+        };
+        let drawn = drawn_with(&window, "a1Ж", &stack);
+        assert_eq!(drawn, vec![('a', segoe), ('1', consolas), ('Ж', consolas)]);
+        let id = text_system.resolve_font(&stack);
+        assert_eq!(
+            text_system.ascent(id, px(16.0)),
+            text_system.ascent(segoe, px(16.0))
+        );
+        // Without fallbacks, its own face stands for it.
+        let alone = drawn_with(&window, "1a", &font("VN Digits"));
+        assert_eq!(alone[0], ('1', consolas));
+        Ok(())
+    }
+
+    #[test]
+    fn text_splits_by_the_first_face_that_covers_each_character() {
+        use gpui::split_by_face;
+        let faces = [
+            face("cyrillic", &[(0x0301, 0x0301), (0x0400, 0x045F)]),
+            face("latin", &[(0x0000, 0x00FF), (0x2000, 0x206F)]),
+        ];
+        // "EXOBIO Жук 1–0": Latin and the space, Cyrillic, then the en dash
+        // (U+2013) with the digits.
+        let text = "EXOBIO Жук 1–0";
+        let pieces = split_by_face(text, &faces);
+        assert_eq!(
+            pieces,
+            vec![(7, Some(1)), ("Жук".len(), Some(0)), (" 1–0".len(), Some(1))]
+        );
+        assert_eq!(pieces.iter().map(|p| p.0).sum::<usize>(), text.len());
+        // A character no face covers is a piece of its own.
+        assert_eq!(
+            split_by_face("a\u{E010}b", &faces),
+            vec![(1, Some(1)), (3, None), (1, Some(1))]
+        );
+        // The earlier face wins where two overlap; an empty range is everything.
+        let overlap = [face("pua", &[(0xE000, 0xE0FF)]), face("all", &[])];
+        assert_eq!(
+            split_by_face("\u{E000}x", &overlap),
+            vec![(3, Some(0)), (1, Some(1))]
+        );
+        // A combining mark stays with its base ("é" as e + U+0301, in the
+        // latin face though U+0301 is the cyrillic one's) — unless it has none.
+        assert_eq!(split_by_face("e\u{0301}x", &faces), vec![(4, Some(1))]);
+        assert_eq!(split_by_face("\u{0301}", &faces), vec![(2, Some(0))]);
+    }
+
+    #[test]
+    fn faces_are_the_same_only_for_the_same_file() -> Result<()> {
+        let platform = DirectWriteTextSystem::new(None)?;
+        let a = platform.font_id(&font("Segoe UI"))?;
+        let b = platform.font_id(&font("Consolas"))?;
+        let state = platform.state.read();
+        let (fa, fb) = (&state.fonts[a.0].font_face, &state.fonts[b.0].font_face);
+        assert!(unsafe { super::same_face(fa, fa) });
+        assert!(!unsafe { super::same_face(fa, fb) });
         Ok(())
     }
 }

@@ -1502,6 +1502,10 @@ pub trait PlatformDispatcher: Send + Sync {
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
+    /// vue-native fork: replaces the composed families
+    /// ([`crate::TextSystem::set_composed_families`]). A platform that does
+    /// not implement them resolves such a family by its name, as any other.
+    fn set_composed_families(&self, _families: Vec<(SharedString, crate::FamilyComposer)>) {}
     /// Installs a nonblocking sink for unresolved grapheme clusters.
     fn set_missing_glyph_sink(&self, _sink: Option<Arc<dyn MissingGlyphSink>>) {}
     /// Get all available font names.
