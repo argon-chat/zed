@@ -611,6 +611,10 @@ pub struct Style {
     /// The border color of this element
     pub border_color: Option<Hsla>,
 
+    /// CSS side colours override the shared colour independently.
+    #[refineable]
+    pub vn_border_colors: Edges<Option<Hsla>>,
+
     /// The border style of this element
     pub border_style: BorderStyle,
 
@@ -1712,16 +1716,33 @@ impl Style {
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);
-            let mut background = self.border_color.unwrap_or_default();
-            background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            let colors = self.vn_resolved_border_colors();
+            if colors.top == colors.right && colors.top == colors.bottom && colors.top == colors.left {
+                window.paint_quad(quad(
+                    bounds, corner_radii, Hsla::transparent_black(), border_widths,
+                    colors.top, self.border_style,
+                ));
+            } else {
+                // Reuse the rounded/dashed border shader, partitioned along
+                // the joins between outer and inner corners. Rectangular
+                // strips would give rounded corners the wrong side colour.
+                let clips = Self::vn_border_side_clips(bounds, border_widths);
+                for (points, (color, width)) in clips.into_iter().zip([
+                    (colors.top, border_widths.top), (colors.right, border_widths.right),
+                    (colors.bottom, border_widths.bottom), (colors.left, border_widths.left),
+                ]) {
+                    if width <= px(0.) || color.is_transparent() || points.len() < 3 { continue; }
+                    let mut verbs: Vec<_> = points.into_iter().enumerate().map(|(index, point)| {
+                        if index == 0 { VnPathVerb::MoveTo(point) } else { VnPathVerb::LineTo(point) }
+                    }).collect();
+                    verbs.push(VnPathVerb::Close);
+                    let outline = VnClipOutline { fill_rule: VnFillRule::NonZero, verbs };
+                    window.vn_with_clip_shape(Some(&outline), |window| {
+                        window.paint_quad(quad(bounds, corner_radii, Hsla::transparent_black(),
+                            border_widths, color, self.border_style));
+                    });
+                }
+            }
         }
 
         // `outline` LAST, and at dilated bounds: CSS paints it outside the
@@ -1764,9 +1785,50 @@ impl Style {
         }
     }
 
+    fn vn_resolved_border_colors(&self) -> Edges<Hsla> {
+        let shared = self.border_color.unwrap_or_default();
+        self.vn_border_colors.map(|color| color.unwrap_or(shared))
+    }
+
+    fn vn_border_side_clips(bounds: Bounds<Pixels>, widths: Edges<Pixels>) -> [Vec<[f32; 2]>; 4] {
+        let (left, top, right, bottom) = (f32::from(bounds.left()), f32::from(bounds.top()),
+            f32::from(bounds.right()), f32::from(bounds.bottom()));
+        let widths = [widths.top, widths.right, widths.bottom, widths.left].map(|width| f32::from(width).max(0.));
+        let distances = [[0., 1., -top], [-1., 0., right], [0., -1., bottom], [1., 0., -left]];
+        std::array::from_fn(|side| {
+            if widths[side] <= 0. { return Vec::new(); }
+            let mut polygon = vec![[left, top], [right, top], [right, bottom], [left, bottom]];
+            // Partition the FULL quad by distance / border width. Stopping
+            // at inner rectangular corners cuts holes out of rounded arcs.
+            // These bisectors keep the CSS joins through the inner corners
+            // while extending far enough to cover circles and large radii.
+            for other in 0..4 {
+                if other == side || widths[other] <= 0. { continue; }
+                let plane: [f32; 3] = std::array::from_fn(|index|
+                    distances[side][index] * widths[other] - distances[other][index] * widths[side]);
+                let distance = |point: [f32; 2]| plane[0] * point[0] + plane[1] * point[1] + plane[2];
+                let Some(mut previous) = polygon.last().copied() else { break };
+                let mut previous_distance = distance(previous);
+                let mut clipped = Vec::with_capacity(polygon.len() + 1);
+                for current in polygon {
+                    let current_distance = distance(current);
+                    if (previous_distance <= 0.) != (current_distance <= 0.) {
+                        let fraction = previous_distance / (previous_distance - current_distance);
+                        clipped.push([previous[0] + fraction * (current[0] - previous[0]),
+                            previous[1] + fraction * (current[1] - previous[1])]);
+                    }
+                    if current_distance <= 0. { clipped.push(current); }
+                    previous = current;
+                    previous_distance = current_distance;
+                }
+                polygon = clipped;
+            }
+            polygon
+        })
+    }
+
     fn is_border_visible(&self) -> bool {
-        self.border_color
-            .is_some_and(|color| !color.is_transparent())
+        self.vn_resolved_border_colors().any(|color| !color.is_transparent())
             && self.border_widths.any(|length| !length.is_zero())
     }
 }
@@ -1807,6 +1869,7 @@ impl Default for Style {
             background: None,
             background_layers: Vec::new(),
             border_color: None,
+            vn_border_colors: Edges::default(),
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
@@ -3140,5 +3203,52 @@ mod vn_clip_path_tests {
                 assert!(!hits(150., 10.));
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vn_border_color_tests {
+    use super::*;
+
+    #[test]
+    fn independent_border_colors_keep_shared_fallback_and_transparent_sides() {
+        let mut style = Style { border_color: Some(Hsla::red()), ..Default::default() };
+        style.vn_border_colors.left = Some(Hsla::transparent_black());
+        style.vn_border_colors.top = Some(Hsla::blue());
+        let colors = style.vn_resolved_border_colors();
+        assert_eq!(colors.top, Hsla::blue());
+        assert_eq!(colors.right, Hsla::red());
+        assert!(colors.left.is_transparent());
+    }
+
+    #[test]
+    fn colored_border_partitions_cover_rounded_arcs_with_width_weighted_joins() {
+        let clips = Style::vn_border_side_clips(
+            Bounds::new(point(px(0.), px(0.)), size(px(80.), px(80.))), Edges::all(px(8.)),
+        );
+        let contains = |polygon: &Vec<[f32; 2]>, point: [f32; 2]| {
+            let mut sign = 0.;
+            for (a, b) in polygon.iter().zip(polygon.iter().cycle().skip(1)) {
+                let cross = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0]);
+                if cross.abs() < 0.0001 { continue; }
+                if sign != 0. && cross.signum() != sign { return false; }
+                sign = cross.signum();
+            }
+            polygon.len() >= 3
+        };
+        assert!(contains(&clips[0], [15., 13.]), "top rounded arc extends below the rectangular inner top");
+        assert!(contains(&clips[3], [13., 15.]), "left rounded arc extends beyond the rectangular inner left");
+        for y in 0..80 {
+            for x in 0..80 {
+                assert!(clips.iter().any(|polygon| contains(polygon, [x as f32 + 0.25, y as f32 + 0.25])),
+                    "coloured side clips must cover the entire quad, including rounded corners");
+            }
+        }
+        let clips = Style::vn_border_side_clips(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(60.))),
+            Edges { top: px(4.), right: px(8.), bottom: px(6.), left: px(2.) },
+        );
+        assert!(contains(&clips[0], [2., 3.]));
+        assert!(contains(&clips[3], [2., 5.]), "top/left join uses their2:4width ratio");
     }
 }
