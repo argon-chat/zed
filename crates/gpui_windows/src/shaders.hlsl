@@ -1774,6 +1774,17 @@ StructuredBuffer<VnLayer> vn_layers: register(t1);
 // `[x0, y0, x1, y1]`, every layer's edges; a layer names its run.
 StructuredBuffer<float4> vn_clip_segments: register(t3);
 
+// Same layout as gpui::VnTextBackground: one stack entry, not per glyph.
+struct VnTextBackground {
+    Background background;
+    Bounds bounds;
+    TransformationMatrix inverse;
+    float scale_factor;
+    float pad;
+};
+StructuredBuffer<VnTextBackground> vn_text_backgrounds: register(t4);
+
+
 struct VnLayerVertexOutput {
     float4 position: SV_Position;
     nointerpolation uint layer_id: TEXCOORD0;
@@ -1833,6 +1844,21 @@ float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
     coverage *= content_mask_coverage(input.position.xy, layer.content_mask, layer.content_mask_radii);
     // The layer is the size of the window: the texel under the pixel.
     float4 color = t_sprite.Load(int3(int2(input.position.xy), 0));
+    if (layer.pad2 != 0u) {
+        float4 fill = 0.0;
+        for (uint i = 0u; i < layer.pad2; i++) {
+            VnTextBackground text = vn_text_backgrounds[layer.pad1 + i];
+            float2 position = mul(input.position.xy, text.inverse.rotation_scale) + text.inverse.translation;
+            position /= text.scale_factor;
+            GradientColor prepared = prepare_gradient_color(text.background);
+            float4 layer_color = gradient_color(text.background, position, text.bounds,
+                prepared.solid, prepared.color0, prepared.color1);
+            float4 premultiplied = float4(layer_color.rgb * layer_color.a, layer_color.a);
+            fill = premultiplied + fill * (1.0 - premultiplied.a);
+        }
+        // The whole background stack is masked once, preserving antialiased edges.
+        color = fill * color.a;
+    }
     if (layer.pad0 != 0u) {
         float4 straight = color.a > 0.0 ? float4(color.rgb / color.a, color.a) : 0.0;
         if (layer.pad0 == 1u) {

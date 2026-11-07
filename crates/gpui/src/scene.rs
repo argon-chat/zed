@@ -65,6 +65,8 @@ pub struct Scene {
     /// vue-native fork: every isolated layer's clip edges, `[x0, y0, x1, y1]`
     /// in device pixels; a [`VnLayer`] names its run.
     pub vn_clip_segments: Vec<[f32; 4]>,
+    /// Gradient stacks used by text-mask composites, shared across source groups.
+    pub vn_text_backgrounds: Vec<VnTextBackground>,
     /// vue-native fork: the groups still open, innermost last, each holding
     /// the lists of the group around it while it paints.
     vn_open: Vec<VnOpenGroup>,
@@ -72,7 +74,8 @@ pub struct Scene {
     vn_groups: Vec<VnGroupLists>,
     // Reopened deferred descendants append to one source before the matrix
     // runs. Filtering separately changes translucent colors in linear RGB.
-    vn_color_groups: HashMap<u64, usize>,
+    vn_color_groups: HashMap<(bool, u64, usize), usize>,
+    vn_contexts: HashMap<(usize, VnIsolationIdentity), usize>,
     /// vue-native fork: where each group's primitives are after `finish`:
     /// the root at 0, then the groups a [`VnLayer::group`] names.
     vn_group_ranges: Vec<VnGroupRanges>,
@@ -86,9 +89,44 @@ pub struct VnIsolation {
     pub geometry: std::sync::Arc<crate::VnClipGeometry>,
     /// A transform over the isolated source pixels before composition.
     pub color_matrix: Option<crate::VnColorMatrix>,
+    /// A text-only alpha source, filled by this background stack.
+    pub text_paint: Option<std::sync::Arc<crate::VnTextPaint>>,
     /// The content mask in force where the layer was opened; it cuts the
     /// composite as it cuts any primitive.
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+impl VnIsolation {
+    fn shared_key(&self, parent_context: usize) -> Option<(bool, u64, usize)> {
+        if let Some(text) = &self.text_paint {
+            return Some((true, text.fill.group_id, parent_context));
+        }
+        self.color_matrix.and_then(|matrix| (matrix.group_id != 0).then_some((false, matrix.group_id, 0)))
+    }
+
+    fn identity(&self) -> VnIsolationIdentity {
+        if let Some(text) = &self.text_paint { return VnIsolationIdentity::Text(text.fill.group_id); }
+        if let Some(matrix) = self.color_matrix.filter(|matrix| matrix.group_id != 0) {
+            return VnIsolationIdentity::Matrix(matrix.group_id);
+        }
+        VnIsolationIdentity::Clip(std::sync::Arc::as_ptr(&self.geometry) as usize)
+    }
+}
+
+/// One text background and its positioning space. GPU layout matches HLSL.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VnTextBackground {
+    /// Gradient/solid and its CSS size, position and repeat settings.
+    pub background: Background,
+    /// Logical CSS background box (not device-scaled).
+    pub bounds: Bounds<ScaledPixels>,
+    /// Device-space inverse transform.
+    pub inverse: TransformationMatrix,
+    /// Device pixels per CSS pixel.
+    pub scale_factor: f32,
+    /// Explicit tail padding, initialized before GPU upload.
+    pub pad: f32,
 }
 
 /// vue-native fork: the composite of one isolated layer. The renderer draws
@@ -204,11 +242,20 @@ impl VnGroupLists {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum VnIsolationIdentity {
+    Matrix(u64),
+    Text(u64),
+    Clip(usize),
+}
+
 struct VnOpenGroup {
     /// The lists of the group around this one.
     saved: VnGroupLists,
     isolation: VnIsolation,
     existing_group: Option<usize>,
+    shared_key: Option<(bool, u64, usize)>,
+    context: usize,
 }
 
 /// An entry on the scene's layer stack. The bounds are retained so that a
@@ -237,9 +284,11 @@ impl Scene {
         self.surfaces.clear();
         self.vn_layers.clear();
         self.vn_clip_segments.clear();
+        self.vn_text_backgrounds.clear();
         self.vn_open.clear();
         self.vn_groups.clear();
         self.vn_color_groups.clear();
+        self.vn_contexts.clear();
         self.vn_group_ranges.clear();
     }
 
@@ -276,14 +325,16 @@ impl Scene {
             .push(PaintOperation::VnStartIsolation(isolation.clone()));
         let mut saved = VnGroupLists::default();
         self.vn_swap_lists(&mut saved);
-        let existing_group = isolation.color_matrix.and_then(|matrix| {
-            (matrix.group_id != 0).then(|| self.vn_color_groups.get(&matrix.group_id).copied()).flatten()
-        });
+        let parent_context = self.vn_open.last().map_or(0, |group| group.context);
+        let shared_key = isolation.shared_key(parent_context);
+        let next_context = self.vn_contexts.len() + 1;
+        let context = *self.vn_contexts.entry((parent_context, isolation.identity())).or_insert(next_context);
+        let existing_group = shared_key.and_then(|key| self.vn_color_groups.get(&key).copied());
         if let Some(index) = existing_group {
             let mut source = mem::take(&mut self.vn_groups[index]);
             self.vn_swap_lists(&mut source);
         }
-        self.vn_open.push(VnOpenGroup { saved, isolation, existing_group });
+        self.vn_open.push(VnOpenGroup { saved, isolation, existing_group, shared_key, context });
     }
 
     /// vue-native fork: whether an isolated layer is open.
@@ -310,7 +361,7 @@ impl Scene {
             self.vn_groups[index] = group;
             return;
         }
-        let color_group = open.isolation.color_matrix.and_then(|matrix| (matrix.group_id != 0).then_some(matrix.group_id));
+        let color_group = open.shared_key;
         let geometry = &open.isolation.geometry;
         let mask = open.isolation.content_mask;
         // The antialiased edge reaches half a pixel past the shape.
@@ -340,13 +391,26 @@ impl Scene {
             .last()
             .map(|layer| layer.order)
             .unwrap_or_else(|| self.primitive_bounds.insert(bounds));
+        let text_start = self.vn_text_backgrounds.len() as u32;
+        if let Some(text) = &open.isolation.text_paint {
+            let m = text.inverse;
+            self.vn_text_backgrounds.extend(text.fill.backgrounds.iter().map(|background| VnTextBackground {
+                background: *background,
+                bounds: Bounds::new(
+                    point(ScaledPixels(text.bounds[0]), ScaledPixels(text.bounds[1])),
+                    crate::size(ScaledPixels(text.bounds[2]), ScaledPixels(text.bounds[3]))),
+                inverse: TransformationMatrix { rotation_scale: [[m[0], m[1]], [m[2], m[3]]], translation: [m[4], m[5]] },
+                scale_factor: text.scale_factor, pad: 0.,
+            }));
+        }
+        let text_count = self.vn_text_backgrounds.len() as u32 - text_start;
         self.vn_layers.push(VnLayer {
             order,
             group: self.vn_groups.len() as u32,
             segment_start,
             segment_count: geometry.segments.len() as u32,
             fill_rule: (geometry.fill_rule == crate::VnFillRule::EvenOdd) as u32,
-            pad: [open.isolation.color_matrix.map_or(0, |m| if m.linear_rgb { 1 } else { 2 }), 0, 0],
+            pad: [open.isolation.color_matrix.map_or(0, |m| if m.linear_rgb { 1 } else { 2 }), text_start, text_count],
             color_matrix: open.isolation.color_matrix.map_or([0.; 20], |matrix| matrix.gpu_values()),
             bounds,
             content_mask: mask,
@@ -2237,6 +2301,7 @@ mod vn_color_group_tests {
 
     fn filter(id: u64) -> VnIsolation {
         VnIsolation {
+            text_paint: None,
             geometry: Arc::new(VnClipGeometry {
                 fill_rule: VnFillRule::NonZero,
                 segments: vec![[0., 0., 100., 0.], [100., 0., 100., 100.], [100., 100., 0., 100.], [0., 100., 0., 0.]],
@@ -2249,6 +2314,101 @@ mod vn_color_group_tests {
 
     fn paint(scene: &mut Scene) {
         scene.insert_primitive(Quad { bounds: rectangle(), content_mask: ContentMask { bounds: rectangle(), ..Default::default() }, ..Default::default() });
+    }
+
+    fn text_mask(id: u64) -> VnIsolation {
+        let mut isolation = filter(id);
+        isolation.color_matrix = None;
+        isolation.text_paint = Some(Arc::new(crate::VnTextPaint {
+            fill: crate::VnTextFill { group_id: id, backgrounds: vec![crate::red().into(), crate::blue().into()] },
+            bounds: [10., 20., 40., 30.],
+            inverse: [0., 1., -1., 0., 50., 60.], scale_factor: 1.5,
+            geometry: isolation.geometry.clone(), content_mask: isolation.content_mask,
+        }));
+        isolation
+    }
+
+    #[test]
+    fn text_glyphs_and_deferred_replay_share_one_gradient_stack_and_source() {
+        let mut scene = Scene::default();
+        for _ in 0..3 {
+            scene.vn_push_isolation(text_mask(7));
+            paint(&mut scene);
+            scene.vn_pop_isolation();
+        }
+        assert_eq!(scene.vn_layers.len(), 1, "a text scope composites once, not per glyph");
+        assert_eq!(scene.vn_groups[0].quads.len(), 3);
+        assert_eq!(scene.vn_text_backgrounds.len(), 2, "metadata belongs to a text scope, not each glyph");
+        assert_eq!(scene.vn_layers[0].pad, [0, 0, 2]);
+        let brush = scene.vn_text_backgrounds[0];
+        assert_eq!(brush.bounds.origin.x.0, 10.);
+        assert_eq!(brush.inverse.apply(point(px(2.), px(3.))), point(px(53.), px(58.)));
+        assert_eq!(brush.scale_factor, 1.5);
+        let operations = 0..scene.len();
+        scene.finish();
+        let mut replay = Scene::default();
+        replay.replay(operations, &scene);
+        assert_eq!(replay.vn_layers.len(), 1);
+        assert_eq!(replay.vn_text_backgrounds.len(), 2, "cached operations rebuild valid metadata indices");
+        assert_eq!(replay.vn_groups[0].quads.len(), 3);
+        replay.clear();
+        assert!(replay.vn_text_backgrounds.is_empty());
+        replay.vn_push_isolation(text_mask(7));
+        paint(&mut replay);
+        replay.vn_pop_isolation();
+        assert_eq!(replay.vn_text_backgrounds.len(), 2);
+        assert_eq!(replay.vn_groups[0].quads.len(), 1, "new frames cannot retain old mask coverage");
+    }
+
+    #[test]
+    fn text_and_color_filter_group_identities_do_not_alias() {
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(filter(7));
+        scene.vn_push_isolation(text_mask(7));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        assert_eq!(scene.vn_groups.len(), 2);
+        assert_eq!(scene.vn_groups[1].vn_layers.len(), 1);
+        assert_eq!(scene.vn_layers[0].pad[0], 1);
+        assert_eq!(scene.vn_groups[1].vn_layers[0].pad[2], 2);
+        assert_eq!(std::mem::size_of::<VnLayer>(), 160, "keep existing HLSL layer ABI");
+        assert_eq!(std::mem::size_of::<VnTextBackground>(), 276, "match the HLSL structured buffer stride");
+        assert_eq!(std::mem::offset_of!(VnTextBackground, bounds), 228);
+        assert_eq!(std::mem::offset_of!(VnTextBackground, inverse), 244);
+        assert_eq!(std::mem::offset_of!(VnTextBackground, scale_factor), 268);
+    }
+
+    #[test]
+    fn text_sources_partition_child_clip_and_filter_contexts_and_rejoin_deferred_siblings() {
+        for matrix in [false, true] {
+            let mut first = filter(11);
+            let mut second = filter(12);
+            if !matrix { first.color_matrix = None; second.color_matrix = None; }
+            let mut scene = Scene::default();
+            for parent in [first.clone(), second, first] {
+                scene.vn_push_isolation(parent);
+                scene.vn_push_isolation(text_mask(7));
+                paint(&mut scene);
+                scene.vn_pop_isolation();
+                scene.vn_pop_isolation();
+            }
+            // Clip-path groups themselves may close separately; their text
+            // sources must still partition by stable parent geometry identity.
+            let masks: Vec<_> = scene.vn_groups.iter().filter(|group| !group.quads.is_empty()).collect();
+            assert_eq!(masks.len(), 2, "text cannot be captured by the first child's clip or filter");
+            assert_eq!(masks[0].quads.len(), 2, "deferred text in the same parent reuses its source");
+            assert_eq!(masks[1].quads.len(), 1);
+            assert_eq!(scene.vn_text_backgrounds.len(), 4, "two brushes per distinct isolation context");
+            let operations = 0..scene.len();
+            scene.finish();
+            let mut replay = Scene::default();
+            replay.replay(operations, &scene);
+            assert_eq!(replay.vn_text_backgrounds.len(), 4, "paint-cache replay interns equivalent parent contexts");
+            let masks: Vec<_> = replay.vn_groups.iter().filter(|group| !group.quads.is_empty()).collect();
+            assert_eq!(masks.len(), 2);
+            assert_eq!(masks[0].quads.len(), 2);
+        }
     }
 
     #[test]

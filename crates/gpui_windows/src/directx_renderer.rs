@@ -134,6 +134,7 @@ struct DirectXRenderPipelines {
     /// it reads at t3.
     vn_layer_pipeline: PipelineState<VnLayer>,
     vn_clip_segments: VnStructuredBuffer,
+    vn_text_backgrounds: VnStructuredBuffer,
 }
 
 struct DirectXGlobalElements {
@@ -176,6 +177,7 @@ struct VnStructuredBuffer {
     buffer: ID3D11Buffer,
     view: Option<ID3D11ShaderResourceView>,
     len: usize,
+    stride: usize,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -585,10 +587,11 @@ impl DirectXRenderer {
         }
         let layer_texture = slice::from_ref(&target.srv);
         let segments = slice::from_ref(&self.pipelines.vn_clip_segments.view);
+        let text_backgrounds = slice::from_ref(&self.pipelines.vn_text_backgrounds.view);
         self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources(
             &devices.device_context,
             None,
-            &[(0, layer_texture), (3, segments)],
+            &[(0, layer_texture), (3, segments), (4, text_backgrounds)],
             self.globals
                 .batch_params_buffer
                 .as_ref()
@@ -855,6 +858,9 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.vn_clip_segments,
+            )?;
+            self.pipelines.vn_text_backgrounds.update(
+                &devices.device, &devices.device_context, &scene.vn_text_backgrounds,
             )?;
         }
 
@@ -1682,7 +1688,8 @@ impl DirectXRenderPipelines {
             4,
             create_blend_state_for_path_sprite(device)?,
         )?;
-        let vn_clip_segments = VnStructuredBuffer::new(device, 64)?;
+        let vn_clip_segments = VnStructuredBuffer::new(device, 64, std::mem::size_of::<[f32; 4]>())?;
+        let vn_text_backgrounds = VnStructuredBuffer::new(device, 16, std::mem::size_of::<VnTextBackground>())?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1699,6 +1706,7 @@ impl DirectXRenderPipelines {
             poly_sprites,
             vn_layer_pipeline,
             vn_clip_segments,
+            vn_text_backgrounds,
         })
     }
 }
@@ -2448,30 +2456,31 @@ fn create_vn_layer_target(device: &ID3D11Device, width: u32, height: u32) -> Res
 }
 
 impl VnStructuredBuffer {
-    fn new(device: &ID3D11Device, len: usize) -> Result<Self> {
-        let buffer = create_buffer(device, std::mem::size_of::<[f32; 4]>(), len)?;
+    fn new(device: &ID3D11Device, len: usize, stride: usize) -> Result<Self> {
+        let buffer = create_buffer(device, stride, len)?;
         let view = create_buffer_view(device, &buffer)?;
-        Ok(Self { buffer, view, len })
+        Ok(Self { buffer, view, len, stride })
     }
 
     /// Uploads `data`, growing the buffer to the next power of two first
     /// when it does not fit.
-    fn update(
+    fn update<T: Copy>(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
-        data: &[[f32; 4]],
+        data: &[T],
     ) -> Result<()> {
+        anyhow::ensure!(self.stride == std::mem::size_of::<T>(), "structured buffer stride mismatch");
         if data.is_empty() {
             return Ok(());
         }
         if self.len < data.len() {
             let len = data.len().next_power_of_two();
             anyhow::ensure!(
-                len * std::mem::size_of::<[f32; 4]>() <= MAX_INSTANCE_BUFFER_SIZE,
-                "clip-path segment buffer needs {len} segments, above the maximum"
+                len * self.stride <= MAX_INSTANCE_BUFFER_SIZE,
+                "isolated layer buffer needs {len} items, above the maximum"
             );
-            *self = Self::new(device, len)?;
+            *self = Self::new(device, len, self.stride)?;
         }
         update_buffer(device_context, &self.buffer, data)
     }

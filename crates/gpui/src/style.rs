@@ -780,6 +780,9 @@ pub struct Style {
     /// SVG color filtering of the whole painted subtree.
     pub vn_color_matrix: Option<crate::VnColorMatrix>,
 
+    /// CSS backgrounds painted through the descendant glyph alpha, not the box.
+    pub vn_text_fill: Option<VnTextFill>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -984,12 +987,46 @@ pub enum TextAlign {
     Right,
 }
 
+/// A CSS background stack clipped to the element's descendant text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VnTextFill {
+    /// Stable element identity; reopened/deferred text shares one alpha mask.
+    pub group_id: u64,
+    /// Backgrounds, bottom first, retaining their gradient and tile parameters.
+    pub backgrounds: Vec<Background>,
+}
+
+/// A text background resolved against its element, in logical CSS pixels.
+/// Carried in TextStyle so deferred drawing and paint-cache keys retain it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VnTextPaint {
+    /// The authored stack.
+    pub fill: VnTextFill,
+    /// The background positioning box.
+    pub bounds: [f32; 4],
+    /// Inverse device-space element transform, row major followed by translation.
+    pub inverse: [f32; 6],
+    /// Device pixels per logical CSS pixel.
+    pub scale_factor: f32,
+    /// The owner scope's geometry, shared by every descendant glyph.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub geometry: Arc<crate::VnClipGeometry>,
+    /// The owner scope's outer mask. Glyphs retain their local child masks.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub content_mask: ContentMask<crate::ScaledPixels>,
+}
+
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TextStyle {
     /// The color of the text
     pub color: Hsla,
+
+    /// Background clipped to transparent glyphs in this text scope.
+    pub vn_text_paint: Option<Arc<VnTextPaint>>,
 
     /// The font family to use
     pub font_family: SharedString,
@@ -1055,6 +1092,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         TextStyle {
             color: black(),
+            vn_text_paint: None,
             // todo(linux) make this configurable or choose better default
             font_family: ".SystemUIFont".into(),
             font_features: FontFeatures::default(),
@@ -1234,6 +1272,16 @@ impl Style {
         } else {
             None
         }
+    }
+
+    /// Text refinements with the background positioning box resolved for paint.
+    /// Layout uses `text_style` because this scope must not change glyph shaping.
+    pub fn text_style_for_bounds(&self, bounds: Bounds<Pixels>, window: &Window) -> Option<TextStyleRefinement> {
+        let mut text = self.text.clone();
+        if let Some(fill) = &self.vn_text_fill {
+            text.vn_text_paint = Some(window.vn_text_paint(fill.clone(), bounds));
+        }
+        text.is_some().then_some(text)
     }
 
     /// vue-native fork: the corner radii this style paints on a box of `size`,
@@ -1903,6 +1951,7 @@ impl Default for Style {
             vn_mask_ring: false,
             vn_clip_path: VnClipPath::None,
             vn_color_matrix: None,
+            vn_text_fill: None,
             vn_corner_radii: Corners::default(),
 
             #[cfg(debug_assertions)]

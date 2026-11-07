@@ -2547,7 +2547,7 @@ impl Interactivity {
                     // here carries it (`Window::defer_draw_with_stack_key`).
                     // Nothing reads it in prepaint otherwise.
                     window.with_element_opacity(style.opacity, |window| {
-                    window.with_text_style(style.text_style().cloned(), |window| {
+                    window.with_text_style(style.text_style_for_bounds(bounds, window), |window| {
                         // vue-native fork: `clip-path` cuts the hit test
                         // of the element and its subtree, as `Style::paint`
                         // cuts their painting.
@@ -2730,7 +2730,7 @@ impl Interactivity {
 
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                        window.with_text_style(style.text_style().cloned(), |window| {
+                        window.with_text_style(style.text_style_for_bounds(bounds, window), |window| {
                             window.with_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
                                 |window| {

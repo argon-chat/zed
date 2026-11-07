@@ -596,13 +596,15 @@ fn paint_line(
                         && let Some(hyphen) =
                             text_system.platform_text_system.glyph_for_char(font_id, '-')
                     {
-                        window.paint_glyph(
-                            glyph_origin + baseline_offset,
-                            font_id,
-                            hyphen,
-                            layout.font_size,
-                            color,
-                        )?;
+                        let text_paint = window.text_style().vn_text_paint.clone()
+                            .filter(|paint| !paint.fill.backgrounds.is_empty());
+                        if let Some(text_paint) = text_paint {
+                            window.vn_with_text_mask(text_paint, |window| window.paint_glyph(
+                                glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, crate::white()))?;
+                        }
+                        if color.a > 0. {
+                            window.paint_glyph(glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, color)?;
+                        }
                     }
                     wrap_ix += 1;
                     if let Some((underline_origin, underline_style, underline_range)) =
@@ -766,8 +768,21 @@ fn paint_line(
                 // different frames, and comparing them culls the glyphs of a
                 // transformed element against a region it does not live in.
                 let content_mask = window.content_mask_in_element_space();
-                if color.a > 0. && max_glyph_bounds.intersects(&content_mask.bounds) {
+                let text_paint = window.text_style().vn_text_paint.clone()
+                            .filter(|paint| !paint.fill.backgrounds.is_empty());
+                if (color.a > 0. || text_paint.is_some()) && max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
+                    if let Some(text_paint) = text_paint {
+                        window.vn_with_text_mask(text_paint, |window| {
+                            let origin = glyph_origin + baseline_offset + vertical_offset;
+                            if glyph.is_emoji {
+                                window.paint_emoji(origin, run.font_id, glyph.id, layout.font_size)
+                            } else {
+                                window.paint_glyph(origin, run.font_id, glyph.id, layout.font_size, crate::white())
+                            }
+                        })?;
+                    }
+                    if color.a == 0. { continue; }
                     if glyph.is_emoji {
                         // Color glyphs keep their own RGB, but still inherit the text alpha.
                         // A transparent Unicode fallback must not paint over its sprite.
@@ -1242,6 +1257,72 @@ mod tests {
         context
             .update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    #[test]
+    fn clipped_text_masks_only_glyphs_and_preserves_emoji_alpha_and_advance() {
+        let mut context = TestAppContext::build_with_text_system(
+            crate::TestDispatcher::new(0), None, Arc::new(ColorGlyphTextSystem));
+        let window = context.add_window(|_, _| UnderlineHandlerTestView(Rc::new(|window, cx| {
+            let line = window.text_system().shape_line("x👂".into(), px(16.), &[TextRun {
+                len: 5, color: hsla(0., 0., 0., 0.),
+                underline: Some(UnderlineStyle { color: Some(crate::red()), thickness: px(1.), ..Default::default() }),
+                ..TextRun::default()
+            }], None);
+            let width = line.width();
+            let text_paint = window.vn_text_paint(crate::VnTextFill { group_id: 1, backgrounds: vec![crate::blue().into()] },
+                Bounds::new(point(px(0.), px(0.)), size(px(200.), px(100.))));
+            window.next_frame.scene.clear();
+            window.with_text_style(Some(crate::TextStyleRefinement { vn_text_paint: Some(text_paint), ..Default::default() }), |window| {
+                line.paint(point(px(20.), px(20.)), px(20.), TextAlign::Left, None, window, cx).unwrap();
+            });
+            let scene = &mut window.next_frame.scene;
+            assert_eq!(scene.vn_layers.len(), 1, "ordinary and emoji glyphs share one fill");
+            assert_eq!(scene.vn_text_backgrounds.len(), 1);
+            assert!(scene.monochrome_sprites.is_empty());
+            assert!(scene.polychrome_sprites.is_empty());
+            assert!(!scene.underlines.is_empty(), "decorations remain outside the glyph alpha source");
+            scene.finish();
+            assert_eq!(scene.monochrome_sprites.len(), 1);
+            assert_eq!(scene.polychrome_sprites.len(), 1, "explicit text fill can use color emoji alpha");
+            assert_eq!(scene.polychrome_sprites[0].opacity, 0.5, "ancestor opacity applied once to mask");
+            assert_eq!(line.width(), width, "filling must not reshape or reposition the text");
+            assert_eq!(window.element_opacity(), 0.5);
+        })));
+        context.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    }
+
+    #[test]
+    fn clipped_text_uses_owner_mask_across_child_clips_and_paints_translucent_foreground() {
+        let mut context = TestAppContext::build_with_text_system(
+            crate::TestDispatcher::new(0), None, Arc::new(ColorGlyphTextSystem));
+        let window = context.add_window(|_, _| UnderlineHandlerTestView(Rc::new(|window, cx| {
+            let transparent = window.text_system().shape_line("x".into(), px(16.), &[TextRun {
+                len: 1, color: hsla(0., 0., 0., 0.), ..TextRun::default() }], None);
+            let translucent = window.text_system().shape_line("y".into(), px(16.), &[TextRun {
+                len: 1, color: hsla(0., 1., 0.5, 0.5), ..TextRun::default() }], None);
+            let paint = window.vn_text_paint(crate::VnTextFill { group_id: 1, backgrounds: vec![crate::blue().into()] },
+                Bounds::new(point(px(0.), px(0.)), size(px(200.), px(100.))));
+            let owner_mask = paint.content_mask;
+            window.next_frame.scene.clear();
+            window.with_text_style(Some(crate::TextStyleRefinement { vn_text_paint: Some(paint), ..Default::default() }), |window| {
+                window.with_content_mask(Some(crate::ContentMask::rect(Bounds::new(point(px(0.), px(0.)), size(px(30.), px(100.))))), |window| {
+                    transparent.paint(point(px(20.), px(20.)), px(20.), TextAlign::Left, None, window, cx).unwrap();
+                });
+                translucent.paint(point(px(80.), px(20.)), px(20.), TextAlign::Left, None, window, cx).unwrap();
+            });
+            let scale_factor = window.scale_factor();
+            let scene = &mut window.next_frame.scene;
+            assert_eq!(scene.vn_layers.len(), 1);
+            assert_eq!(scene.vn_layers[0].content_mask, owner_mask, "first child's narrow clip cannot crop sibling glyphs");
+            assert_eq!(scene.monochrome_sprites.len(), 1, "translucent foreground paints over the gradient mask");
+            assert_eq!(scene.monochrome_sprites[0].color.a, 0.25, "foreground run alpha keeps ancestor opacity");
+            scene.finish();
+            assert_eq!(scene.monochrome_sprites.len(), 3, "two mask glyphs and one foreground glyph");
+            assert_eq!(scene.monochrome_sprites[1].content_mask.bounds.size.width.0, 30. * scale_factor);
+            assert!(scene.monochrome_sprites[2].content_mask.bounds.size.width.0 > 80. * scale_factor);
+        })));
+        context.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
     }
 
     #[test]

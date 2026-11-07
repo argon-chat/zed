@@ -4954,6 +4954,37 @@ impl Window {
         result
     }
 
+    /// Resolve a text brush once at its owner, before descendant overflow masks.
+    pub fn vn_text_paint(&self, fill: crate::VnTextFill, bounds: Bounds<Pixels>) -> Arc<crate::VnTextPaint> {
+        let x = bounds.origin.x.0; let y = bounds.origin.y.0;
+        let right = x + bounds.size.width.0; let bottom = y + bounds.size.height.0;
+        let outline = crate::VnClipOutline {
+            fill_rule: crate::VnFillRule::NonZero,
+            verbs: vec![crate::VnPathVerb::MoveTo([x,y]), crate::VnPathVerb::LineTo([right,y]),
+                crate::VnPathVerb::LineTo([right,bottom]), crate::VnPathVerb::LineTo([x,bottom]), crate::VnPathVerb::Close],
+        };
+        let m = self.element_transform.inverse().unwrap_or_else(TransformationMatrix::unit);
+        Arc::new(crate::VnTextPaint {
+            fill, bounds: [x, y, bounds.size.width.0, bounds.size.height.0],
+            inverse: [m.rotation_scale[0][0], m.rotation_scale[0][1], m.rotation_scale[1][0], m.rotation_scale[1][1], m.translation[0], m.translation[1]],
+            scale_factor: self.scale_factor,
+            geometry: Arc::new(crate::VnClipGeometry::new(&outline, self.scale_factor, self.element_transform)),
+            content_mask: self.snapped_content_mask(),
+        })
+    }
+
+    /// Paint only glyph alpha into the owner's shared mask. Child overflow
+    /// masks still apply to their sprites without clipping later sibling glyphs.
+    pub fn vn_with_text_mask<R>(&mut self, paint: Arc<crate::VnTextPaint>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+            geometry: paint.geometry.clone(), color_matrix: None,
+            content_mask: paint.content_mask, text_paint: Some(paint),
+        });
+        let result = f(self);
+        self.next_frame.scene.vn_pop_isolation();
+        result
+    }
+
     /// vue-native fork: `f` inside an isolated layer for `node`'s shape when
     /// painting, and as it is otherwise.
     fn vn_with_clip_layer<R>(
@@ -4968,6 +4999,7 @@ impl Window {
         self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
             geometry: node.geometry.clone(),
             color_matrix: node.color_matrix,
+            text_paint: None,
             content_mask,
         });
         let result = f(self);
@@ -5007,6 +5039,7 @@ impl Window {
                 window.next_frame.scene.vn_push_isolation(crate::VnIsolation {
                     geometry: node.geometry.clone(),
                     color_matrix: node.color_matrix,
+                    text_paint: None,
                     content_mask,
                 });
             }
