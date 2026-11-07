@@ -766,15 +766,19 @@ fn paint_line(
                 // different frames, and comparing them culls the glyphs of a
                 // transformed element against a region it does not live in.
                 let content_mask = window.content_mask_in_element_space();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if color.a > 0. && max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
-                        window.paint_emoji(
-                            glyph_origin + baseline_offset + vertical_offset,
-                            run.font_id,
-                            glyph.id,
-                            layout.font_size,
-                        )?;
+                        // Color glyphs keep their own RGB, but still inherit the text alpha.
+                        // A transparent Unicode fallback must not paint over its sprite.
+                        window.with_element_opacity(Some(color.a), |window| {
+                            window.paint_emoji(
+                                glyph_origin + baseline_offset + vertical_offset,
+                                run.font_id,
+                                glyph.id,
+                                layout.font_size,
+                            )
+                        })?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
@@ -1085,6 +1089,159 @@ mod tests {
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
         }
+    }
+
+    struct ColorGlyphTextSystem;
+
+    impl crate::PlatformTextSystem for ColorGlyphTextSystem {
+        fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
+            crate::NoopTextSystem.add_fonts(fonts)
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            crate::NoopTextSystem.all_font_names()
+        }
+
+        fn font_id(&self, descriptor: &crate::Font) -> Result<FontId> {
+            crate::NoopTextSystem.font_id(descriptor)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> crate::FontMetrics {
+            crate::NoopTextSystem.font_metrics(font_id)
+        }
+
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            crate::NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<crate::Size<f32>> {
+            crate::NoopTextSystem.advance(font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, character: char) -> Option<GlyphId> {
+            crate::NoopTextSystem.glyph_for_char(font_id, character)
+        }
+
+        fn glyph_raster_bounds(&self, _: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            Ok(Bounds::new(
+                point(DevicePixels(0), DevicePixels(0)),
+                size(DevicePixels(2), DevicePixels(2)),
+            ))
+        }
+
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            bounds: Bounds<DevicePixels>,
+        ) -> Result<(crate::Size<DevicePixels>, Vec<u8>)> {
+            let pixel_count = (bounds.size.width.0 * bounds.size.height.0) as usize;
+            let pixels = if params.is_emoji {
+                [40, 80, 120, 255].repeat(pixel_count)
+            } else {
+                vec![255; pixel_count]
+            };
+            Ok((bounds.size, pixels))
+        }
+
+        fn layout_line(
+            &self,
+            text: &str,
+            font_size: Pixels,
+            runs: &[crate::FontRun],
+        ) -> LineLayout {
+            crate::NoopTextSystem.layout_line(text, font_size, runs)
+        }
+
+        fn recommended_rendering_mode(&self, _: FontId, _: Pixels) -> crate::TextRenderingMode {
+            crate::TextRenderingMode::Grayscale
+        }
+    }
+
+    #[test]
+    fn color_emoji_respects_text_alpha_without_collapsing_advance() {
+        let mut context = TestAppContext::build_with_text_system(
+            crate::TestDispatcher::new(0),
+            None,
+            Arc::new(ColorGlyphTextSystem),
+        );
+        let window = context.add_window(|_, _| {
+            UnderlineHandlerTestView(Rc::new(|window, cx| {
+                let text: SharedString = "👂👂x👂".into();
+                let line = window.text_system().shape_line(
+                    text,
+                    px(16.),
+                    &[
+                        TextRun {
+                            len: 4,
+                            color: hsla(0., 1., 0.5, 0.),
+                            ..TextRun::default()
+                        },
+                        TextRun {
+                            len: 4,
+                            color: hsla(0., 1., 0.5, 0.5),
+                            ..TextRun::default()
+                        },
+                        TextRun {
+                            len: 1,
+                            color: hsla(0., 1., 0.5, 1.),
+                            ..TextRun::default()
+                        },
+                        TextRun {
+                            len: 4,
+                            color: hsla(0.6, 1., 0.5, 1.),
+                            ..TextRun::default()
+                        },
+                    ],
+                    None,
+                );
+                let original_width = line.width();
+                let origin = point(px(20.), px(20.));
+                window.next_frame.scene.clear();
+                line.paint(origin, px(20.), TextAlign::Left, None, window, cx)
+                    .unwrap();
+                let sprites = &window.next_frame.scene.polychrome_sprites;
+                assert_eq!(
+                    sprites.len(),
+                    2,
+                    "transparent text must not add its native emoji over an atlas sprite"
+                );
+                assert_eq!(
+                    sprites[0].opacity, 0.25,
+                    "run alpha multiplies ancestor opacity once"
+                );
+                assert_eq!(sprites[1].opacity, 0.5);
+                assert!(
+                    sprites.iter().all(|sprite| sprite.tint.a == 0.),
+                    "text RGB must not tint color emoji"
+                );
+                assert_eq!(
+                    sprites[0].bounds.origin.x.0,
+                    ((20. + line.runs[0].glyphs[1].position.x.0) * window.scale_factor()).round()
+                );
+                assert_eq!(
+                    sprites[1].bounds.origin.x.0,
+                    ((20. + line.runs[0].glyphs[3].position.x.0) * window.scale_factor()).round()
+                );
+                assert_eq!(
+                    window.next_frame.scene.monochrome_sprites.len(),
+                    1,
+                    "mixed ordinary text still paints"
+                );
+                assert_eq!(
+                    line.width(),
+                    original_width,
+                    "transparent emoji still advances layout"
+                );
+                assert_eq!(
+                    window.element_opacity(),
+                    0.5,
+                    "run alpha must not leak to later glyphs"
+                );
+            }))
+        });
+        context
+            .update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
     }
 
     #[test]
