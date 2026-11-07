@@ -730,6 +730,12 @@ pub struct Style {
     /// The `repeat(auto-fill | auto-fit, …)` run of [`Style::vn_grid_rows`].
     pub vn_grid_rows_auto: Option<GridAutoRepeat>,
 
+    /// CSS `grid-auto-columns`: a repeating pattern for implicit column tracks.
+    pub vn_grid_auto_cols: Option<Vec<GridTrack>>,
+
+    /// CSS `grid-auto-rows`: a repeating pattern for implicit row tracks.
+    pub vn_grid_auto_rows: Option<Vec<GridTrack>>,
+
     /// CSS `grid-auto-flow` — the direction the auto-placement algorithm fills,
     /// and whether it packs densely.
     pub vn_grid_auto_flow: Option<GridAutoFlow>,
@@ -1944,6 +1950,8 @@ impl Default for Style {
             vn_grid_rows: None,
             vn_grid_cols_auto: None,
             vn_grid_rows_auto: None,
+            vn_grid_auto_cols: None,
+            vn_grid_auto_rows: None,
             vn_grid_auto_flow: None,
             vn_justify_items: None,
             vn_justify_self: None,

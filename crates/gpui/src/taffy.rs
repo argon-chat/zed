@@ -572,6 +572,12 @@ impl ToTaffy<taffy::style::Style> for Style {
                 .unwrap_or_else(|| to_grid_repeat(&self.grid_rows)),
             grid_template_columns: to_grid_tracks(&self.vn_grid_cols, self.vn_grid_cols_auto)
                 .unwrap_or_else(|| to_grid_repeat(&self.grid_cols)),
+            grid_auto_columns: self.vn_grid_auto_cols.as_ref().map(|tracks| tracks.iter()
+                .map(|track| minmax(to_track_size_min(track.min), to_track_size_max(track.max)))
+                .collect()).unwrap_or_default(),
+            grid_auto_rows: self.vn_grid_auto_rows.as_ref().map(|tracks| tracks.iter()
+                .map(|track| minmax(to_track_size_min(track.min), to_track_size_max(track.max)))
+                .collect()).unwrap_or_default(),
             grid_auto_flow: match self.vn_grid_auto_flow.unwrap_or_default() {
                 crate::GridAutoFlow::Row => taffy::GridAutoFlow::Row,
                 crate::GridAutoFlow::Column => taffy::GridAutoFlow::Column,
@@ -874,6 +880,77 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_fractional_columns_share_the_container_width() {
+        let mut tree = TaffyTree::<()>::new();
+        let children: Vec<_> = (0..3).map(|_| tree.new_leaf(Default::default()).unwrap()).collect();
+        let style = Style {
+            display: crate::Display::Grid,
+            size: Size {
+                width: Length::Definite(Pixels(300.0).into()),
+                height: Length::Definite(Pixels(40.0).into()),
+            },
+            vn_grid_auto_flow: Some(crate::GridAutoFlow::Column),
+            vn_grid_auto_cols: Some(vec![crate::GridTrack::fr(1.0)]),
+            ..Default::default()
+        };
+        let root = tree.new_with_children(style.to_taffy(Pixels(16.0), 1.0), &children).unwrap();
+        tree.compute_layout(root, TaffySize {
+            width: TaffyAvailableSpace::Definite(300.0), height: TaffyAvailableSpace::Definite(40.0),
+        }).unwrap();
+        for (index, child) in children.into_iter().enumerate() {
+            let layout = tree.layout(child).unwrap();
+            assert_eq!(layout.size.width, 100.0);
+            assert_eq!(layout.location.x, index as f32 * 100.0);
+        }
+    }
+
+    #[test]
+    fn implicit_row_patterns_repeat_in_layout() {
+        use crate::GridTrackSize as Track;
+        let mut tree = TaffyTree::<()>::new();
+        let children: Vec<_> = (0..5).map(|_| tree.new_leaf(Default::default()).unwrap()).collect();
+        let style = Style {
+            display: crate::Display::Grid,
+            vn_grid_cols: Some(vec![crate::GridTrack::fixed(Track::Px(100.0))]),
+            vn_grid_auto_rows: Some(vec![crate::GridTrack::fixed(Track::Px(20.0)), crate::GridTrack::fixed(Track::Px(35.0))]),
+            ..Default::default()
+        };
+        let root = tree.new_with_children(style.to_taffy(Pixels(16.0), 1.0), &children).unwrap();
+        tree.compute_layout(root, TaffySize {
+            width: TaffyAvailableSpace::MaxContent, height: TaffyAvailableSpace::MaxContent,
+        }).unwrap();
+        for ((height, top), child) in [(20.0, 0.0), (35.0, 20.0), (20.0, 55.0), (35.0, 75.0), (20.0, 110.0)].into_iter().zip(children) {
+            let layout = tree.layout(child).unwrap();
+            assert_eq!(layout.size.height, height);
+            assert_eq!(layout.location.y, top);
+        }
+    }
+
+    #[test]
+    fn implicit_auto_reset_replaces_a_fixed_row_pattern() {
+        use crate::{GridTrack, GridTrackSize, Refineable, StyleRefinement};
+        let mut style = Style {
+            display: crate::Display::Grid,
+            vn_grid_cols: Some(vec![GridTrack::fixed(GridTrackSize::Px(100.0))]),
+            vn_grid_auto_rows: Some(vec![GridTrack::fixed(GridTrackSize::Px(50.0))]),
+            ..Default::default()
+        };
+        style.refine(&StyleRefinement { vn_grid_auto_rows: Some(Vec::new()), ..Default::default() });
+        let mut tree = TaffyTree::<()>::new();
+        let children: Vec<_> = [17.0, 29.0].into_iter().map(|height| {
+            let mut leaf_style = taffy::style::Style::default();
+            leaf_style.size.height = taffy::style::Dimension::length(height);
+            tree.new_leaf(leaf_style).unwrap()
+        }).collect();
+        let root = tree.new_with_children(style.to_taffy(Pixels(16.0), 1.0), &children).unwrap();
+        tree.compute_layout(root, TaffySize {
+            width: TaffyAvailableSpace::MaxContent, height: TaffyAvailableSpace::MaxContent,
+        }).unwrap();
+        assert_eq!(tree.layout(children[1]).unwrap().location.y, 17.0);
+        assert_eq!(tree.layout(root).unwrap().size.height, 46.0);
+    }
 
     #[test]
     fn border_widths_to_taffy_use_stroke_snapping() {
