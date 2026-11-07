@@ -2238,11 +2238,13 @@ impl Window {
                 }
                 last_frame_time.set(Some(now));
 
-                let pending_next_frame_callbacks = next_frame_callbacks.take();
-                if !pending_next_frame_callbacks.is_empty() {
+                if !next_frame_callbacks.borrow().is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
-                            for callback in pending_next_frame_callbacks {
+                            // A native frame request can re-enter while App is borrowed.
+                            // Keep the callbacks queued if updating the window fails,
+                            // or a self-rescheduling frame pump would be lost forever.
+                            for callback in next_frame_callbacks.take() {
                                 callback(window, cx);
                             }
                         })
@@ -10440,6 +10442,48 @@ mod tests {
             test_window.frame_scheduled(),
             "a rendered scene awaiting presentation must wake the render loop"
         );
+    }
+
+    #[gpui::test]
+    fn reentrant_frame_request_preserves_pending_callbacks(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+        let callback_count = Rc::new(Cell::new(0));
+
+        cx.update_window(window.into(), |_, window, _| {
+            window.active.set(true);
+            let callback_count = callback_count.clone();
+            window.on_next_frame(move |window, _| {
+                callback_count.set(callback_count.get() + 1);
+                window.on_next_frame(move |_, _| {
+                    callback_count.set(callback_count.get() + 1);
+                });
+            });
+        })
+        .unwrap();
+
+        // Win32 can deliver WM_PAINT from a nested native message loop while
+        // an input listener or host call still owns the App borrow.
+        let wake_count = test_window.frame_wake_count();
+        cx.update(|_| {
+            test_window.simulate_frame_request(RequestFrameOptions::default());
+        });
+        assert_eq!(callback_count.get(), 0);
+        cx.update_window(window.into(), |_, window, _| {
+            assert_eq!(window.next_frame_callbacks.borrow().len(), 1);
+        })
+        .unwrap();
+        assert!(
+            test_window.frame_wake_count() > wake_count,
+            "a deferred frame callback must wake the frame source for a retry"
+        );
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(callback_count.get(), 1);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(callback_count.get(), 2);
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(callback_count.get(), 2);
     }
 
     #[gpui::test]
