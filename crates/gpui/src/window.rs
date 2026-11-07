@@ -57,7 +57,7 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem,
-    ops::{Add, DerefMut, Div, Range, Sub},
+    ops::{Add, Div, Range, Sub},
     rc::Rc,
     sync::{
         Arc, Weak,
@@ -498,10 +498,10 @@ impl ArenaClearNeeded {
     /// reference.
     pub fn clear(self, cx: &mut App) {
         assert!(
-            std::ptr::eq(self.arena, &cx.element_arena),
+            std::ptr::eq(self.arena, &*cx.element_arena),
             "ArenaClearNeeded::clear called with a different App than the draw ran against"
         );
-        cx.element_arena.borrow_mut().clear();
+        RefCell::borrow_mut(&cx.element_arena).clear();
     }
 }
 
@@ -1204,6 +1204,9 @@ pub(crate) struct DeferredDraw {
     vn_clip: Option<Arc<crate::VnClipNode>>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The entities the deferred element accessed while it was last drawn, in
+    /// any phase, restored when its prepaint is reused.
+    accessed_entities: FxHashSet<EntityId>,
 }
 
 impl DeferredDraw {
@@ -4143,8 +4146,7 @@ impl Window {
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
-        let mut entities_ref = cx.entities.accessed_entities.get_mut();
-        let mut entities = mem::take(entities_ref.deref_mut());
+        let entities = cx.entities.take_accessed();
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,
@@ -4152,8 +4154,7 @@ impl Window {
             self.invalidator.clone(),
             &entities,
         );
-        let mut entities_ref = cx.entities.accessed_entities.get_mut();
-        mem::swap(&mut entities, entities_ref.deref_mut());
+        cx.entities.restore_accessed(entities);
     }
 
     fn invalidate_entities(&mut self) {
@@ -4515,26 +4516,20 @@ impl Window {
                     if let Some(parent) = a11y_parent {
                         self.a11y.nodes.begin_adopted(parent);
                     }
-                    self.with_rendered_view(current_view, |window| {
-                        window.with_rem_size(Some(rem_size), |window| {
-                            // The mask BEFORE the transform: it was captured in
-                            // window space, and `with_content_mask` maps what it
-                            // is given through whatever transform is in force.
-                            window.with_content_mask(content_mask, |window| {
-                                // vue-native fork: and the clip shapes, which
-                                // are in window space too.
-                                window.vn_with_absolute_clip_stack(vn_clip, |window| {
-                                window.with_absolute_element_opacity(element_opacity, |window| {
-                                    window.with_absolute_element_transform(
-                                        element_transform,
-                                        |window| {
-                                            window.with_absolute_element_offset(
-                                                absolute_offset,
-                                                |window| element.prepaint(window, cx),
-                                            );
-                                        },
-                                    );
-                                });
+                    let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                        self.with_rendered_view(current_view, |window| {
+                            window.with_rem_size(Some(rem_size), |window| {
+                                // Masks are captured before transforms, in window space.
+                                window.with_content_mask(content_mask, |window| {
+                                    window.vn_with_absolute_clip_stack(vn_clip, |window| {
+                                        window.with_absolute_element_opacity(element_opacity, |window| {
+                                            window.with_absolute_element_transform(element_transform, |window| {
+                                                window.with_absolute_element_offset(absolute_offset, |window| {
+                                                    element.prepaint(window, cx);
+                                                });
+                                            });
+                                        });
+                                    });
                                 });
                             });
                         });
@@ -4542,8 +4537,15 @@ impl Window {
                     if a11y_parent.is_some() {
                         self.a11y.nodes.end_adopted();
                     }
+                    self.next_frame.deferred_draws[deferred_draw_ix].accessed_entities = accessed_entities;
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
+                    cx.entities.extend_accessed(
+                        self.next_frame.deferred_draws[deferred_draw_ix]
+                            .accessed_entities
+                            .iter()
+                            .copied(),
+                    );
                     self.reuse_prepaint(prepaint_range);
                 }
                 let prepaint_end = self.prepaint_index();
@@ -4589,22 +4591,23 @@ impl Window {
             let element_opacity = deferred_draw.element_opacity;
             let vn_clip = deferred_draw.vn_clip.clone();
             if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    // Mask first, transform second — see the prepaint side.
-                    window.with_content_mask(content_mask, |window| {
-                        // vue-native fork: an isolated layer for each clip
-                        // shape the draw was deferred from inside.
-                        window.vn_reopen_clip_layers(vn_clip, |window| {
-                        window.with_absolute_element_opacity(element_opacity, |window| {
-                            window.with_absolute_element_transform(element_transform, |window| {
-                                window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                    element.paint(window, cx);
+                let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    self.with_rendered_view(deferred_draw.current_view, |window| {
+                        // Reopen inherited clipping and transforms in their original order.
+                        window.with_content_mask(content_mask, |window| {
+                            window.vn_reopen_clip_layers(vn_clip, |window| {
+                                window.with_absolute_element_opacity(element_opacity, |window| {
+                                    window.with_absolute_element_transform(element_transform, |window| {
+                                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                                            element.paint(window, cx);
+                                        });
+                                    });
                                 });
-                            })
-                        })
-                        })
-                    })
-                })
+                            });
+                        });
+                    });
+                });
+                deferred_draw.accessed_entities.extend(accessed_entities);
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
             }
@@ -4736,6 +4739,7 @@ impl Window {
                     vn_clip: deferred_draw.vn_clip.clone(),
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
+                    accessed_entities: deferred_draw.accessed_entities.clone(),
                 }),
         );
     }
@@ -5539,6 +5543,7 @@ impl Window {
             },
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
+            accessed_entities: FxHashSet::default(),
         });
     }
 
@@ -7231,9 +7236,10 @@ impl Window {
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
+            // A drag can start before the next paint records its cursor in the frame.
+            let style = cx
+                .active_drag_cursor_style()
+                .or_else(|| self.rendered_frame.cursor_style(self))
                 .unwrap_or(CursorStyle::Arrow);
             cx.platform.set_cursor_style(style);
         }
@@ -7658,11 +7664,7 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position(), self.scale_factor);
-        if hit_test != self.mouse_hit_test {
-            self.mouse_hit_test = hit_test;
-            self.reset_cursor_style(cx);
-        }
+        self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position(), self.scale_factor);
 
         // vue-native fork: the embedder narrows a press, a release or a wheel
         // to the hitboxes it is FOR, before anyone hears it.
@@ -7684,6 +7686,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
+            self.reset_cursor_style(cx);
             self.handle_inspector_mouse_event(event, cx);
             // When inspector is picking, all other mouse handling is skipped.
             return;
@@ -7731,6 +7734,10 @@ impl Window {
         if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
             self.captured_hitbox = None;
         }
+
+        // Runs after the listeners so that a drag they start takes effect in this event. Resolving
+        // the cursor any earlier would briefly select whatever is under the pointer instead.
+        self.reset_cursor_style(cx);
     }
 
     // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
@@ -9721,10 +9728,10 @@ mod tests {
 
     use crate::{
         AnyWindowHandle, AppContext as _, BackGestureEvent, BackGesturePhase, Bounds, ContentMask,
-        Context, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
+        Context, CursorStyle, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
         FileDragPaths, FileDropEvent, FocusHandle, InputEvent as _, InteractiveElement as _,
         IntoElement, KeyDownEvent, Keystroke, LongPressEvent, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, PlatformInput, Point, Render, RequestFrameOptions,
+        MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, PlatformInput, Point, Render, RequestFrameOptions,
         ScaledPixels, StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent,
         TouchEvent, TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance,
         WindowOptions, canvas, div, hsla, point, px, size,
@@ -11668,6 +11675,192 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn cached_view_follows_inherited_opacity(cx: &mut TestAppContext) {
+        struct Child {
+            renders: usize,
+        }
+
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                div().size_full().bg(crate::rgb(0xff0000))
+            }
+        }
+
+        struct Root {
+            opacity: f32,
+            width: Pixels,
+            child: crate::Entity<Child>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(self.width)
+                    .h(px(200.))
+                    .opacity(self.opacity)
+                    .hover(|style| style.opacity(1.))
+                    .child(
+                        self.child
+                            .clone()
+                            .cached(crate::StyleRefinement::default().size(px(100.))),
+                    )
+            }
+        }
+
+        /// Updates the root, draws until no more frames are requested, and returns the
+        /// child's painted alpha and how many times it has rendered.
+        fn update_and_draw(
+            window: crate::WindowHandle<Root>,
+            child: &crate::Entity<Child>,
+            cx: &mut TestAppContext,
+            update: impl FnOnce(&mut Root, &mut Window, &mut Context<Root>),
+        ) -> (f32, usize) {
+            window
+                .update(cx, |root, window, cx| {
+                    update(root, window, cx);
+                    cx.notify();
+                })
+                .expect("update root");
+            for _ in 0..3 {
+                let (alpha, renders, requested_frames) = cx
+                    .update_window(window.into(), |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        let quads = &window.rendered_frame.scene.quads;
+                        assert_eq!(quads.len(), 1);
+                        let alpha = quads.first().expect("child quad").background.solid.a;
+                        (
+                            alpha,
+                            child.read(cx).renders,
+                            window.simulate_next_frame(cx),
+                        )
+                    })
+                    .expect("draw window");
+                if requested_frames == 0 {
+                    return (alpha, renders);
+                }
+            }
+            panic!("cached child kept requesting frames");
+        }
+
+        let child = cx.new(|_| Child { renders: 0 });
+        let window = cx.add_window(|_, _| Root {
+            opacity: 1.,
+            width: px(200.),
+            child: child.clone(),
+        });
+        let outside = point(px(500.), px(500.));
+        let inside = point(px(50.), px(50.));
+        let beside = point(px(250.), px(50.));
+
+        // Changing the wrapper's opacity redraws the child; unchanged opacity reuses it.
+        let move_outside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(outside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_outside), (1., 1));
+        assert_eq!(update_and_draw(window, &child, cx, |_, _, _| {}), (1., 1));
+        let fade = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.opacity = 0.5;
+        assert_eq!(update_and_draw(window, &child, cx, fade), (0.5, 2));
+        assert_eq!(update_and_draw(window, &child, cx, |_, _, _| {}), (0.5, 2));
+
+        // Hover opacity applies when the mouse enters and leaves.
+        let move_inside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(inside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_inside).0, 1.);
+        let move_beside = |_: &mut Root, window: &mut Window, cx: &mut Context<Root>| {
+            window.simulate_mouse_move(beside, cx)
+        };
+        assert_eq!(update_and_draw(window, &child, cx, move_beside).0, 0.5);
+
+        // Widening the wrapper puts it under a still mouse, so only paint's hit test sees
+        // the hover.
+        let widen = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.width = px(300.);
+        assert_eq!(update_and_draw(window, &child, cx, widen).0, 1.);
+    }
+
+    #[gpui::test]
+    fn test_drag_cursor_applies_before_next_paint(cx: &mut TestAppContext) {
+        struct ResizeHandle;
+
+        impl Render for ResizeHandle {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().cursor_text().child(
+                    div()
+                        .id("resize-handle")
+                        .w(px(4.))
+                        .h_full()
+                        .cursor_col_resize()
+                        .on_drag((), |_, _, _, cx| cx.new(|_| Empty)),
+                )
+            }
+        }
+
+        let window = cx.add_window(|_, _| ResizeHandle);
+        let handle_position = point(px(1.), px(10.));
+        let drag_position = point(px(20.), px(10.));
+        let cursor_observer = cx.clone();
+
+        let update_result = cx.update_window(window.into(), |_, window, cx| {
+            window.hovered.set(true);
+            window.active.set(true);
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: handle_position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: handle_position,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: drag_position,
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.has_active_drag());
+            // Asserted here because leaving this update flushes effects, which paints a frame.
+            assert_eq!(
+                cursor_observer.test_platform().cursor_style(),
+                CursorStyle::ResizeColumn
+            );
+
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: drag_position,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to run drag: {update_result:?}"
+        );
+        assert_eq!(
+            cursor_observer.test_platform().cursor_style(),
+            CursorStyle::IBeam
+        );
     }
 }
 

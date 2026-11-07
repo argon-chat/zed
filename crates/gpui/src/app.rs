@@ -896,7 +896,12 @@ pub struct App {
 
     /// Per-App element arena. This isolates element allocations between different
     /// App instances (important for tests where multiple Apps run concurrently).
-    pub(crate) element_arena: RefCell<Arena>,
+    ///
+    /// Kept in its own allocation because draws reach it through a raw pointer
+    /// (`CURRENT_ELEMENT_ARENA`) while a `&mut App` is live. If it were stored
+    /// inline, those accesses would alias memory the `&mut App` claims
+    /// exclusively, which is undefined behavior.
+    pub(crate) element_arena: Rc<RefCell<Arena>>,
     /// Per-App event arena.
     pub(crate) event_arena: Arena,
 
@@ -1051,7 +1056,7 @@ impl App {
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
-                element_arena: RefCell::new(Arena::new(1024 * 1024)),
+                element_arena: Rc::new(RefCell::new(Arena::new(1024 * 1024))),
                 event_arena: Arena::new(1024 * 1024),
 
                 #[cfg(any(test, gpui_leak_detection))]
@@ -1413,16 +1418,9 @@ impl App {
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+        self.entities.push_access_scope();
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
-            .accessed_entities
-            .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+        (result, self.entities.pop_access_scope())
     }
 
     pub(crate) fn record_entities_accessed(

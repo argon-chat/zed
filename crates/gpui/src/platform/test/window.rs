@@ -7,7 +7,6 @@ use crate::{
     WindowVisibility,
 };
 use gpui_util::ResultExt as _;
-#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};

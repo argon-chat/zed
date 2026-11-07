@@ -317,11 +317,23 @@ const CANDIDATE_VKEYS: &[VIRTUAL_KEY] = &[
 #[cfg(test)]
 mod tests {
     use crate::WindowsKeyboardMapper;
+    use collections::HashMap;
     use gpui::{Keystroke, Modifiers, PlatformKeyboardMapper};
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_4;
 
     #[test]
     fn test_keyboard_mapper() {
-        let mapper = WindowsKeyboardMapper::new();
+        // These assertions cover US shift normalization. Production snapshots the
+        // active input layout, so using new() here would depend on the machine's
+        // layout (for example, Russian Shift+4 produces ';' instead of '$').
+        let mapper = WindowsKeyboardMapper {
+            key_to_vkey: HashMap::from_iter([
+                ("4".to_string(), (VK_4.0, false)),
+                ("$".to_string(), (VK_4.0, true)),
+            ]),
+            vkey_to_key: HashMap::from_iter([(VK_4.0, "4".to_string())]),
+            vkey_to_shifted: HashMap::from_iter([(VK_4.0, "$".to_string())]),
+        };
 
         // Normal case
         let keystroke = Keystroke {
@@ -342,6 +354,12 @@ mod tests {
         };
         let mapped = mapper.map_key_equivalent(keystroke.clone(), true);
         assert_eq!(*mapped.inner(), keystroke);
+        assert_eq!(mapped.key(), "4");
+        assert_eq!(*mapped.modifiers(), Modifiers::control_shift());
+
+        // Without US key equivalents, use the same fixture's reverse map.
+        let mapped = mapper.map_key_equivalent(keystroke, false);
+        assert_eq!(mapped.inner().key, "$");
         assert_eq!(mapped.key(), "4");
         assert_eq!(*mapped.modifiers(), Modifiers::control_shift());
 
