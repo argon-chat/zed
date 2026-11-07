@@ -9,6 +9,7 @@ use crate::{
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, px,
 };
 use std::{
+    collections::HashMap,
     fmt::Debug,
     iter::Peekable,
     mem,
@@ -69,6 +70,9 @@ pub struct Scene {
     vn_open: Vec<VnOpenGroup>,
     /// vue-native fork: the closed groups, until `finish` appends them.
     vn_groups: Vec<VnGroupLists>,
+    // Reopened deferred descendants append to one source before the matrix
+    // runs. Filtering separately changes translucent colors in linear RGB.
+    vn_color_groups: HashMap<u64, usize>,
     /// vue-native fork: where each group's primitives are after `finish`:
     /// the root at 0, then the groups a [`VnLayer::group`] names.
     vn_group_ranges: Vec<VnGroupRanges>,
@@ -80,6 +84,8 @@ pub struct Scene {
 pub struct VnIsolation {
     /// The clip shape.
     pub geometry: std::sync::Arc<crate::VnClipGeometry>,
+    /// A transform over the isolated source pixels before composition.
+    pub color_matrix: Option<crate::VnColorMatrix>,
     /// The content mask in force where the layer was opened; it cuts the
     /// composite as it cuts any primitive.
     pub content_mask: ContentMask<ScaledPixels>,
@@ -93,7 +99,7 @@ pub struct VnIsolation {
 /// by the content mask.
 ///
 /// Keep in sync with `struct VnLayer` in `gpui_windows/src/shaders.hlsl`
-/// (20 words); the renderer uploads this vector as it is.
+/// (40 words); the renderer uploads this vector as it is.
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[allow(missing_docs)]
@@ -105,6 +111,8 @@ pub struct VnLayer {
     pub segment_count: u32,
     pub fill_rule: u32,
     pub pad: [u32; 3],
+    /// Four coefficient rows and the bias column, matching the shader.
+    pub color_matrix: [f32; 20],
     /// The device pixels the composite covers: the shape's box, out to whole
     /// pixels and one more for the antialiased edge, cut by the mask.
     pub bounds: Bounds<ScaledPixels>,
@@ -200,6 +208,7 @@ struct VnOpenGroup {
     /// The lists of the group around this one.
     saved: VnGroupLists,
     isolation: VnIsolation,
+    existing_group: Option<usize>,
 }
 
 /// An entry on the scene's layer stack. The bounds are retained so that a
@@ -230,6 +239,7 @@ impl Scene {
         self.vn_clip_segments.clear();
         self.vn_open.clear();
         self.vn_groups.clear();
+        self.vn_color_groups.clear();
         self.vn_group_ranges.clear();
     }
 
@@ -266,7 +276,14 @@ impl Scene {
             .push(PaintOperation::VnStartIsolation(isolation.clone()));
         let mut saved = VnGroupLists::default();
         self.vn_swap_lists(&mut saved);
-        self.vn_open.push(VnOpenGroup { saved, isolation });
+        let existing_group = isolation.color_matrix.and_then(|matrix| {
+            (matrix.group_id != 0).then(|| self.vn_color_groups.get(&matrix.group_id).copied()).flatten()
+        });
+        if let Some(index) = existing_group {
+            let mut source = mem::take(&mut self.vn_groups[index]);
+            self.vn_swap_lists(&mut source);
+        }
+        self.vn_open.push(VnOpenGroup { saved, isolation, existing_group });
     }
 
     /// vue-native fork: whether an isolated layer is open.
@@ -287,6 +304,13 @@ impl Scene {
         };
         let mut group = open.saved;
         self.vn_swap_lists(&mut group);
+        if let Some(index) = open.existing_group {
+            // Its composite was inserted on the first paint. Appending source
+            // pixels here must neither filter them alone nor composite twice.
+            self.vn_groups[index] = group;
+            return;
+        }
+        let color_group = open.isolation.color_matrix.and_then(|matrix| (matrix.group_id != 0).then_some(matrix.group_id));
         let geometry = &open.isolation.geometry;
         let mask = open.isolation.content_mask;
         // The antialiased edge reaches half a pixel past the shape.
@@ -302,11 +326,12 @@ impl Scene {
             ),
         )
         .intersect(&mask.bounds);
-        if group.is_empty() || geometry.segments.is_empty() || bounds.is_empty() {
+        if (group.is_empty() && color_group.is_none()) || geometry.segments.is_empty() || bounds.is_empty() {
             return;
         }
-        group.primitive_bounds = BoundsTree::default();
+        if color_group.is_none() { group.primitive_bounds = BoundsTree::default(); }
         group.layer_stack = Vec::new();
+        if let Some(key) = color_group { self.vn_color_groups.insert(key, self.vn_groups.len()); }
         self.vn_groups.push(group);
         let segment_start = self.vn_clip_segments.len() as u32;
         self.vn_clip_segments.extend_from_slice(&geometry.segments);
@@ -321,7 +346,8 @@ impl Scene {
             segment_start,
             segment_count: geometry.segments.len() as u32,
             fill_rule: (geometry.fill_rule == crate::VnFillRule::EvenOdd) as u32,
-            pad: [0; 3],
+            pad: [open.isolation.color_matrix.map_or(0, |m| if m.linear_rgb { 1 } else { 2 }), 0, 0],
+            color_matrix: open.isolation.color_matrix.map_or([0.; 20], |matrix| matrix.gpu_values()),
             bounds,
             content_mask: mask,
         });
@@ -2195,5 +2221,96 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod vn_color_group_tests {
+    use super::*;
+    use crate::{VnColorMatrix, VnClipGeometry, VnFillRule, size};
+    use std::sync::Arc;
+
+    fn rectangle() -> Bounds<ScaledPixels> {
+        Bounds { origin: point(ScaledPixels(0.), ScaledPixels(0.)), size: size(ScaledPixels(100.), ScaledPixels(100.)) }
+    }
+
+    fn filter(id: u64) -> VnIsolation {
+        VnIsolation {
+            geometry: Arc::new(VnClipGeometry {
+                fill_rule: VnFillRule::NonZero,
+                segments: vec![[0., 0., 100., 0.], [100., 0., 100., 100.], [100., 100., 0., 100.], [0., 100., 0., 0.]],
+                bounds: rectangle(),
+            }),
+            color_matrix: Some(VnColorMatrix { group_id: id, values: VnColorMatrix::IDENTITY, linear_rgb: true }),
+            content_mask: ContentMask { bounds: rectangle(), ..Default::default() },
+        }
+    }
+
+    fn paint(scene: &mut Scene) {
+        scene.insert_primitive(Quad { bounds: rectangle(), content_mask: ContentMask { bounds: rectangle(), ..Default::default() }, ..Default::default() });
+    }
+
+    #[test]
+    fn deferred_source_is_composited_with_its_background_before_one_color_matrix() {
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(filter(1));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        scene.vn_push_isolation(filter(1));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        assert_eq!(scene.vn_layers.len(), 1, "one composite, not separately filtered translucent pieces");
+        assert_eq!(scene.vn_groups.len(), 1);
+        assert_eq!(scene.vn_groups[0].quads.len(), 2);
+        assert!(scene.vn_groups[0].quads[1].order > scene.vn_groups[0].quads[0].order, "deferred source blends over its earlier background");
+        let operations = 0..scene.len();
+        scene.finish();
+        assert_eq!(scene.vn_group_count(), 2);
+        let mut replay = Scene::default();
+        replay.replay(operations, &scene);
+        assert_eq!(replay.vn_layers.len(), 1, "cached operations rebuild the same keyed source");
+        assert_eq!(replay.vn_groups[0].quads.len(), 2);
+        replay.clear();
+        replay.vn_push_isolation(filter(1));
+        paint(&mut replay);
+        replay.vn_pop_isolation();
+        assert_eq!(replay.vn_groups[0].quads.len(), 1, "a new frame has no old source pixels");
+    }
+
+    #[test]
+    fn an_initially_empty_filter_keeps_its_composite_for_deferred_descendants() {
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(filter(1));
+        scene.vn_pop_isolation();
+        scene.vn_push_isolation(filter(1));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        assert_eq!(scene.vn_layers.len(), 1);
+        assert_eq!(scene.vn_groups.len(), 1);
+        assert_eq!(scene.vn_groups[0].quads.len(), 1);
+    }
+
+    #[test]
+    fn nested_filtered_sources_reopen_without_duplicate_inner_composites() {
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(filter(1));
+        paint(&mut scene);
+        scene.vn_push_isolation(filter(2));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        scene.vn_push_isolation(filter(1));
+        scene.vn_push_isolation(filter(2));
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        assert_eq!(scene.vn_layers.len(), 1, "only the outer composite belongs to the page");
+        assert_eq!(scene.vn_groups.len(), 2);
+        assert_eq!(scene.vn_groups[0].quads.len(), 2, "both inner source pieces share one filter");
+        assert_eq!(scene.vn_groups[1].vn_layers.len(), 1, "the inner filter composites once into the outer source");
+        scene.finish();
+        assert_eq!(scene.vn_group_count(), 3);
+        assert_eq!(scene.vn_layers.len(), 2);
     }
 }

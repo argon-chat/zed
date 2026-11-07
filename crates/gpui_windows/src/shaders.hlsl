@@ -1760,6 +1760,11 @@ struct VnLayer {
     uint pad0;
     uint pad1;
     uint pad2;
+    float4 color_row0;
+    float4 color_row1;
+    float4 color_row2;
+    float4 color_row3;
+    float4 color_bias;
     Bounds bounds;
     Bounds content_mask;
     Corners content_mask_radii;
@@ -1828,6 +1833,21 @@ float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
     coverage *= content_mask_coverage(input.position.xy, layer.content_mask, layer.content_mask_radii);
     // The layer is the size of the window: the texel under the pixel.
     float4 color = t_sprite.Load(int3(int2(input.position.xy), 0));
+    if (layer.pad0 != 0u) {
+        float4 straight = color.a > 0.0 ? float4(color.rgb / color.a, color.a) : 0.0;
+        if (layer.pad0 == 1u) {
+            straight.rgb = lerp(straight.rgb / 12.92,
+                pow((straight.rgb + 0.055) / 1.055, 2.4), step(0.04045, straight.rgb));
+        }
+        float4 filtered = saturate(float4(
+            dot(layer.color_row0, straight), dot(layer.color_row1, straight),
+            dot(layer.color_row2, straight), dot(layer.color_row3, straight)) + layer.color_bias);
+        if (layer.pad0 == 1u) {
+            filtered.rgb = lerp(filtered.rgb * 12.92,
+                1.055 * pow(filtered.rgb, 1.0 / 2.4) - 0.055, step(0.0031308, filtered.rgb));
+        }
+        color = float4(filtered.rgb * filtered.a, filtered.a);
+    }
     // Premultiplied over premultiplied (the path sprite blend).
     return color * coverage;
 }

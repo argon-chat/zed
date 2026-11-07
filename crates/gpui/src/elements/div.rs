@@ -2555,6 +2555,7 @@ impl Interactivity {
                         let outline = style.vn_clip_outline(bounds, window.rem_size());
                         window.with_content_mask(clip, |window| {
                         window.vn_with_clip_shape(outline.as_ref(), |window| {
+                        window.vn_with_color_matrix(style.vn_color_matrix, |window| {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
@@ -2576,6 +2577,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                        })
                         })
                         })
                     })

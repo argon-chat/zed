@@ -4913,6 +4913,39 @@ impl Window {
         ));
         let node = Arc::new(crate::VnClipNode {
             geometry,
+            color_matrix: None,
+            parent: self.vn_clip_stack.clone(),
+        });
+        let previous = self.vn_clip_stack.replace(node.clone());
+        let result = self.vn_with_clip_layer(&node, f);
+        self.vn_clip_stack = previous;
+        result
+    }
+
+    /// Applies an SVG color matrix to the entire painted subtree. The same
+    /// stack node is retained in prepaint so deferred descendants reopen it.
+    pub fn vn_with_color_matrix<R>(
+        &mut self,
+        matrix: Option<crate::VnColorMatrix>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(matrix) = matrix else { return f(self) };
+        let bounds = self.snapped_content_mask().bounds;
+        let left = bounds.origin.x.0;
+        let top = bounds.origin.y.0;
+        let right = left + bounds.size.width.0;
+        let bottom = top + bounds.size.height.0;
+        let geometry = Arc::new(crate::VnClipGeometry {
+            fill_rule: crate::VnFillRule::NonZero,
+            segments: vec![
+                [left, top, right, top], [right, top, right, bottom],
+                [right, bottom, left, bottom], [left, bottom, left, top],
+            ],
+            bounds,
+        });
+        let node = Arc::new(crate::VnClipNode {
+            geometry,
+            color_matrix: Some(matrix),
             parent: self.vn_clip_stack.clone(),
         });
         let previous = self.vn_clip_stack.replace(node.clone());
@@ -4934,6 +4967,7 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
             geometry: node.geometry.clone(),
+            color_matrix: node.color_matrix,
             content_mask,
         });
         let result = f(self);
@@ -4972,6 +5006,7 @@ impl Window {
                 let content_mask = window.snapped_content_mask();
                 window.next_frame.scene.vn_push_isolation(crate::VnIsolation {
                     geometry: node.geometry.clone(),
+                    color_matrix: node.color_matrix,
                     content_mask,
                 });
             }
@@ -5464,7 +5499,11 @@ impl Window {
                 .then(|| self.a11y.nodes.current_id()),
             vn_stack: stack_key,
             element_opacity: self.element_opacity,
-            vn_clip: content_mask.is_some().then(|| self.vn_clip_stack.clone()).flatten(),
+            vn_clip: if content_mask.is_some() {
+                self.vn_clip_stack.clone()
+            } else {
+                crate::VnClipNode::color_filters(&self.vn_clip_stack)
+            },
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });

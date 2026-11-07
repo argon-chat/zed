@@ -257,6 +257,36 @@ impl VnClipGeometry {
     }
 }
 
+/// An SVG feColorMatrix over unpremultiplied RGBA components.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VnColorMatrix {
+    /// Stable identity of the filtered element within this window's scene.
+    /// Zero keeps independently composited layers for callers without an ID.
+    pub group_id: u64,
+    /// Four rows of five coefficients, in SVG order.
+    pub values: [f32; 20],
+    /// SVG filters use linear RGB unless color-interpolation-filters is sRGB.
+    pub linear_rgb: bool,
+}
+
+impl VnColorMatrix {
+    /// The identity transform.
+    pub const IDENTITY: [f32; 20] = [
+        1., 0., 0., 0., 0., 0., 1., 0., 0., 0.,
+        0., 0., 1., 0., 0., 0., 0., 0., 1., 0.,
+    ];
+
+    /// Four float4 coefficient rows followed by a float4 bias, for the GPU.
+    pub fn gpu_values(self) -> [f32; 20] {
+        let mut packed = [0.; 20];
+        for row in 0..4 {
+            packed[row * 4..row * 4 + 4].copy_from_slice(&self.values[row * 5..row * 5 + 4]);
+            packed[16 + row] = self.values[row * 5 + 4];
+        }
+        packed
+    }
+}
+
 /// vue-native fork: a clip shape in force, and the ones around it — what a
 /// hitbox, a deferred draw and the window's clip stack carry, so a press
 /// outside any of them misses (CSS Masking 1 §5).
@@ -264,6 +294,8 @@ impl VnClipGeometry {
 pub struct VnClipNode {
     /// This clip's shape, in window device pixels.
     pub geometry: Arc<VnClipGeometry>,
+    /// A color transform applied when this isolated layer is composited.
+    pub color_matrix: Option<VnColorMatrix>,
     /// The clip around this one, if any.
     pub parent: Option<Arc<VnClipNode>>,
 }
@@ -292,12 +324,29 @@ impl VnClipNode {
         chain
     }
 
+    /// Fixed-position descendants can escape geometric clips, but remain in
+    /// their ancestors' color-filter groups until those groups composite.
+    pub fn color_filters(clip: &Option<Arc<VnClipNode>>) -> Option<Arc<VnClipNode>> {
+        let Some(clip) = clip else { return None };
+        let mut parent = None;
+        for node in Self::outermost_first(clip) {
+            if node.color_matrix.is_some() {
+                parent = Some(Arc::new(Self {
+                    geometry: node.geometry.clone(),
+                    color_matrix: node.color_matrix,
+                    parent,
+                }));
+            }
+        }
+        parent
+    }
+
     /// Two chains are the same clip: the same shapes, nested the same way.
     pub fn same(a: &Option<Arc<VnClipNode>>, b: &Option<Arc<VnClipNode>>) -> bool {
         match (a, b) {
             (None, None) => true,
             (Some(a), Some(b)) => {
-                Arc::ptr_eq(a, b) || (a.geometry == b.geometry && VnClipNode::same(&a.parent, &b.parent))
+                Arc::ptr_eq(a, b) || (a.geometry == b.geometry && a.color_matrix == b.color_matrix && VnClipNode::same(&a.parent, &b.parent))
             }
             _ => false,
         }
@@ -400,6 +449,22 @@ mod tests {
         }
         v.push(Close);
         v
+    }
+
+    #[test]
+    fn color_matrix_gpu_rows_and_bias_match_the_layer_shader() {
+        let matrix = VnColorMatrix {
+            group_id: 1,
+            values: std::array::from_fn(|index| index as f32),
+            linear_rgb: true,
+        };
+        assert_eq!(matrix.gpu_values(), [
+            0., 1., 2., 3., 5., 6., 7., 8., 10., 11., 12., 13., 15., 16., 17., 18.,
+            4., 9., 14., 19.,
+        ]);
+        assert_eq!(std::mem::size_of::<crate::VnLayer>(), 160);
+        assert_eq!(std::mem::offset_of!(crate::VnLayer, color_matrix), 32);
+        assert_eq!(std::mem::offset_of!(crate::VnLayer, bounds), 112);
     }
 
     #[test]
@@ -528,8 +593,8 @@ mod tests {
             1.,
             TransformationMatrix::unit(),
         ));
-        let outer = Arc::new(VnClipNode { geometry: left.clone(), parent: None });
-        let inner = Arc::new(VnClipNode { geometry: right.clone(), parent: Some(outer.clone()) });
+        let outer = Arc::new(VnClipNode { geometry: left.clone(), color_matrix: None, parent: None });
+        let inner = Arc::new(VnClipNode { geometry: right.clone(), color_matrix: None, parent: Some(outer.clone()) });
         assert!(inner.contains([50., 10.]));
         assert!(!inner.contains([10., 10.]) && !inner.contains([90., 10.]));
         assert_eq!(VnClipNode::outermost_first(&inner).len(), 2);
@@ -537,9 +602,29 @@ mod tests {
         // The same shapes rebuilt are the same clip; a different one is not.
         let rebuilt = Some(Arc::new(VnClipNode {
             geometry: Arc::new((*right).clone()),
-            parent: Some(Arc::new(VnClipNode { geometry: Arc::new((*left).clone()), parent: None })),
+            color_matrix: None,
+            parent: Some(Arc::new(VnClipNode { geometry: Arc::new((*left).clone()), color_matrix: None, parent: None })),
         }));
         assert!(VnClipNode::same(&Some(inner.clone()), &rebuilt));
         assert!(!VnClipNode::same(&Some(inner), &Some(outer)));
     }
+
+    #[test]
+    fn fixed_escapes_preserve_color_groups_while_dropping_geometric_clips() {
+        let geometry = Arc::new(VnClipGeometry::new(
+            &outline(VnFillRule::NonZero, square(0., 0., 100., true)),
+            1., TransformationMatrix::unit(),
+        ));
+        let clip = Arc::new(VnClipNode { geometry: geometry.clone(), color_matrix: None, parent: None });
+        let filter = Arc::new(VnClipNode {
+            geometry: geometry.clone(),
+            color_matrix: Some(VnColorMatrix { group_id: 7, values: VnColorMatrix::IDENTITY, linear_rgb: true }),
+            parent: Some(clip),
+        });
+        let inside = Some(Arc::new(VnClipNode { geometry, color_matrix: None, parent: Some(filter) }));
+        let retained = VnClipNode::color_filters(&inside).expect("filter retained");
+        assert_eq!(retained.color_matrix.expect("matrix").group_id, 7);
+        assert!(retained.parent.is_none(), "geometric clipping is escaped");
+    }
+
 }

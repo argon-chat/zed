@@ -777,6 +777,9 @@ pub struct Style {
     /// test, inside its `transform`.
     pub vn_clip_path: VnClipPath,
 
+    /// SVG color filtering of the whole painted subtree.
+    pub vn_color_matrix: Option<crate::VnColorMatrix>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -1559,13 +1562,19 @@ impl Style {
             return window.with_element_transform(transformation, |window| {
                 window.with_content_mask(clip, |window| {
                     window.vn_with_clip_shape(outline.as_ref(), |window| {
-                        self.paint_untransformed(bounds, window, cx, continuation)
+                        window.vn_with_color_matrix(self.vn_color_matrix, |window| {
+                            self.paint_untransformed(bounds, window, cx, continuation)
+                        })
                     })
                 })
             });
         }
         window.with_content_mask(clip, |window| {
-            window.vn_with_clip_shape(outline.as_ref(), |window| self.paint_untransformed(bounds, window, cx, continuation))
+            window.vn_with_clip_shape(outline.as_ref(), |window| {
+                window.vn_with_color_matrix(self.vn_color_matrix, |window| {
+                    self.paint_untransformed(bounds, window, cx, continuation)
+                })
+            })
         })
     }
 
@@ -1893,6 +1902,7 @@ impl Default for Style {
             vn_outline: None,
             vn_mask_ring: false,
             vn_clip_path: VnClipPath::None,
+            vn_color_matrix: None,
             vn_corner_radii: Corners::default(),
 
             #[cfg(debug_assertions)]
