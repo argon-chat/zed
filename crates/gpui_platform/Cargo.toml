@@ -13,7 +13,9 @@ path = "src/gpui_platform.rs"
 doctest = false
 
 [features]
-default = ["multithreaded"]
+default = ["multithreaded", "windows-manifest"]
+# Embedding applications can provide their own executable manifest.
+windows-manifest = ["gpui/windows-manifest"]
 # Threads in the browser: needs a nightly toolchain and a cross-origin-isolated
 # page. Off, gpui_web builds on stable.
 multithreaded = ["gpui_web/multithreaded"]
@@ -58,7 +60,6 @@ gpui_ios.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows.workspace = true
-gpui = { workspace = true, features = ["windows-manifest"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_linux.workspace = true
