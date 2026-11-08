@@ -53,6 +53,8 @@ use std::sync::{Arc, OnceLock};
 /// `keep_alive` retains the physical owner until every GPUI clone is dropped.
 /// The factory is called again during device-lost recovery; it must retire the
 /// previous generation and notify any other clients that shared that device.
+/// A factory error falls back to native DirectX; the provider must clear any
+/// partially published shared state before returning an error.
 pub struct ExternalDirectXDevice {
     pub adapter: IDXGIAdapter1,
     pub dxgi_factory: IDXGIFactory6,
@@ -128,21 +130,30 @@ pub(crate) struct DirectXDevices {
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
         if let Some(factory) = DEVICE_FACTORY.get() {
-            let external = factory().context("Creating embedder-owned DirectX devices")?;
-            let mt = external
-                .device
-                .cast::<ID3D11Multithread>()
-                .context("Shared renderer requires D3D11 multithread protection")?;
-            let _ = unsafe { mt.SetMultithreadProtected(true) };
-            publish_device(&external.device);
-            return Ok(Self {
-                adapter: external.adapter,
-                dxgi_factory: external.dxgi_factory,
-                device: external.device,
-                device_context: external.device_context,
-                _external_owner: Some(external.keep_alive),
-            });
+            return create_with_fallback(
+                || Self::from_external(factory().context("Creating embedder-owned DirectX devices")?),
+                Self::new_native,
+            );
         }
+        Self::new_native()
+    }
+
+    fn from_external(external: ExternalDirectXDevice) -> Result<Self> {
+        let multithread = external.device.cast::<ID3D11Multithread>()
+            .context("Shared renderer requires D3D11 multithread protection")?;
+        let previously_protected = unsafe { multithread.SetMultithreadProtected(true) };
+        log::debug!("Shared D3D11 multithread protection was {}", previously_protected.as_bool());
+        publish_device(&external.device);
+        Ok(Self {
+            adapter: external.adapter,
+            dxgi_factory: external.dxgi_factory,
+            device: external.device,
+            device_context: external.device_context,
+            _external_owner: Some(external.keep_alive),
+        })
+    }
+
+    fn new_native() -> Result<Self> {
         let debug_layer_available = check_debug_layer_available();
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
@@ -185,6 +196,45 @@ impl DirectXDevices {
             device_context,
             _external_owner: None,
         })
+    }
+}
+
+// Shared D3D12 support must not become a prerequisite for opening a D3D11 UI.
+fn create_with_fallback<T>(factory: impl FnOnce() -> Result<T>, fallback: impl FnOnce() -> Result<T>) -> Result<T> {
+    match factory() {
+        Ok(device) => Ok(device),
+        Err(error) => {
+            log::warn!("Shared DirectX initialization failed ({error:#}); using native DirectX");
+            fallback()
+        }
+    }
+}
+
+#[cfg(test)]
+mod factory_fallback_tests {
+    use std::cell::Cell;
+
+    #[test]
+    fn a_shared_device_success_does_not_create_a_second_device() {
+        let used = Cell::new(false);
+        let result = super::create_with_fallback(|| Ok(7), || { used.set(true); Ok(9) });
+        assert_eq!(result.expect("shared device"), 7);
+        assert!(!used.get());
+    }
+
+    #[test]
+    fn unavailable_shared_device_uses_native_renderer() {
+        let result = super::create_with_fallback(|| Err(anyhow::anyhow!("D3D12 unavailable")), || Ok(9));
+        assert_eq!(result.expect("native renderer"), 9);
+    }
+
+    #[test]
+    fn failure_of_both_paths_preserves_the_native_error() {
+        let result = super::create_with_fallback::<i32>(
+            || Err(anyhow::anyhow!("D3D12 unavailable")),
+            || Err(anyhow::anyhow!("D3D11 unavailable")),
+        );
+        assert!(result.expect_err("neither device exists").to_string().contains("D3D11 unavailable"));
     }
 }
 
