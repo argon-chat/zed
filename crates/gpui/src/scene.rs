@@ -1408,6 +1408,16 @@ pub struct TransformSpec {
     pub rotate: f32,
     /// `scale()` about the element's centre. `(1.0, 1.0)` is no scale.
     pub scale: (f32, f32),
+    /// Upper-right coefficient of the linear matrix before rotation:
+    /// `R * [[scale.x, shear], [0, scale.y]]`. Unlike a tangent multiplied by
+    /// scale.y this also represents finite rank-one/zero-scale matrices.
+    #[serde(default)]
+    pub shear: f32,
+    /// Ordered transform lists can mix pixel translations with percentages of
+    /// either box axis. When present, each row is `[pixels, width, height]`
+    /// and replaces `translate` at paint time. Ordinary TRS lists need none.
+    #[serde(default)]
+    pub translation_basis: Option<[[f32; 3]; 2]>,
     /// `transform-origin`, per axis, relative to the element's own border box —
     /// the point `rotate()` and `scale()` act about. CSS's initial value is
     /// `50% 50%`, i.e. `(Fraction(0.5), Fraction(0.5))`, which is what
@@ -1494,6 +1504,8 @@ impl TransformSpec {
         rotate: 0.0,
         scale: (1.0, 1.0),
         origin: Self::CENTRE_ORIGIN,
+        shear: 0.0,
+        translation_basis: None,
     };
 
     /// CSS's initial `transform-origin: 50% 50%`.
@@ -1508,10 +1520,26 @@ impl TransformSpec {
     pub fn is_identity(&self) -> bool {
         self.rotate == 0.0
             && self.scale == (1.0, 1.0)
-            && self.translate.0.is_zero()
-            && self.translate.1.is_zero()
+            && self.shear == 0.0
+            && match self.translation_basis {
+                Some(basis) => basis.iter().flatten().all(|v| *v == 0.0),
+                None => self.translate.0.is_zero() && self.translate.1.is_zero(),
+            }
     }
 
+    fn translation_coefficients(&self) -> [[f32; 3]; 2] {
+        self.translation_basis.unwrap_or_else(|| {
+            let x = match self.translate.0 {
+                TransformLength::Pixels(v) => [v, 0.0, 0.0],
+                TransformLength::Fraction(v) => [0.0, v, 0.0],
+            };
+            let y = match self.translate.1 {
+                TransformLength::Pixels(v) => [v, 0.0, 0.0],
+                TransformLength::Fraction(v) => [0.0, 0.0, v],
+            };
+            [x, y]
+        })
+    }
     /// Componentwise interpolation, which is what a browser does when both
     /// sides are the same function list: `rotate(0deg)` → `rotate(90deg)`
     /// sweeps through 45°, not through the matrix entries (which would shear).
@@ -1523,6 +1551,12 @@ impl TransformSpec {
                 self.translate.1.interpolate(other.translate.1, t),
             ),
             rotate: lerp(self.rotate, other.rotate),
+            shear: lerp(self.shear, other.shear),
+            translation_basis: if self.translation_basis.is_some() || other.translation_basis.is_some() {
+                let a = self.translation_coefficients();
+                let b = other.translation_coefficients();
+                Some(std::array::from_fn(|row| std::array::from_fn(|column| lerp(a[row][column], b[row][column]))))
+            } else { None },
             scale: (
                 lerp(self.scale.0, other.scale.0),
                 lerp(self.scale.1, other.scale.1),
@@ -1549,16 +1583,15 @@ impl TransformSpec {
                 px(self.origin.0.resolve(bounds.size.width.0)),
                 px(self.origin.1.resolve(bounds.size.height.0)),
             );
-        let translate = Point::new(
-            px(self.translate.0.resolve(bounds.size.width.0)),
-            px(self.translate.1.resolve(bounds.size.height.0)),
-        );
+        let coefficients = self.translation_coefficients();
+        let resolve = |row: [f32; 3]| px(row[0] + row[1] * bounds.size.width.0 + row[2] * bounds.size.height.0);
+        let translate = Point::new(resolve(coefficients[0]), resolve(coefficients[1]));
         TransformationMatrix::unit()
             .translate((anchor + translate).scale(scale_factor))
             .rotate(Radians(self.rotate))
-            .scale(Size {
-                width: self.scale.0,
-                height: self.scale.1,
+            .compose(TransformationMatrix {
+                rotation_scale: [[self.scale.0, self.shear], [0.0, self.scale.1]],
+                translation: [0.0, 0.0],
             })
             .translate(anchor.scale(-scale_factor))
     }
