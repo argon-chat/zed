@@ -6528,6 +6528,35 @@ impl Window {
         })
     }
 
+    /// Writes a GPU frame while retaining its producer until the asynchronous
+    /// atlas copy completes. See [`PlatformAtlas::upload_from_d3d12`].
+    pub fn write_image_tile_d3d12(
+        &mut self,
+        image: &RenderImage,
+        frame_index: usize,
+        texture: crate::D3D12TextureHandle,
+        owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<TileWrite> {
+        let key: AtlasKey = RenderImageParams {
+            image_id: image.id,
+            frame_index,
+        }
+        .into();
+        let before = self.sprite_atlas.tile(&key);
+        let Some(after) = self.sprite_atlas.upload_from_d3d12(
+            &key,
+            image.size(frame_index),
+            texture,
+            owner,
+        )? else {
+            return Ok(TileWrite::Refused);
+        };
+        Ok(match before {
+            Some(tile) if tile == after => TileWrite::InPlace,
+            _ => TileWrite::Placed,
+        })
+    }
+
     /// vue-native fork: presents the frame already drawn once more, with no
     /// layout, prepaint or paint: the renderer encodes the same scene again, so
     /// an atlas tile overwritten in place since ([`Window::write_image_tile`],

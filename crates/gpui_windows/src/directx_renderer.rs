@@ -23,6 +23,7 @@ use crate::directx_renderer::shader_resources::{
     EffectShader, RawShaderBytes, ShaderModule, ShaderTarget,
 };
 use crate::*;
+use crate::{directx_atlas::DirectXAtlas, directx_devices::DirectXDevices};
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
@@ -2959,7 +2960,7 @@ pub(crate) mod shader_resources {
     /// Reads `$VN_EFFECTS_DIR/effects.json`. Absent variable, absent file and
     /// unreadable file all mean "this app has no effects of its own" — the
     /// built-ins are unaffected either way.
-    pub(super) fn dynamic_effects() -> Vec<DynamicEffect> {
+    pub(crate) fn dynamic_effects() -> Vec<DynamicEffect> {
         let Some(dir) = std::env::var_os(EFFECTS_DIR_ENV).filter(|d| !d.is_empty()) else {
             return Vec::new();
         };
@@ -3021,7 +3022,7 @@ pub(crate) mod shader_resources {
     ///
     /// `#line` directives in the generated HLSL name the author's `.slang`, so
     /// an fxc diagnostic here points at their source, not at slangc's output.
-    pub(super) fn compile_hlsl_file(path: &Path, entry: &str, target: &str) -> Result<ID3DBlob> {
+    pub(crate) fn compile_hlsl_file(path: &Path, entry: &str, target: &str) -> Result<ID3DBlob> {
         unsafe {
             use windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,

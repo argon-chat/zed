@@ -1,6 +1,20 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    // Native D3D12 embeds SM5.1 HLSL in debug and release alike. Export the
+    // same resolved directory used by the legacy release shader compiler.
+    let effects_generated = effects_generated_dir();
+    println!("cargo:rerun-if-env-changed=VN_EFFECTS_GENERATED_DIR");
+    println!(
+        "cargo:rustc-env=GPUI_D3D12_EFFECTS_HLSL_DIR={}",
+        effects_generated.display()
+    );
+    for effect in ["frost", "noise", "glow"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            effects_generated.join(format!("{effect}.hlsl")).display()
+        );
+    }
     #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
     println!("cargo:rerun-if-changed=build.rs");
     #[cfg(target_os = "windows")]
@@ -8,6 +22,21 @@ fn main() {
         // Compile HLSL shaders
         #[cfg(not(debug_assertions))]
         compile_shaders();
+    }
+}
+
+fn effects_generated_dir() -> std::path::PathBuf {
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let generated = match std::env::var("VN_EFFECTS_GENERATED_DIR") {
+        Ok(directory) => std::path::PathBuf::from(directory),
+        Err(_) => manifest_dir.join("../../../../crates/vn-effects/generated"),
+    };
+    // include_str! resolves relative names beside its Rust source, whereas
+    // fxc runs from CARGO_MANIFEST_DIR. Make the shared contract absolute.
+    if generated.is_absolute() {
+        generated
+    } else {
+        manifest_dir.join(generated)
     }
 }
 
@@ -92,12 +121,8 @@ mod shader_compilation {
     ///   keeps `cargo build` free of any dependency on slangc.
     fn compile_effect_shaders(out_dir: &str, fxc_path: &str, rust_binding_path: &str) {
         let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        let generated = match std::env::var("VN_EFFECTS_GENERATED_DIR") {
-            Ok(dir) => PathBuf::from(dir),
-            Err(_) => manifest_dir.join("../../../../crates/vn-effects/generated"),
-        };
+        let generated = super::effects_generated_dir();
         let vertex_path = manifest_dir.join("src/effects.hlsl");
-        println!("cargo:rerun-if-env-changed=VN_EFFECTS_GENERATED_DIR");
         println!("cargo:rerun-if-changed={}", vertex_path.display());
 
         let output_file = format!("{}/effect_vs.h", out_dir);

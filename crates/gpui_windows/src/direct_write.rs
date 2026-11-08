@@ -14,16 +14,20 @@ use windows::{
     Win32::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
-        Graphics::{
-            Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, Direct3D11::*, DirectWrite::*,
-            Dxgi::Common::*, Gdi::LOGFONTW,
-        },
+        Graphics::{DirectWrite::*, Gdi::LOGFONTW},
         System::SystemServices::LOCALE_NAME_MAX_LENGTH,
         UI::WindowsAndMessaging::*,
     },
     core::*,
 };
 use windows_numerics::Vector2;
+
+#[cfg(feature = "native-dx12")]
+use crate::directx12::glyphs::{GPUState, GlyphLayerTexture};
+#[cfg(not(feature = "native-dx12"))]
+use windows::Win32::Graphics::{
+    Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, Direct3D11::*, Dxgi::Common::*,
+};
 
 use crate::*;
 use gpui::*;
@@ -96,6 +100,7 @@ impl Drop for DirectWriteComponents {
     }
 }
 
+#[cfg(not(feature = "native-dx12"))]
 struct GPUState {
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
@@ -124,6 +129,7 @@ struct DirectWriteState {
     composed: HashMap<String, FamilyComposer>,
 }
 
+#[cfg(not(feature = "native-dx12"))]
 impl GPUState {
     fn new(directx_devices: &DirectXDevices) -> Result<Self> {
         let device = directx_devices.device.clone();
@@ -1323,10 +1329,9 @@ impl DirectWriteState {
         params: &RenderGlyphParams,
         glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<Vec<u8>> {
-        // INVARIANT: the code below drives the *shared* D3D11 immediate context
-        // (`Map`/`Unmap`/`Draw`/`CopyResource`), which `DirectXRenderer` and `DirectXAtlas` also
-        // touch. An immediate `ID3D11DeviceContext` is not thread-safe, so this must only run on
-        // the main UI thread (which it always is; text rasterization never leaves that thread).
+        // D3D11 uses the shared immediate context on the UI thread. The
+        // native D3D12 backend serializes its mask uploads and composition on
+        // the platform queue and waits only for the glyph's readback fence.
         let gpu_state = self
             .gpu_state
             .as_ref()
@@ -1443,59 +1448,67 @@ impl DirectWriteState {
             }
         }
 
-        let render_target_texture = {
-            let mut texture = None;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: bitmap_size.width.0 as u32,
-                Height: bitmap_size.height.0 as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
+        #[cfg(feature = "native-dx12")]
+        {
+            gpu_state.composite_color_layers(&glyph_layers, bitmap_size)
+        }
+        #[cfg(not(feature = "native-dx12"))]
+        {
+            let render_target_texture = {
+                let mut texture = None;
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: bitmap_size.width.0 as u32,
+                    Height: bitmap_size.height.0 as u32,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                unsafe {
+                    gpu_state
+                        .device
+                        .CreateTexture2D(&desc, None, Some(&mut texture))
+                }?;
+                texture.unwrap()
             };
-            unsafe {
-                gpu_state
-                    .device
-                    .CreateTexture2D(&desc, None, Some(&mut texture))
-            }?;
-            texture.unwrap()
-        };
 
-        let render_target_view = {
-            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
-                },
+            let render_target_view = {
+                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                    },
+                };
+                let mut rtv = None;
+                unsafe {
+                    gpu_state.device.CreateRenderTargetView(
+                        &render_target_texture,
+                        Some(&desc),
+                        Some(&mut rtv),
+                    )
+                }?;
+                rtv
             };
-            let mut rtv = None;
-            unsafe {
-                gpu_state.device.CreateRenderTargetView(
-                    &render_target_texture,
-                    Some(&desc),
-                    Some(&mut rtv),
-                )
-            }?;
-            rtv
-        };
 
-        Self::composite_color_layers(
-            gpu_state,
-            &glyph_layers,
-            bitmap_size,
-            &render_target_texture,
-            &render_target_view,
-        )
+            Self::composite_color_layers(
+                gpu_state,
+                &glyph_layers,
+                bitmap_size,
+                &render_target_texture,
+                &render_target_view,
+            )
+        }
     }
 
+    #[cfg(not(feature = "native-dx12"))]
     fn composite_color_layers(
         gpu_state: &GPUState,
         glyph_layers: &[GlyphLayerTexture],
@@ -1732,6 +1745,7 @@ impl DirectWriteState {
     }
 }
 
+#[cfg(not(feature = "native-dx12"))]
 struct GlyphLayerTexture {
     run_color: Rgba,
     bounds: Bounds<i32>,
@@ -1740,6 +1754,7 @@ struct GlyphLayerTexture {
     _texture: ID3D11Texture2D,
 }
 
+#[cfg(not(feature = "native-dx12"))]
 impl GlyphLayerTexture {
     fn new(
         gpu_state: &GPUState,
@@ -1804,6 +1819,7 @@ impl GlyphLayerTexture {
     }
 }
 
+#[cfg(not(feature = "native-dx12"))]
 #[repr(C)]
 struct GlyphLayerTextureParams {
     bounds: Bounds<i32>,
@@ -2218,7 +2234,11 @@ fn axes_at_optical_size(
 /// "leave this font exactly as it was".
 unsafe fn read_variations(
     font_face: &IDWriteFontFace3,
-) -> (Vec<DWRITE_FONT_AXIS_VALUE>, Option<IDWriteFontResource>, bool) {
+) -> (
+    Vec<DWRITE_FONT_AXIS_VALUE>,
+    Option<IDWriteFontResource>,
+    bool,
+) {
     let Ok(face) = font_face.cast::<IDWriteFontFace5>() else {
         return (Vec::new(), None, false);
     };
@@ -2514,20 +2534,26 @@ fn is_line_separator(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture};
+    #[cfg(not(feature = "native-dx12"))]
+    use super::DirectWriteState;
+    use super::{DirectWriteTextSystem, GPUState, GlyphLayerTexture};
+    use crate::DirectXDevices;
     use crate::direct_write::ClusterAnalyzer;
-    use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
         DevicePixels, Font, FontWeight, PlatformTextSystem, RenderGlyphParams, Rgba, TextRun,
         TextSystem, WindowTextSystem, bounds, point, px, size,
     };
-    use std::{ffi::c_void, sync::Arc};
+    #[cfg(not(feature = "native-dx12"))]
+    use std::ffi::c_void;
+    use std::sync::Arc;
+    #[cfg(not(feature = "native-dx12"))]
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
         D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
+    #[cfg(not(feature = "native-dx12"))]
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     #[test]
@@ -2701,7 +2727,10 @@ mod tests {
             DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, DWRITE_FONT_AXIS_TAG_WEIGHT, DWRITE_FONT_AXIS_VALUE,
         };
 
-        let axis = |tag, value| DWRITE_FONT_AXIS_VALUE { axisTag: tag, value };
+        let axis = |tag, value| DWRITE_FONT_AXIS_VALUE {
+            axisTag: tag,
+            value,
+        };
         let inter_bold = [
             axis(DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE, 14.0),
             axis(DWRITE_FONT_AXIS_TAG_WEIGHT, 700.0),
@@ -2828,6 +2857,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "native-dx12"))]
     #[test]
     fn color_emoji_composites_over_cleared_texture() -> Result<()> {
         let devices = DirectXDevices::new()?;
@@ -2916,6 +2946,85 @@ mod tests {
             &[0, 0, 0, 0],
             "uncovered texel retained the poison from the uninitialized render target"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-dx12")]
+    #[test]
+    fn color_emoji_composites_over_cleared_texture() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let gpu_state = GPUState::new(&devices)?;
+        let layer = GlyphLayerTexture::new(
+            &gpu_state,
+            Rgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+            bounds(point(0, 0), size(4, 4)),
+            &[255; 16],
+        )?;
+        let rasterized = gpu_state.composite_color_layers(
+            std::slice::from_ref(&layer),
+            size(DevicePixels(32), DevicePixels(32)),
+        )?;
+        assert_eq!(&rasterized[..4], &[255, 255, 255, 255]);
+        let corner = (31 + 31 * 32) * 4;
+        assert_eq!(
+            &rasterized[corner..corner + 4],
+            &[0, 0, 0, 0],
+            "uncovered texels must be transparent after native glyph composition",
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-dx12")]
+    #[test]
+    fn native_color_layers_preserve_premultiplied_blending_and_bgra_readback() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let gpu_state = GPUState::new(&devices)?;
+        let layers = [
+            GlyphLayerTexture::new(
+                &gpu_state,
+                Rgba {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.5,
+                },
+                bounds(point(0, 0), size(3, 2)),
+                &[255; 6],
+            )?,
+            GlyphLayerTexture::new(
+                &gpu_state,
+                Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 1.0,
+                    a: 0.5,
+                },
+                bounds(point(1, 0), size(2, 2)),
+                &[255; 4],
+            )?,
+        ];
+        // Width 3 deliberately exercises the padded D3D12 readback pitch.
+        let rasterized =
+            gpu_state.composite_color_layers(&layers, size(DevicePixels(3), DevicePixels(2)))?;
+        assert_eq!(rasterized.len(), 24);
+        for row in rasterized.chunks_exact(12) {
+            for (actual, expected) in row[..4].iter().zip([0u8, 0, 255, 128]) {
+                assert!(actual.abs_diff(expected) <= 1, "red layer: {row:?}");
+            }
+            for pixel in row[4..].chunks_exact(4) {
+                for (actual, expected) in pixel.iter().zip([170u8, 0, 85, 192]) {
+                    assert!(
+                        actual.abs_diff(expected) <= 1,
+                        "overlapping layers: {pixel:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

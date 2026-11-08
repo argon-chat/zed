@@ -20,7 +20,7 @@ use windows::{
     UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
-        Graphics::{Direct3D11::ID3D11Device, Gdi::*},
+        Graphics::Gdi::*,
         Security::Credentials::*,
         System::{
             Com::*,
@@ -1650,7 +1650,12 @@ fn should_auto_hide_scrollbars() -> Result<bool> {
     Ok(ui_settings.AutoHideScrollBars()?)
 }
 
-fn check_device_lost(device: &ID3D11Device) -> bool {
+#[cfg(feature = "native-dx12")]
+type RendererDevice = windows::Win32::Graphics::Direct3D12::ID3D12Device;
+#[cfg(not(feature = "native-dx12"))]
+type RendererDevice = windows::Win32::Graphics::Direct3D11::ID3D11Device;
+
+fn check_device_lost(device: &RendererDevice) -> bool {
     let device_state = unsafe { device.GetDeviceRemovedReason() };
     match device_state {
         Ok(_) => false,

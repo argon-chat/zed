@@ -1797,6 +1797,21 @@ pub trait PlatformAtlas {
         Ok(None)
     }
 
+    /// Copies a straight-alpha BGRA8 D3D12 texture on this atlas's device.
+    /// The source is in RENDER_TARGET state before and after the copy. Its
+    /// producer signals `ready_fence` at `ready_value`; the consumer waits on
+    /// its GPU queue. `owner` retains the producer allocation and fence until
+    /// the copy completes, not merely until this function returns.
+    fn upload_from_d3d12(
+        &self,
+        _key: &AtlasKey,
+        _size: Size<DevicePixels>,
+        _texture: D3D12TextureHandle,
+        _owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Option<AtlasTile>> {
+        Ok(None)
+    }
+
     /// vue-native fork: the tile `key` maps to now, if any. `None` from a
     /// backend that does not say, which makes every
     /// [`crate::Window::write_image_tile`] report a moved tile: correct, only
@@ -1872,6 +1887,18 @@ pub struct AtlasStats {
 /// Same reasoning as `gpui_windows::renderer_d3d11_device`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GpuTextureHandle(pub *mut std::ffi::c_void);
+
+/// Borrowed D3D12 resource and producer fence. Both pointers remain valid
+/// through the owner passed to [`PlatformAtlas::upload_from_d3d12`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct D3D12TextureHandle {
+    /// ID3D12Resource, BGRA8_UNORM, RENDER_TARGET state.
+    pub resource: *mut std::ffi::c_void,
+    /// ID3D12Fence signalled by the producer queue after its last write.
+    pub ready_fence: *mut std::ffi::c_void,
+    /// Producer submission fence value.
+    pub ready_value: u64,
+}
 
 /// vue-native fork: where [`crate::Window::write_image_tile`] takes a frame's
 /// pixels from.
