@@ -700,6 +700,81 @@ mod vn_cache_key_tests {
     };
     use std::{cell::Cell, rc::Rc};
 
+    struct CaptionRoot {
+        child: Entity<CaptionChild>,
+        uncached_drag_parent: bool,
+    }
+    struct CaptionChild {
+        renders: Rc<Cell<u32>>,
+        own_drag_region: bool,
+    }
+    impl Render for CaptionRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full()
+                .when(self.uncached_drag_parent, |element| element.window_control_area(crate::WindowControlArea::Drag))
+                .child(self.child.clone().cached(StyleRefinement::default().w(px(200.)).h(px(40.))))
+        }
+    }
+    impl Render for CaptionChild {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().size_full()
+                .when(self.own_drag_region, |element| element.window_control_area(crate::WindowControlArea::Drag))
+                .child(div().w(px(50.)).h(px(40.)).window_control_area(crate::WindowControlArea::NoDrag))
+        }
+    }
+    fn caption_frame(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(handle, |root, window, cx| {
+            root.downcast::<CaptionRoot>().expect("caption root").update(cx, |_, cx| cx.notify());
+            window.draw(cx).clear(cx);
+            assert_eq!(window.window_control_area_at(crate::point(px(100.), px(20.))), Some(crate::WindowControlArea::Drag));
+            assert_eq!(window.window_control_area_at(crate::point(px(25.), px(20.))), Some(crate::WindowControlArea::NoDrag));
+        }).expect("draw caption");
+    }
+    #[gpui::test]
+    fn cached_caption_replays_drag_and_no_drag_regions(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let counter = renders.clone();
+        let handle = cx.open_window(size(px(240.), px(100.)), move |_, cx| CaptionRoot {
+            child: cx.new(|_| CaptionChild { renders: counter, own_drag_region: true }),
+            uncached_drag_parent: false,
+        }).into();
+        caption_frame(handle, cx);
+        let first = renders.get();
+        for _ in 0..20 { caption_frame(handle, cx); }
+        assert_eq!(renders.get(), first, "caption must replay rather than being rebuilt to keep dragging");
+    }
+    #[gpui::test]
+    fn cached_no_drag_cutout_does_not_become_its_uncached_drag_parent(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let counter = renders.clone();
+        let handle = cx.open_window(size(px(240.), px(100.)), move |_, cx| CaptionRoot {
+            child: cx.new(|_| CaptionChild { renders: counter, own_drag_region: false }),
+            uncached_drag_parent: true,
+        }).into();
+        caption_frame(handle, cx);
+        let first = renders.get();
+        for _ in 0..20 { caption_frame(handle, cx); }
+        assert_eq!(renders.get(), first);
+    }
+    #[gpui::test]
+    fn caption_hit_test_uses_requested_point_without_a_preceding_move(cx: &mut TestAppContext) {
+        let handle = cx.open_window(size(px(240.), px(100.)), move |_, cx| CaptionRoot {
+            child: cx.new(|_| CaptionChild { renders: Rc::new(Cell::new(0)), own_drag_region: true }),
+            uncached_drag_parent: false,
+        });
+        caption_frame(handle.into(), cx);
+        handle.update(cx, |_, window, cx| {
+            window.dispatch_event(crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+                position: crate::point(px(25.), px(20.)),
+                pressed_button: None,
+                modifiers: Default::default(),
+            }), cx);
+            assert_eq!(window.window_control_area_at(crate::point(px(100.), px(20.))), Some(crate::WindowControlArea::Drag));
+            assert_eq!(window.window_control_area_at(crate::point(px(25.), px(20.))), Some(crate::WindowControlArea::NoDrag));
+        }).expect("hit test without another mouse move");
+    }
+
     struct Root {
         child: Entity<Child>,
         opacity: f32,

@@ -1290,6 +1290,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -2436,36 +2437,17 @@ impl Window {
                     .unwrap_or(DispatchEventResult::default())
             })
         });
-        platform_window.on_hit_test_window_control({
+        platform_window.on_hit_test_window_control_at({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |position| {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        // TOPMOST-FIRST. `mouse_hit_test.ids` is built by
-                        // `hit_test`, which walks `hitboxes.iter().rev()` — so
-                        // it is ordered innermost/topmost first, while
-                        // `window_control_hitboxes` is in PAINT order, i.e.
-                        // ancestor first. Driving the loop from the paint list
-                        // therefore let an ancestor's `Drag` beat a
-                        // descendant's `Close`, and the only escape was
-                        // `.occlude()` on every caption button (which zed does,
-                        // and which blocks the mouse for everything behind it).
-                        //
-                        // Driving it from the hit-test order instead gives the
-                        // CSS rule — the innermost element that declares a
-                        // control area wins — for free, and is what makes
-                        // `WindowControlArea::NoDrag` meaningful at all.
-                        for id in &window.mouse_hit_test.ids {
-                            if let Some((area, _)) = window
-                                .rendered_frame
-                                .window_control_hitboxes
-                                .iter()
-                                .find(|(_, hitbox)| hitbox.id == *id)
-                            {
-                                return Some(*area);
-                            }
-                        }
-                        None
+                        // WM_NCHITTEST precedes the next mouse-move and can run
+                        // after a cached repaint. The previous input's hit set
+                        // may name another point/frame, or be narrowed to a DOM
+                        // event path; it is not a native caption hit test.
+                        let position = position.unwrap_or_else(|| window.platform_window.mouse_position());
+                        window.window_control_area_at(position)
                     })
                     .log_err()
                     .unwrap_or(None)
@@ -4755,6 +4737,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -4770,6 +4753,15 @@ impl Window {
             self.next_frame
                 .record_debug_bounds(selector.clone(), *bounds);
         }
+        // Caption areas are paint output just like listeners and cursors.
+        // Dropping this span makes a retained titlebar stop dragging, and
+        // loses NoDrag cutouts when only an ancestor repaints.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes
+                [range.start.window_control_hitboxes_index..range.end.window_control_hitboxes_index]
+                .iter()
+                .cloned(),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -7011,6 +7003,17 @@ impl Window {
             ids,
             hover_hitbox_count: hover,
         };
+    }
+
+    /// Resolves native caption behavior at a point in the current painted frame.
+    /// This does not reuse or modify the hit set narrowed for a DOM input event.
+    pub fn window_control_area_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
+        let hits = self.rendered_frame.hit_test(position, self.scale_factor);
+        hits.ids.iter().find_map(|id| {
+            self.rendered_frame.window_control_hitboxes.iter()
+                .find(|(_, hitbox)| hitbox.id == *id)
+                .map(|(area, _)| *area)
+        })
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
