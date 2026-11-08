@@ -18,6 +18,7 @@ mod display;
 mod events;
 mod keyboard;
 mod platform;
+mod profiling;
 mod system_notifications;
 mod system_settings;
 mod util;
@@ -61,5 +62,6 @@ pub use directx12::{RendererD3D11Handle, renderer_d3d11_device, ensure_renderer_
 #[cfg(feature = "native-dx12")]
 pub use directx12::{RendererD3D12Handle, renderer_d3d12_device, install_renderer_d3d12_generation_observer};
 pub use platform::WindowsPlatform;
+pub use profiling::{FrameProfilerCallbacks, set_frame_profiler};
 
 pub(crate) use windows::Win32::Foundation::HWND;

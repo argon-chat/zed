@@ -1581,6 +1581,8 @@ pub struct Window {
     vn_pick_every_box: bool,
     /// vue-native fork: see [`Window::set_vn_hit_refiner`].
     vn_hit_refiner: Option<VnHitRefiner>,
+    // Optional modal input interception, e.g. an external element inspector.
+    input_interceptor: Option<Rc<dyn Fn(&PlatformInput, &mut Window, &mut App) -> bool>>,
     /// vue-native fork: see [`Window::vn_key_event_seq`].
     vn_key_event_seq: u64,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
@@ -2559,6 +2561,7 @@ impl Window {
             vn_tag_every_hitbox: false,
             vn_pick_every_box: false,
             vn_hit_refiner: None,
+            input_interceptor: None,
             vn_key_event_seq: 0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -7313,9 +7316,27 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Installs a modal input interceptor. Return true to consume the event
+    /// before normal dispatch. Passing None restores the ordinary input path.
+    /// The callback may remove itself. No callback runs while it is absent.
+    pub fn set_input_interceptor(
+        &mut self,
+        interceptor: Option<Rc<dyn Fn(&PlatformInput, &mut Window, &mut App) -> bool>>,
+    ) {
+        self.input_interceptor = interceptor;
+    }
+
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        // A modal tool consumes the complete gesture before focus, native widgets,
+        // click tracking and application listeners can observe it. Cloning the
+        // Rc permits the interceptor to remove itself while handling an event.
+        if let Some(intercept) = self.input_interceptor.clone() {
+            if intercept(&event, self, cx) {
+                return DispatchEventResult { propagate: false, default_prevented: true };
+            }
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();

@@ -638,6 +638,7 @@ impl DirectXRenderer {
         if self.skip_draws || self.uploads_failed {
             return Ok(());
         }
+        let _profile = crate::profiling::span(self.hwnd.0 as usize, "native", "D3D12 draw");
         let started = self.timings.as_ref().map(|_| Instant::now());
         let index = unsafe {
             self.swap_chain
@@ -659,6 +660,8 @@ impl DirectXRenderer {
                 }
                 return Ok(());
             }
+            let _wait =
+                crate::profiling::span(self.hwnd.0 as usize, "wait", "D3D12 backbuffer fence");
             self.gpu.wait_for(fence)?;
         }
         let fence_time = fence_started
@@ -702,11 +705,14 @@ impl DirectXRenderer {
             DXGI_PRESENT(0)
         };
         let present_started = started.map(|_| Instant::now());
-        let result = unsafe {
-            self.swap_chain
-                .as_ref()
-                .context("D3D12 swap chain missing")?
-                .Present(0, flags)
+        let result = {
+            let _present = crate::profiling::span(self.hwnd.0 as usize, "wait", "D3D12 Present");
+            unsafe {
+                self.swap_chain
+                    .as_ref()
+                    .context("D3D12 swap chain missing")?
+                    .Present(0, flags)
+            }
         };
         let present_busy = self.present_no_wait && result == DXGI_ERROR_WAS_STILL_DRAWING;
         if let (Some(started), Some(present_started), Some(timings)) =
@@ -734,6 +740,9 @@ impl DirectXRenderer {
         present: bool,
         uploads: &mut UploadPool,
     ) -> Result<u64> {
+        let profile_target = self.hwnd.0 as usize;
+        let prepare_profile =
+            crate::profiling::span(profile_target, "native", "D3D12 prepare pipelines");
         let prepare_started = self.timings.as_ref().map(|_| Instant::now());
         let depth = layer_depth(scene, 0, 0)?;
         self.layers.truncate(depth);
@@ -763,6 +772,8 @@ impl DirectXRenderer {
         let prepare_time = prepare_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        drop(prepare_profile);
+        let upload_profile = crate::profiling::span(profile_target, "native", "D3D12 upload scene");
         let upload_started = prepare_started.map(|_| Instant::now());
         let retained: Retained = Arc::new(Mutex::new(Vec::new()));
         let gpu = self.gpu.clone();
@@ -784,6 +795,9 @@ impl DirectXRenderer {
         let upload_time = upload_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        drop(upload_profile);
+        let atlas_profile =
+            crate::profiling::span(profile_target, "native", "D3D12 snapshot atlas");
         let atlas_started = prepare_started.map(|_| Instant::now());
         let descriptors = Descriptors::new(gpu.clone(), retained.clone());
         // Atlas insertion takes the atlas lock before submitting uploads. Snapshot it
@@ -816,10 +830,15 @@ impl DirectXRenderer {
         let atlas_time = atlas_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        drop(atlas_profile);
+        let _submit_profile =
+            crate::profiling::span(profile_target, "native", "D3D12 submit commands");
         let mut changes = StateChanges::new();
         let submit_started = prepare_started.map(|_| Instant::now());
         let mut record_time = Duration::ZERO;
         let result = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
+            let _record_profile =
+                crate::profiling::span(profile_target, "native", "D3D12 record commands");
             let record_started = submit_started.map(|_| Instant::now());
             let mut encoding = Encoding {
                 gpu: &gpu,
@@ -941,6 +960,8 @@ impl DirectXRenderer {
             !self.skip_draws && !self.uploads_failed,
             "D3D12 capture unavailable until its renderer device generation recovers"
         );
+        let _profile =
+            crate::profiling::span(self.hwnd.0 as usize, "native", "D3D12 frame capture");
         let target = Target::new(&self.gpu, self.width, self.height, 1)?;
         let mut uploads = UploadPool::default();
         uploads.begin(self.gpu.completed_value(), 0)?;
