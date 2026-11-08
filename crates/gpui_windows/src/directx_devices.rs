@@ -46,6 +46,33 @@ use windows::core::Interface;
 // [`renderer_d3d11_device`].
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+/// An embedder-owned DirectX generation. All handles must refer to the same
+/// adapter/device, and the immediate context must belong to `device`.
+/// `keep_alive` retains the physical owner until every GPUI clone is dropped.
+/// The factory is called again during device-lost recovery; it must retire the
+/// previous generation and notify any other clients that shared that device.
+pub struct ExternalDirectXDevice {
+    pub adapter: IDXGIAdapter1,
+    pub dxgi_factory: IDXGIFactory6,
+    pub device: ID3D11Device,
+    pub device_context: ID3D11DeviceContext,
+    pub keep_alive: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+static DEVICE_FACTORY: OnceLock<fn() -> Result<ExternalDirectXDevice>> = OnceLock::new();
+
+/// Installs a process-wide provider before creating the platform. Without one,
+/// GPUI creates its normal D3D11 device. Provider errors are propagated rather
+/// than silently creating a different physical device.
+pub fn install_directx_device_factory(
+    factory: fn() -> Result<ExternalDirectXDevice>,
+) -> Result<()> {
+    DEVICE_FACTORY
+        .set(factory)
+        .map_err(|_| anyhow::anyhow!("DirectX device factory already installed"))
+}
 
 static SHARED_DEVICE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static SHARED_DEVICE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -95,10 +122,27 @@ pub(crate) struct DirectXDevices {
     pub(crate) dxgi_factory: IDXGIFactory6,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
+    _external_owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
+        if let Some(factory) = DEVICE_FACTORY.get() {
+            let external = factory().context("Creating embedder-owned DirectX devices")?;
+            let mt = external
+                .device
+                .cast::<ID3D11Multithread>()
+                .context("Shared renderer requires D3D11 multithread protection")?;
+            let _ = unsafe { mt.SetMultithreadProtected(true) };
+            publish_device(&external.device);
+            return Ok(Self {
+                adapter: external.adapter,
+                dxgi_factory: external.dxgi_factory,
+                device: external.device,
+                device_context: external.device_context,
+                _external_owner: Some(external.keep_alive),
+            });
+        }
         let debug_layer_available = check_debug_layer_available();
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
@@ -139,6 +183,7 @@ impl DirectXDevices {
             dxgi_factory,
             device,
             device_context,
+            _external_owner: None,
         })
     }
 }
