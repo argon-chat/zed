@@ -16,6 +16,7 @@ use std::{
     mem::size_of_val,
     ptr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -36,6 +37,8 @@ const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
 );
 const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_UPLOAD_POOL_BYTES: u64 = 256 * 1024 * 1024;
+const UPLOAD_ALLOCATION_ALIGNMENT: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
 const MAX_LAYER_DEPTH: usize = 8;
 const DESCRIPTORS_PER_PAGE: u32 = 256;
 const _: () = assert!(std::mem::size_of::<GlobalParams>() == 48);
@@ -44,6 +47,216 @@ const _: () = assert!(std::mem::size_of::<PathRasterizationSprite>() == 292);
 const _: () = assert!(std::mem::offset_of!(PathRasterizationSprite, color) == 16);
 const _: () = assert!(std::mem::size_of::<PathSprite>() == 16);
 type Retained = Arc<Mutex<Vec<KeepAlive>>>;
+
+struct UploadBuffer {
+    resource: ID3D12Resource,
+    capacity: u64,
+    allocation_bytes: u64,
+}
+
+#[derive(Default)]
+struct UploadPool {
+    buffers: Vec<UploadBuffer>,
+    next: usize,
+    allocation_bytes: u64,
+}
+impl UploadPool {
+    fn begin(&mut self, completed: u64, reusable_after: u64) -> Result<()> {
+        ensure!(
+            completed >= reusable_after,
+            "D3D12 uploads cannot be reused before fence {reusable_after} completes"
+        );
+        self.next = 0;
+        Ok(())
+    }
+
+    fn buffer(&mut self, gpu: &Device, bytes: usize) -> Result<ID3D12Resource> {
+        ensure!(
+            bytes <= MAX_UPLOAD_BYTES,
+            "D3D12 scene upload exceeds {MAX_UPLOAD_BYTES} bytes"
+        );
+        let required = u64::try_from(bytes.max(1))
+            .context("D3D12 upload size overflow")?
+            .checked_add(255)
+            .context("D3D12 upload alignment overflow")?
+            & !255;
+        if let Some(buffer) = self
+            .buffers
+            .get(self.next)
+            .filter(|buffer| buffer.capacity >= required)
+        {
+            self.next += 1;
+            return Ok(buffer.resource.clone());
+        }
+        let capacity = required
+            .max(UPLOAD_ALLOCATION_ALIGNMENT)
+            .checked_next_power_of_two()
+            .context("D3D12 upload capacity overflow")?;
+        let allocation_bytes = capacity
+            .checked_add(UPLOAD_ALLOCATION_ALIGNMENT - 1)
+            .context("D3D12 upload allocation size overflow")?
+            & !(UPLOAD_ALLOCATION_ALIGNMENT - 1);
+        let previous = self
+            .buffers
+            .get(self.next)
+            .map_or(0, |buffer| buffer.allocation_bytes);
+        let mut total = self
+            .allocation_bytes
+            .checked_sub(previous)
+            .and_then(|total| total.checked_add(allocation_bytes))
+            .context("D3D12 upload pool accounting overflow")?;
+        // Unused slots belong to a completed frame, so they must not prevent
+        // a larger current upload from fitting within the pool's hard budget.
+        while total > MAX_UPLOAD_POOL_BYTES && self.buffers.len() > self.next + 1 {
+            if let Some(buffer) = self.buffers.pop() {
+                self.allocation_bytes -= buffer.allocation_bytes;
+                total -= buffer.allocation_bytes;
+            }
+        }
+        ensure!(
+            total <= MAX_UPLOAD_POOL_BYTES,
+            "D3D12 frame upload pool exceeds {MAX_UPLOAD_POOL_BYTES} committed bytes"
+        );
+        let resource = gpu.create_buffer(
+            capacity,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )?;
+        let buffer = UploadBuffer {
+            resource: resource.clone(),
+            capacity,
+            allocation_bytes,
+        };
+        if let Some(slot) = self.buffers.get_mut(self.next) {
+            *slot = buffer;
+        } else {
+            self.buffers.push(buffer);
+        }
+        self.allocation_bytes = total;
+        self.next += 1;
+        Ok(resource)
+    }
+
+    fn finish(&mut self) {
+        for buffer in self.buffers.drain(self.next..) {
+            self.allocation_bytes -= buffer.allocation_bytes;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CpuStage {
+    total: Duration,
+    maximum: Duration,
+}
+impl CpuStage {
+    fn add(&mut self, duration: Duration) {
+        self.total = self.total.saturating_add(duration);
+        self.maximum = self.maximum.max(duration);
+    }
+}
+
+struct RendererTimings {
+    started: Instant,
+    frames: u64,
+    fence_waits: u64,
+    skipped_gpu_busy: u64,
+    skipped_present_busy: u64,
+    stages: [CpuStage; 9],
+    last_render: [Duration; 5],
+}
+impl RendererTimings {
+    fn from_environment() -> Option<Self> {
+        std::env::var_os("VN_DX12_TIMINGS")
+            .filter(|value| value.to_str() == Some("1"))
+            .map(|_| Self {
+                started: Instant::now(),
+                frames: 0,
+                fence_waits: 0,
+                skipped_gpu_busy: 0,
+                skipped_present_busy: 0,
+                stages: [CpuStage::default(); 9],
+                last_render: [Duration::ZERO; 5],
+            })
+    }
+
+    fn frame(
+        &mut self,
+        fence: Duration,
+        render: Duration,
+        present: Duration,
+        total: Duration,
+        waited: bool,
+        present_busy: bool,
+    ) {
+        self.frames += 1;
+        self.fence_waits += u64::from(waited);
+        self.skipped_present_busy += u64::from(present_busy);
+        for (stage, duration) in self.stages.iter_mut().zip([
+            fence,
+            render,
+            present,
+            total,
+            self.last_render[0],
+            self.last_render[1],
+            self.last_render[2],
+            self.last_render[3],
+            self.last_render[4],
+        ]) {
+            stage.add(duration);
+        }
+        self.emit_if_due();
+    }
+
+    fn emit_if_due(&mut self) {
+        let elapsed = self.started.elapsed();
+        if elapsed < Duration::from_secs(2) {
+            return;
+        }
+        let names = [
+            "fence",
+            "render",
+            "present",
+            "draw",
+            "prepare",
+            "upload",
+            "atlas",
+            "record",
+            "submit_other",
+        ];
+        let mut stages = String::new();
+        for (name, stage) in names.into_iter().zip(self.stages) {
+            use std::fmt::Write as _;
+            // Writing to a String has no I/O failure; retain diagnostics if the
+            // formatting contract ever changes to a fallible destination.
+            if let Err(error) = write!(
+                stages,
+                " {name}_avg_ms={:.3} {name}_max_ms={:.3}",
+                stage.total.as_secs_f64() * 1000. / self.frames.max(1) as f64,
+                stage.maximum.as_secs_f64() * 1000.
+            ) {
+                log::error!("Formatting native D3D12 timings failed: {error}");
+                return;
+            }
+        }
+        log::info!(
+            "[DX12 timings] frames={} window_ms={:.1} fps={:.1} fence_waits={} skipped_gpu_busy={} skipped_present_busy={}{}",
+            self.frames,
+            elapsed.as_secs_f64() * 1000.,
+            self.frames as f64 / elapsed.as_secs_f64(),
+            self.fence_waits,
+            self.skipped_gpu_busy,
+            self.skipped_present_busy,
+            stages,
+        );
+        self.started = Instant::now();
+        self.frames = 0;
+        self.fence_waits = 0;
+        self.skipped_gpu_busy = 0;
+        self.skipped_present_busy = 0;
+        self.stages = [CpuStage::default(); 9];
+    }
+}
 
 #[repr(C)]
 struct GlobalParams {
@@ -238,6 +451,9 @@ pub(crate) struct DirectXRenderer {
     path_resolved: Option<Arc<Target>>,
     snapshot: Option<Arc<Target>>,
     blur: Vec<Arc<Target>>,
+    timings: Option<RendererTimings>,
+    uploads: [UploadPool; BUFFERS],
+    uploads_failed: bool,
 }
 impl DirectXRenderer {
     pub(crate) fn new(
@@ -308,6 +524,9 @@ impl DirectXRenderer {
             path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
+            timings: RendererTimings::from_environment(),
+            uploads: std::array::from_fn(|_| UploadPool::default()),
+            uploads_failed: false,
         })
     }
     fn buffers(
@@ -403,6 +622,7 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
         self.fences = [0; BUFFERS];
+        self.uploads = std::array::from_fn(|_| UploadPool::default());
         self.layers.clear();
         self.path_msaa = None;
         self.path_resolved = None;
@@ -415,9 +635,10 @@ impl DirectXRenderer {
         scene: &Scene,
         appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        if self.skip_draws {
+        if self.skip_draws || self.uploads_failed {
             return Ok(());
         }
+        let started = self.timings.as_ref().map(|_| Instant::now());
         let index = unsafe {
             self.swap_chain
                 .as_ref()
@@ -428,31 +649,79 @@ impl DirectXRenderer {
             .fences
             .get(index)
             .context("D3D12 swap-chain index is out of range")?;
-        if self.gpu.completed_value() < fence {
+        let waited = self.gpu.completed_value() < fence;
+        let fence_started = started.map(|_| Instant::now());
+        if waited {
             if self.present_no_wait {
+                if let Some(timings) = self.timings.as_mut() {
+                    timings.skipped_gpu_busy += 1;
+                    timings.emit_if_due();
+                }
                 return Ok(());
             }
             self.gpu.wait_for(fence)?;
         }
+        let fence_time = fence_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         let target = self
             .back_buffers
             .get(index)
             .context("D3D12 back buffer missing")?
             .clone();
-        let completed = self.render(scene, appearance, target, true)?;
+        let render_started = started.map(|_| Instant::now());
+        let mut uploads = std::mem::take(
+            self.uploads
+                .get_mut(index)
+                .context("D3D12 back buffer upload pool missing")?,
+        );
+        uploads.begin(self.gpu.completed_value(), fence)?;
+        let rendered = self.render(scene, appearance, target, true, &mut uploads);
+        uploads.finish();
+        *self
+            .uploads
+            .get_mut(index)
+            .context("D3D12 back buffer upload pool missing")? = uploads;
+        let completed = match rendered {
+            Ok(completed) => completed,
+            Err(error) => {
+                // Execute may have succeeded even if its completion Signal failed.
+                // Never map that generation again using the preceding frame's fence.
+                self.skip_draws = true;
+                self.uploads_failed = true;
+                return Err(error);
+            }
+        };
+        let render_time = render_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         self.fences[index] = completed;
         let flags = if self.present_no_wait {
             DXGI_PRESENT_DO_NOT_WAIT
         } else {
             DXGI_PRESENT(0)
         };
+        let present_started = started.map(|_| Instant::now());
         let result = unsafe {
             self.swap_chain
                 .as_ref()
                 .context("D3D12 swap chain missing")?
                 .Present(0, flags)
         };
-        if self.present_no_wait && result == DXGI_ERROR_WAS_STILL_DRAWING {
+        let present_busy = self.present_no_wait && result == DXGI_ERROR_WAS_STILL_DRAWING;
+        if let (Some(started), Some(present_started), Some(timings)) =
+            (started, present_started, self.timings.as_mut())
+        {
+            timings.frame(
+                fence_time,
+                render_time,
+                present_started.elapsed(),
+                started.elapsed(),
+                waited,
+                present_busy,
+            );
+        }
+        if present_busy {
             return Ok(());
         }
         result.ok().context("Presenting native D3D12 swap chain")
@@ -463,7 +732,9 @@ impl DirectXRenderer {
         appearance: WindowBackgroundAppearance,
         target: Arc<Target>,
         present: bool,
+        uploads: &mut UploadPool,
     ) -> Result<u64> {
+        let prepare_started = self.timings.as_ref().map(|_| Instant::now());
         let depth = layer_depth(scene, 0, 0)?;
         self.layers.truncate(depth);
         if scene.paths.is_empty() {
@@ -489,12 +760,17 @@ impl DirectXRenderer {
                 .unwrap_or(0);
             self.blur.truncate(levels as usize);
         }
+        let prepare_time = prepare_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let upload_started = prepare_started.map(|_| Instant::now());
         let retained: Retained = Arc::new(Mutex::new(Vec::new()));
         let gpu = self.gpu.clone();
         let font = Self::get_font_info();
         let globals = upload(
             &gpu,
             &retained,
+            uploads,
             &[GlobalParams {
                 gamma_ratios: font.gamma_ratios,
                 viewport_size: [self.width as f32, self.height as f32],
@@ -504,7 +780,11 @@ impl DirectXRenderer {
                 padding: [0; 3],
             }],
         )?;
-        let data = SceneBuffers::new(&gpu, &retained, scene)?;
+        let data = SceneBuffers::new(&gpu, &retained, uploads, scene)?;
+        let upload_time = upload_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let atlas_started = prepare_started.map(|_| Instant::now());
         let descriptors = Descriptors::new(gpu.clone(), retained.clone());
         // Atlas insertion takes the atlas lock before submitting uploads. Snapshot it
         // before submit takes the queue lock so rendering cannot reverse that order.
@@ -533,8 +813,14 @@ impl DirectXRenderer {
                 entry.insert(texture);
             }
         }
+        let atlas_time = atlas_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         let mut changes = StateChanges::new();
+        let submit_started = prepare_started.map(|_| Instant::now());
+        let mut record_time = Duration::ZERO;
         let result = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
+            let record_started = submit_started.map(|_| Instant::now());
             let mut encoding = Encoding {
                 gpu: &gpu,
                 list,
@@ -546,6 +832,7 @@ impl DirectXRenderer {
                 globals,
                 retained,
                 descriptors,
+                uploads,
                 target: target.clone(),
                 width: self.width,
                 height: self.height,
@@ -568,10 +855,25 @@ impl DirectXRenderer {
             if present {
                 target.to(list, D3D12_RESOURCE_STATE_PRESENT, encoding.changes);
             }
+            record_time = record_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
             Ok(())
         });
+        let submit_time = submit_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         if result.is_ok() {
             changes.commit();
+            if let Some(timings) = self.timings.as_mut() {
+                timings.last_render = [
+                    prepare_time,
+                    upload_time,
+                    atlas_time,
+                    record_time,
+                    submit_time.saturating_sub(record_time),
+                ];
+            }
         }
         result
     }
@@ -636,11 +938,17 @@ impl DirectXRenderer {
         appearance: WindowBackgroundAppearance,
     ) -> Result<image::RgbaImage> {
         ensure!(
-            !self.skip_draws,
-            "D3D12 capture unavailable during device recovery"
+            !self.skip_draws && !self.uploads_failed,
+            "D3D12 capture unavailable until its renderer device generation recovers"
         );
         let target = Target::new(&self.gpu, self.width, self.height, 1)?;
-        self.render(scene, appearance, target.clone(), false)?;
+        let mut uploads = UploadPool::default();
+        uploads.begin(self.gpu.completed_value(), 0)?;
+        self.render(scene, appearance, target.clone(), false, &mut uploads)?;
+        uploads.finish();
+        self.capture_target(target)
+    }
+    fn capture_target(&self, target: Arc<Target>) -> Result<image::RgbaImage> {
         let row_pitch = (u64::from(self.width) * 4 + 255) & !255;
         let length = row_pitch
             .checked_mul(u64::from(self.height))
@@ -773,17 +1081,14 @@ fn retain<T: Any + Send + Sync>(retained: &Retained, value: T) {
         .unwrap_or_else(|error| error.into_inner())
         .push(Arc::new(value));
 }
-fn upload<T>(gpu: &Device, retained: &Retained, data: &[T]) -> Result<ID3D12Resource> {
+fn upload<T>(
+    gpu: &Device,
+    retained: &Retained,
+    uploads: &mut UploadPool,
+    data: &[T],
+) -> Result<ID3D12Resource> {
     let bytes = size_of_val(data);
-    ensure!(
-        bytes <= MAX_UPLOAD_BYTES,
-        "D3D12 scene upload exceeds {MAX_UPLOAD_BYTES} bytes"
-    );
-    let resource = gpu.create_buffer(
-        (bytes.max(1) as u64 + 255) & !255,
-        D3D12_HEAP_TYPE_UPLOAD,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-    )?;
+    let resource = uploads.buffer(gpu, bytes)?;
     let mut mapped = ptr::null_mut();
     unsafe {
         resource.Map(
@@ -811,12 +1116,13 @@ fn upload_or_dummy<T>(
     gpu: &Device,
     retained: &Retained,
     dummy: &ID3D12Resource,
+    uploads: &mut UploadPool,
     data: &[T],
 ) -> Result<ID3D12Resource> {
     if data.is_empty() {
         Ok(dummy.clone())
     } else {
-        upload(gpu, retained, data)
+        upload(gpu, retained, uploads, data)
     }
 }
 
@@ -835,21 +1141,38 @@ struct SceneBuffers {
     text_backgrounds: ID3D12Resource,
 }
 impl SceneBuffers {
-    fn new(gpu: &Device, retained: &Retained, scene: &Scene) -> Result<Self> {
-        let dummy = upload(gpu, retained, &[0u32; 64])?;
+    fn new(
+        gpu: &Device,
+        retained: &Retained,
+        uploads: &mut UploadPool,
+        scene: &Scene,
+    ) -> Result<Self> {
+        let dummy = upload(gpu, retained, uploads, &[0u32; 64])?;
         Ok(Self {
             dummy: dummy.clone(),
-            shadows: upload_or_dummy(gpu, retained, &dummy, &scene.shadows)?,
-            quads: upload_or_dummy(gpu, retained, &dummy, &scene.quads)?,
-            blur_rects: upload_or_dummy(gpu, retained, &dummy, &scene.backdrop_blur_rects)?,
-            effects: upload_or_dummy(gpu, retained, &dummy, &scene.effect_quads)?,
-            underlines: upload_or_dummy(gpu, retained, &dummy, &scene.underlines)?,
-            mono: upload_or_dummy(gpu, retained, &dummy, &scene.monochrome_sprites)?,
-            subpixel: upload_or_dummy(gpu, retained, &dummy, &scene.subpixel_sprites)?,
-            poly: upload_or_dummy(gpu, retained, &dummy, &scene.polychrome_sprites)?,
-            layers: upload_or_dummy(gpu, retained, &dummy, &scene.vn_layers)?,
-            clips: upload_or_dummy(gpu, retained, &dummy, &scene.vn_clip_segments)?,
-            text_backgrounds: upload_or_dummy(gpu, retained, &dummy, &scene.vn_text_backgrounds)?,
+            shadows: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.shadows)?,
+            quads: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.quads)?,
+            blur_rects: upload_or_dummy(
+                gpu,
+                retained,
+                &dummy,
+                uploads,
+                &scene.backdrop_blur_rects,
+            )?,
+            effects: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.effect_quads)?,
+            underlines: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.underlines)?,
+            mono: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.monochrome_sprites)?,
+            subpixel: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.subpixel_sprites)?,
+            poly: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.polychrome_sprites)?,
+            layers: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.vn_layers)?,
+            clips: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.vn_clip_segments)?,
+            text_backgrounds: upload_or_dummy(
+                gpu,
+                retained,
+                &dummy,
+                uploads,
+                &scene.vn_text_backgrounds,
+            )?,
         })
     }
 }
@@ -949,6 +1272,7 @@ struct Encoding<'a> {
     globals: ID3D12Resource,
     retained: Retained,
     descriptors: Descriptors,
+    uploads: &'a mut UploadPool,
     target: Arc<Target>,
     width: u32,
     height: u32,
@@ -1244,7 +1568,7 @@ impl Encoding<'_> {
                 content_mask: path.content_mask,
             }));
         }
-        let buffer = upload(self.gpu, &self.retained, &vertices)?;
+        let buffer = upload(self.gpu, &self.retained, self.uploads, &vertices)?;
         self.bind_target(&msaa)?;
         unsafe {
             self.list.ClearRenderTargetView(msaa.rtv(), &[0.0; 4], None);
@@ -1284,7 +1608,7 @@ impl Encoding<'_> {
             }
             vec![PathSprite { bounds }]
         };
-        let buffer = upload(self.gpu, &self.retained, &sprites)?;
+        let buffer = upload(self.gpu, &self.retained, self.uploads, &sprites)?;
         let target = self.target.clone();
         self.bind_target(&target)?;
         self.draw(
@@ -1473,6 +1797,9 @@ mod tests {
             path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
+            timings: None,
+            uploads: std::array::from_fn(|_| UploadPool::default()),
+            uploads_failed: false,
         })
     }
 
@@ -1735,6 +2062,117 @@ mod tests {
             renderer.snapshot.is_none() && renderer.blur.is_empty(),
             "closing the backdrop scene must release its scratch textures"
         );
+        Ok(())
+    }
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_upload_pools_reuse_completed_resources_and_refresh_pixels() -> Result<()> {
+        let mut renderer = offscreen(32, 32)?;
+        let content_mask = mask(32., 32.);
+        let target = Target::new(&renderer.gpu, 32, 32, 1)?;
+        let mut identities: [Option<Vec<ID3D12Resource>>; BUFFERS] = std::array::from_fn(|_| None);
+        let mut guarded = UploadPool::default();
+        assert!(
+            guarded.begin(0, 1).is_err(),
+            "unfinished frame uploads must not be reset"
+        );
+        for (frame, color) in [0xff0000, 0x00ff00, 0x0000ff, 0x0000ff, 0xff0000, 0x00ff00]
+            .into_iter()
+            .enumerate()
+        {
+            let slot = frame % BUFFERS;
+            let previous = renderer.fences[slot];
+            renderer.gpu.wait_for(previous)?;
+            let mut uploads = std::mem::take(&mut renderer.uploads[slot]);
+            uploads.begin(renderer.gpu.completed_value(), previous)?;
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., 32., 32.), rgb(color), content_mask));
+            let x = if frame < BUFFERS { 8.25 } else { 12.25 };
+            let mut path = Path::new(point(px(x), px(8.25)));
+            path.line_to(point(px(x + 16.), px(8.25)));
+            path.line_to(point(px(x), px(24.25)));
+            let mut path = path.scale(1.);
+            path.content_mask = content_mask;
+            path.color = rgb(0xffffff).into();
+            scene.insert_primitive(path);
+            scene.finish();
+            let fence = renderer.render(
+                &scene,
+                WindowBackgroundAppearance::Transparent,
+                target.clone(),
+                false,
+                &mut uploads,
+            )?;
+            uploads.finish();
+            assert_eq!(
+                uploads.buffers.len(),
+                5,
+                "globals, dummy, quads and both path streams must use the pool"
+            );
+            if let Some(previous) = &identities[slot] {
+                assert_eq!(previous.len(), uploads.buffers.len());
+                for (previous, buffer) in previous.iter().zip(&uploads.buffers) {
+                    assert_eq!(
+                        previous.as_raw(),
+                        buffer.resource.as_raw(),
+                        "a completed slot must reuse its existing COM resource"
+                    );
+                }
+            } else {
+                identities[slot] = Some(
+                    uploads
+                        .buffers
+                        .iter()
+                        .map(|buffer| buffer.resource.clone())
+                        .collect(),
+                );
+            }
+            renderer.uploads[slot] = uploads;
+            renderer.fences[slot] = fence;
+            let image = renderer.capture_target(target.clone())?;
+            let expected = [
+                ((color >> 16) & 255) as u8,
+                ((color >> 8) & 255) as u8,
+                (color & 255) as u8,
+                255,
+            ];
+            assert_eq!(
+                image.get_pixel(1, 1).0,
+                expected,
+                "reused quad uploads must contain the current frame's color"
+            );
+            assert_eq!(image.get_pixel(16, 12).0, [255; 4]);
+            assert_eq!(
+                image.get_pixel(10, 10).0,
+                if frame < BUFFERS { [255; 4] } else { expected },
+                "reused path uploads must contain the current frame's vertices"
+            );
+        }
+        drop(identities);
+        for slot in 0..BUFFERS {
+            let previous = renderer.fences[slot];
+            renderer.gpu.wait_for(previous)?;
+            let mut uploads = std::mem::take(&mut renderer.uploads[slot]);
+            uploads.begin(renderer.gpu.completed_value(), previous)?;
+            let fence = renderer.render(
+                &Scene::default(),
+                WindowBackgroundAppearance::Transparent,
+                target.clone(),
+                false,
+                &mut uploads,
+            )?;
+            uploads.finish();
+            assert_eq!(
+                uploads.buffers.len(),
+                2,
+                "an empty scene must retire unused quad/path upload slots"
+            );
+            assert_eq!(uploads.allocation_bytes, 2 * UPLOAD_ALLOCATION_ALIGNMENT);
+            renderer.uploads[slot] = uploads;
+            renderer.fences[slot] = fence;
+        }
+        renderer.gpu.wait_idle()?;
+        assert_eq!(renderer.capture_target(target)?.get_pixel(16, 12).0, [0; 4]);
         Ok(())
     }
 }
