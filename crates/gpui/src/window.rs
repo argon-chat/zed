@@ -6347,18 +6347,10 @@ impl Window {
             frame_index,
         };
 
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(params.into(), &mut || {
-                Ok(Some((
-                    data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
+        let tile = self.sprite_atlas.get_or_insert_with(params.into(), &mut || {
+            Ok(data.as_bytes(frame_index).map(|bytes| (data.size(frame_index), Cow::Borrowed(bytes))))
+        })?;
+        let Some(tile) = tile else { return Ok(()); };
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
@@ -6566,6 +6558,11 @@ impl Window {
     /// `None` when the platform's atlas does not keep count.
     pub fn sprite_atlas_stats(&self) -> Option<AtlasStats> {
         self.sprite_atlas.stats()
+    }
+
+    /// Reports a live atlas tile on backends supporting GPU image imports.
+    pub fn has_image_atlas_tile(&self, data: &RenderImage, frame_index: usize) -> bool {
+        self.sprite_atlas.tile(&RenderImageParams {image_id:data.id,frame_index}.into()).is_some()
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.

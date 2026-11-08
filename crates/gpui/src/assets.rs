@@ -51,6 +51,7 @@ pub struct RenderImage {
     /// is a new image, and a placeholder whose atlas tile the GPU fills has no
     /// pixels worth reading.
     dynamic: bool,
+    gpu_size: Option<Size<DevicePixels>>,
     /// vue-native: the size the picture has, when its pixels are a smaller
     /// copy of it ([`Self::with_natural_size`]). Layout and `object-fit` read
     /// this, so an image an embedder swapped for the copy it is drawn from
@@ -76,8 +77,19 @@ impl RenderImage {
             scale_factor: 1.0,
             data: data.into(),
             dynamic: false,
+            gpu_size: None,
             natural: None,
         }
+    }
+
+    /// An atlas-backed GPU picture with no placeholder CPU pixel allocation.
+    /// The host must upload its GPU tile before painting. Missing tiles are
+    /// skipped, rather than falling back to an invented CPU image.
+    pub fn from_gpu(size: Size<DevicePixels>) -> Self {
+        let mut image = Self::new(SmallVec::new());
+        image.gpu_size = Some(size);
+        image.dynamic = true;
+        image
     }
 
     /// vue-native: marks this single-frame image as a smaller copy of a picture
@@ -125,6 +137,7 @@ impl RenderImage {
             scale_factor: self.scale_factor,
             data: data.into(),
             dynamic: self.dynamic,
+            gpu_size: None,
             natural: None,
         }
     }
@@ -138,6 +151,7 @@ impl RenderImage {
 
     /// Get the size of this image, in pixels.
     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
+        if frame_index == 0 { if let Some(size) = self.gpu_size { return size; } }
         self.data
             .get(frame_index)
             .map(|frame| {
@@ -163,6 +177,7 @@ impl RenderImage {
 
     /// Get the number of frames for this image.
     pub fn frame_count(&self) -> usize {
+        if self.gpu_size.is_some() { return 1; }
         self.data.len()
     }
 }
@@ -180,6 +195,18 @@ impl fmt::Debug for RenderImage {
 mod tests {
     use super::*;
     use smallvec::SmallVec;
+
+    #[test]
+    fn gpu_image_keeps_intrinsics_without_a_cpu_placeholder() {
+        let dimensions=size(DevicePixels(16384),DevicePixels(16384));
+        let gpu=RenderImage::from_gpu(dimensions);
+        assert_eq!(gpu.size(0),dimensions);
+        assert_eq!(gpu.natural_size(0),dimensions);
+        assert_eq!(gpu.frame_count(),1);
+        assert_eq!(gpu.as_bytes(0),None);
+        assert_eq!(gpu.size(1),Size::default());
+        assert!(gpu.is_dynamic());
+    }
 
     #[test]
     fn empty_render_image_does_not_panic() {
