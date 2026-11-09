@@ -220,7 +220,7 @@ pub use subsecond;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
-pub use taffy::{AvailableSpace, LayoutId};
+pub use taffy::{AvailableSpace, LayoutId, VnRetainedLayoutStats};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;

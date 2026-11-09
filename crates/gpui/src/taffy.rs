@@ -1,4 +1,6 @@
 mod layout_bounds;
+mod retained;
+pub use retained::VnRetainedLayoutStats;
 
 use layout_bounds::LayoutIdMap;
 
@@ -37,6 +39,7 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: LayoutIdMap<Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: LayoutIdMap<Point<f32>>,
+    retention: retained::Retention,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
 }
@@ -51,16 +54,44 @@ impl TaffyLayoutEngine {
             taffy,
             absolute_layout_bounds: LayoutIdMap::default(),
             absolute_outer_origins: LayoutIdMap::default(),
+            retention: retained::Retention::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
         }
     }
 
     pub fn clear(&mut self) {
-        self.taffy.clear();
+        if self.retention.enabled {
+            retained::finish_frame(self);
+        } else {
+            self.taffy.clear();
+        }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+    }
+
+    pub(crate) fn retention_enabled(&self) -> bool {
+        self.retention.enabled
+    }
+
+    pub(crate) fn enable_retention(&mut self) {
+        if !self.retention.enabled {
+            assert_eq!(
+                self.taffy.total_node_count(),
+                0,
+                "enable retained layout before the first layout request"
+            );
+            self.retention.enabled = true;
+        }
+    }
+
+    pub(crate) fn profile_retention(&mut self, enabled: bool) {
+        self.retention.stats = enabled.then(Default::default);
+    }
+
+    pub(crate) fn take_retention_stats(&mut self) -> Option<VnRetainedLayoutStats> {
+        self.retention.stats.as_mut().map(std::mem::take)
     }
 
     pub fn request_layout(
@@ -70,7 +101,21 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
+        self.request_layout_in_scope(None, style, rem_size, scale_factor, children)
+    }
+
+    pub(crate) fn request_layout_in_scope(
+        &mut self,
+        scope: Option<crate::GlobalElementId>,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        if self.retention.enabled {
+            return retained::request_layout(self, scope, taffy_style, children);
+        }
 
         if children.is_empty() {
             self.taffy
@@ -99,7 +144,28 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
+        self.request_measured_layout_in_scope(None, style, rem_size, scale_factor, measure)
+    }
+
+    pub(crate) fn request_measured_layout_in_scope(
+        &mut self,
+        scope: Option<crate::GlobalElementId>,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> Size<Pixels>
+        + 'static,
+    ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        if self.retention.enabled {
+            return retained::request_measured_layout(self, scope, taffy_style, measure);
+        }
+
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
@@ -122,6 +188,10 @@ impl TaffyLayoutEngine {
         size: Size<Pixels>,
         scale_factor: f32,
     ) {
+        if self.retention.enabled {
+            retained::stretch(self, id, size, scale_factor);
+            return;
+        }
         let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
         let stretch_width = style.size.width.is_auto();
         let stretch_height = style.size.height.is_auto();
@@ -236,11 +306,16 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        if self.retention.enabled {
+            retained::prepare_compute(self, scale_factor);
+            retained::replay(self, window, cx);
+        }
+        let retention = &mut self.retention;
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
+                |known_dimensions, available_space, id, node_context, _style| {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
@@ -263,12 +338,18 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
+                    if retention.enabled {
+                        retained::note_measure(retention, id, known_dimensions, available_space);
+                    }
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )
             .expect(EXPECT_MESSAGE);
+        if self.retention.enabled {
+            retained::settle(self, window, cx);
+        }
     }
 
     // Pixel snapping

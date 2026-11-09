@@ -6607,6 +6607,25 @@ impl Window {
             })
     }
 
+    /// Enable node retention for this window before its first layout request.
+    /// Generic GPUI windows retain upstream's per-frame layout by default.
+    pub fn vn_enable_retained_layout(&mut self) {
+        self.layout_engine.as_mut().unwrap().enable_retention();
+    }
+
+    /// Enable counters only while a profiling capture is active.
+    pub fn vn_profile_retained_layout(&mut self, enabled: bool) {
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .profile_retention(enabled);
+    }
+
+    /// Drain this window's retention counters, or None while profiling is off.
+    pub fn vn_take_retained_layout_stats(&mut self) -> Option<crate::VnRetainedLayoutStats> {
+        self.layout_engine.as_mut().unwrap().take_retention_stats()
+    }
+
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
     /// layout is being requested, along with the layout ids of any children. This method is called during
     /// calls to the [`Element::request_layout`] trait method and enables any element to participate in layout.
@@ -6626,12 +6645,24 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
 
-        self.layout_engine.as_mut().unwrap().request_layout(
-            style,
-            rem_size,
-            scale_factor,
-            &cx.layout_id_buffer,
-        )
+        let scope = self
+            .layout_engine
+            .as_ref()
+            .unwrap()
+            .retention_enabled()
+            .then(|| self.element_id_stack.global_id());
+        let engine = self.layout_engine.as_mut().unwrap();
+        if let Some(scope) = scope {
+            engine.request_layout_in_scope(
+                Some(scope),
+                style,
+                rem_size,
+                scale_factor,
+                &cx.layout_id_buffer,
+            )
+        } else {
+            engine.request_layout(style, rem_size, scale_factor, &cx.layout_id_buffer)
+        }
     }
 
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
@@ -6651,10 +6682,24 @@ impl Window {
 
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
-        self.layout_engine
-            .as_mut()
+        let scope = self
+            .layout_engine
+            .as_ref()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .retention_enabled()
+            .then(|| self.element_id_stack.global_id());
+        let engine = self.layout_engine.as_mut().unwrap();
+        if let Some(scope) = scope {
+            engine.request_measured_layout_in_scope(
+                Some(scope),
+                style,
+                rem_size,
+                scale_factor,
+                measure,
+            )
+        } else {
+            engine.request_measured_layout(style, rem_size, scale_factor, measure)
+        }
     }
 
     /// Compute the layout for the given id within the given available space.
