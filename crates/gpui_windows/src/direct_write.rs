@@ -1,9 +1,18 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
     ffi::{c_uint, c_void},
     mem::ManuallyDrop,
     sync::Arc,
 };
+
+thread_local! {
+    /// The analysis `raster_bounds` built for a glyph. An atlas miss asks for
+    /// the glyph's bounds and then rasterizes it on the same thread; reusing
+    /// the analysis halves the DirectWrite work for every new glyph.
+    static LAST_ANALYSIS: RefCell<Option<(RenderGlyphParams, IDWriteGlyphRunAnalysis)>> =
+        const { RefCell::new(None) };
+}
 
 use anyhow::{Context, Result};
 use collections::HashMap;
@@ -1193,6 +1202,9 @@ impl DirectWriteState {
         params: &RenderGlyphParams,
     ) -> Result<Bounds<DevicePixels>> {
         let glyph_analysis = self.create_glyph_run_analysis(components, params)?;
+        LAST_ANALYSIS.with(|last| {
+            *last.borrow_mut() = Some((params.clone(), glyph_analysis.clone()));
+        });
 
         let texture_type = if params.subpixel_rendering {
             DWRITE_TEXTURE_CLEARTYPE_3x1
@@ -1264,7 +1276,20 @@ impl DirectWriteState {
         params: &RenderGlyphParams,
         glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<Vec<u8>> {
-        let glyph_analysis = self.create_glyph_run_analysis(components, params)?;
+        let cached = LAST_ANALYSIS.with(|last| {
+            let mut last = last.borrow_mut();
+            match last.take() {
+                Some((cached, analysis)) if cached == *params => Some(analysis),
+                other => {
+                    *last = other;
+                    None
+                }
+            }
+        });
+        let glyph_analysis = match cached {
+            Some(analysis) => analysis,
+            None => self.create_glyph_run_analysis(components, params)?,
+        };
         if !params.subpixel_rendering {
             let mut bitmap_data =
                 vec![0u8; glyph_bounds.size.width.0 as usize * glyph_bounds.size.height.0 as usize];
@@ -2555,6 +2580,39 @@ mod tests {
     };
     #[cfg(not(feature = "native-dx12"))]
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    #[test]
+    fn reused_glyph_analysis_rasterizes_like_a_fresh_one() -> Result<()> {
+        let text_system = DirectWriteTextSystem::new(None)?;
+        let font_id = text_system.font_id(&Font {
+            family: "Segoe UI".into(),
+            ..Default::default()
+        })?;
+        let glyph_id = text_system
+            .glyph_for_char(font_id, 'g')
+            .expect("Segoe UI has a g");
+        for subpixel_rendering in [false, true] {
+            let params = RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: px(15.0),
+                subpixel_variant: point(1u8, 0u8),
+                scale_factor: 1.5,
+                is_emoji: false,
+                subpixel_rendering,
+                dilation: 0,
+            };
+            let raster_bounds = text_system.glyph_raster_bounds(&params)?;
+            let reused = text_system.rasterize_glyph(&params, raster_bounds)?;
+            super::LAST_ANALYSIS.with(|last| {
+                assert!(last.borrow().is_none(), "rasterizing consumes the analysis")
+            });
+            let fresh = text_system.rasterize_glyph(&params, raster_bounds)?;
+            assert_eq!(reused, fresh);
+            assert!(fresh.1.iter().any(|value| *value != 0));
+        }
+        Ok(())
+    }
 
     #[test]
     fn unicode_line_separators_preserve_shaped_line_cursor() -> Result<()> {
