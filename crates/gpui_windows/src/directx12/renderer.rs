@@ -20,18 +20,25 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{HWND, RECT},
+        Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_OBJECT_0},
         Graphics::{
             Direct3D::*,
             Direct3D12::*,
             DirectComposition::*,
             Dxgi::{Common::*, *},
         },
+        System::Threading::WaitForSingleObject,
     },
     core::Interface,
 };
 
 const FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+const SWAP_CHAIN_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+/// Presents that may queue ahead of the compositor. DXGI's default is three,
+/// which lets input latency grow by two frames whenever the GPU falls behind.
+const FRAME_LATENCY: u32 = 2;
+/// A frame waits this long for queue room before presenting anyway.
+const FRAME_LATENCY_TIMEOUT_MS: u32 = 100;
 const BUFFERS: usize = 3;
 const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
@@ -498,12 +505,39 @@ impl Composition {
     }
 }
 
+/// The swap chain's frame-latency semaphore: signalled once per retired
+/// present, so each present must consume exactly one wait.
+struct FrameLatency(HANDLE);
+impl FrameLatency {
+    fn new(swap_chain: &IDXGISwapChain3) -> Result<Self> {
+        unsafe {
+            swap_chain.SetMaximumFrameLatency(FRAME_LATENCY)?;
+            let handle = swap_chain.GetFrameLatencyWaitableObject();
+            ensure!(!handle.is_invalid(), "D3D12 swap chain has no latency waitable");
+            Ok(Self(handle))
+        }
+    }
+    fn wait(&self, timeout_ms: u32) -> bool {
+        unsafe { WaitForSingleObject(self.0, timeout_ms) == WAIT_OBJECT_0 }
+    }
+}
+impl Drop for FrameLatency {
+    fn drop(&mut self) {
+        if let Err(error) = unsafe { CloseHandle(self.0) } {
+            log::error!("D3D12 frame latency handle close failed: {error}");
+        }
+    }
+}
+
 pub(crate) struct DirectXRenderer {
     hwnd: HWND,
     gpu: Arc<Device>,
     atlas: Arc<Atlas>,
     pipelines: Pipelines,
     swap_chain: Option<IDXGISwapChain3>,
+    latency: Option<FrameLatency>,
+    /// A latency wait succeeded and no present has consumed it yet.
+    latency_ready: bool,
     disable_direct_composition: bool,
     composition: Option<Composition>,
     back_buffers: Vec<Arc<Target>>,
@@ -547,7 +581,7 @@ impl DirectXRenderer {
             } else {
                 DXGI_ALPHA_MODE_PREMULTIPLIED
             },
-            Flags: 0,
+            Flags: SWAP_CHAIN_FLAGS.0 as u32,
         };
         let swap_chain: IDXGISwapChain3 = unsafe {
             if disable_direct_composition {
@@ -564,6 +598,7 @@ impl DirectXRenderer {
             gpu.dxgi_factory
                 .MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
         }
+        let latency = FrameLatency::new(&swap_chain)?;
         let composition = if disable_direct_composition {
             None
         } else {
@@ -578,6 +613,8 @@ impl DirectXRenderer {
             atlas,
             pipelines,
             swap_chain: Some(swap_chain),
+            latency: Some(latency),
+            latency_ready: false,
             disable_direct_composition,
             composition,
             back_buffers,
@@ -638,6 +675,7 @@ impl DirectXRenderer {
         // visual and chain before creating its replacement, including retries.
         self.composition.take();
         self.back_buffers.clear();
+        self.latency.take();
         self.swap_chain.take();
         self.layers.clear();
         self.path_msaa = None;
@@ -676,7 +714,7 @@ impl DirectXRenderer {
                     width,
                     height,
                     FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    SWAP_CHAIN_FLAGS,
                 )?;
         }
         self.back_buffers = Self::buffers(
@@ -710,6 +748,27 @@ impl DirectXRenderer {
         }
         let _profile = crate::profiling::span(self.hwnd.0 as usize, "native", "D3D12 draw");
         let started = self.timings.as_ref().map(|_| Instant::now());
+        if !self.latency_ready {
+            if let Some(latency) = &self.latency {
+                let _wait =
+                    crate::profiling::span(self.hwnd.0 as usize, "wait", "D3D12 frame latency");
+                let timeout = if self.present_no_wait {
+                    0
+                } else {
+                    FRAME_LATENCY_TIMEOUT_MS
+                };
+                self.latency_ready = latency.wait(timeout);
+                if !self.latency_ready && self.present_no_wait {
+                    if let Some(timings) = self.timings.as_mut() {
+                        timings.skipped_gpu_busy += 1;
+                        timings.emit_if_due();
+                    }
+                    return Ok(());
+                }
+                // On timeout (an occluded or stalled compositor) present anyway,
+                // as before; the queue then holds one frame more until it drains.
+            }
+        }
         let index = unsafe {
             self.swap_chain
                 .as_ref()
@@ -785,6 +844,9 @@ impl DirectXRenderer {
             }
         };
         let present_busy = self.present_no_wait && result == DXGI_ERROR_WAS_STILL_DRAWING;
+        if !present_busy {
+            self.latency_ready = false;
+        }
         if let (Some(started), Some(present_started), Some(timings)) =
             (started, present_started, self.timings.as_mut())
         {
@@ -2226,6 +2288,8 @@ mod tests {
             pipelines: Pipelines::new(&gpu.device)?,
             gpu,
             swap_chain: None,
+            latency: None,
+            latency_ready: false,
             disable_direct_composition: true,
             composition: None,
             back_buffers: Vec::new(),
