@@ -23,6 +23,19 @@ use windows::{
 
 pub(super) type KeepAlive = Arc<dyn Any + Send + Sync>;
 
+const MAX_REUSABLE_COMMAND_PAIRS: usize = 16;
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct CommandStats {
+    pub created: u64,
+    pub reused: u64,
+}
+
+struct CommandPair {
+    allocator: ID3D12CommandAllocator,
+    commands: ID3D12GraphicsCommandList,
+}
+
 pub(crate) struct Device {
     pub(super) device: ID3D12Device,
     pub(super) queue: ID3D12CommandQueue,
@@ -30,12 +43,12 @@ pub(crate) struct Device {
     pub(super) dxgi_factory: IDXGIFactory6,
     video: Mutex<Weak<super::video::VideoBridge>>,
     retirement: Arc<Retirement>,
+    pub(super) srv_descriptor_stride: u32,
 }
 
 struct Pending {
     value: u64,
-    _allocator: ID3D12CommandAllocator,
-    _commands: ID3D12GraphicsCommandList,
+    commands: Option<CommandPair>,
     _owners: Vec<KeepAlive>,
 }
 
@@ -43,6 +56,8 @@ struct Pending {
 struct Submissions {
     next_value: u64,
     pending: VecDeque<Pending>,
+    command_pool: Vec<CommandPair>,
+    command_stats: CommandStats,
     worker_started: bool,
     shutdown: bool,
     failure: Option<String>,
@@ -160,7 +175,11 @@ impl Device {
             submissions: Mutex::new(Submissions::default()),
             changed: Condvar::new(),
         });
+        let srv_descriptor_stride = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
         Ok(Arc::new(Self {
+            srv_descriptor_stride,
             device,
             queue,
             adapter,
@@ -193,49 +212,73 @@ impl Device {
             bail!("D3D12 submission failed previously: {error}");
         }
         self.retirement.start_worker(&mut submissions)?;
-        let allocator: ID3D12CommandAllocator = unsafe {
-            self.device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?
-        };
-        let commands: ID3D12GraphicsCommandList = unsafe {
-            self.device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?
-        };
-        record(&commands)?;
-        unsafe { commands.Close()? };
-        let value = submissions
-            .next_value
-            .checked_add(1)
-            .filter(|value| *value != u64::MAX)
-            .context("D3D12 fence value exhausted")?;
-        let executable: ID3D12CommandList = commands.cast()?;
-        if let Some((fence, ready_value)) = ready {
-            unsafe { self.queue.Wait(fence, ready_value)? };
-            owners.push(Arc::new(fence.clone()));
-        }
         let retired = drain_completed(&mut submissions, self.completed_value());
-        submissions.next_value = value;
-        // Publication precedes Execute: even a subsequent Signal failure cannot
-        // release buffers that the GPU may already be consuming.
-        submissions.pending.push_back(Pending {
-            value,
-            _allocator: allocator,
-            _commands: commands,
-            _owners: owners,
-        });
-        unsafe { self.queue.ExecuteCommandLists(&[Some(executable)]) };
-        let signal = unsafe { self.queue.Signal(&self.retirement.fence, value) };
-        if let Err(error) = &signal {
-            submissions.failure = Some(error.to_string());
-            submissions.needs_signal = true;
-        }
-        self.retirement.changed.notify_one();
+        let result = (|| {
+            let pair = if let Some(pair) = submissions.command_pool.pop() {
+                unsafe {
+                    pair.allocator.Reset()?;
+                    pair.commands.Reset(&pair.allocator, None)?;
+                }
+                submissions.command_stats.reused += 1;
+                pair
+            } else {
+                let allocator: ID3D12CommandAllocator = unsafe {
+                    self.device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?
+                };
+                let commands: ID3D12GraphicsCommandList = unsafe {
+                    self.device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?
+                };
+                submissions.command_stats.created += 1;
+                CommandPair {
+                    allocator,
+                    commands,
+                }
+            };
+            record(&pair.commands)?;
+            unsafe { pair.commands.Close()? };
+            let value = submissions
+                .next_value
+                .checked_add(1)
+                .filter(|value| *value != u64::MAX)
+                .context("D3D12 fence value exhausted")?;
+            let executable: ID3D12CommandList = pair.commands.cast()?;
+            if let Some((fence, ready_value)) = ready {
+                unsafe { self.queue.Wait(fence, ready_value)? };
+                owners.push(Arc::new(fence.clone()));
+            }
+            submissions.next_value = value;
+            // Publication precedes Execute: a failed Signal must retain every
+            // command allocator and resource that the GPU may already consume.
+            submissions.pending.push_back(Pending {
+                value,
+                commands: Some(pair),
+                _owners: std::mem::take(&mut owners),
+            });
+            unsafe { self.queue.ExecuteCommandLists(&[Some(executable)]) };
+            let signal = unsafe { self.queue.Signal(&self.retirement.fence, value) };
+            if let Err(error) = &signal {
+                submissions.failure = Some(error.to_string());
+                submissions.needs_signal = true;
+            }
+            self.retirement.changed.notify_one();
+            signal.context("Signalling native D3D12 submission completion")?;
+            Ok(value)
+        })();
         drop(submissions);
-        // A producer owner may own its Device. Never run its destructor under
-        // the submission mutex or it can deadlock during device shutdown.
+        // Both success and early recording errors must drop producer owners
+        // outside the submission mutex: an owner can release its own Device.
         self.retirement.retire(retired);
-        signal.context("Signalling native D3D12 submission completion")?;
-        Ok(value)
+        result
+    }
+
+    pub(super) fn command_stats(&self) -> CommandStats {
+        self.retirement.submissions.lock().command_stats
     }
 
     pub(super) fn completed_value(&self) -> u64 {
@@ -644,7 +687,15 @@ fn drain_completed(submissions: &mut Submissions, completed: u64) -> Vec<Pending
         .front()
         .is_some_and(|pending| pending.value <= completed)
     {
-        if let Some(pending) = submissions.pending.pop_front() {
+        if let Some(mut pending) = submissions.pending.pop_front() {
+            if !submissions.shutdown
+                && submissions.failure.is_none()
+                && submissions.command_pool.len() < MAX_REUSABLE_COMMAND_PAIRS
+            {
+                if let Some(pair) = pending.commands.take() {
+                    submissions.command_pool.push(pair);
+                }
+            }
             retired.push(pending);
         }
     }
@@ -912,6 +963,44 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly on Windows"]
+    fn native_command_pairs_reuse_only_after_their_fence() -> Result<()> {
+        let device = Device::new()?;
+        let gate: ID3D12Fence = unsafe { device.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+        let _release_gate = ReleaseGate(gate.clone());
+        let mut first = 0;
+        device.submit_after(Vec::new(), Some((&gate, 1)), |list| {
+            first = list.as_raw() as usize;
+            Ok(())
+        })?;
+        let mut second = 0;
+        let fence = device.submit(Vec::new(), |list| {
+            second = list.as_raw() as usize;
+            Ok(())
+        })?;
+        assert_ne!(first, second, "in-flight command lists must not be reset");
+        let busy = device.command_stats();
+        assert_eq!(busy.created, 2);
+        assert_eq!(busy.reused, 0);
+        unsafe { gate.Signal(1)? };
+        device.wait_for(fence)?;
+        let mut reused = 0;
+        let fence = device.submit(Vec::new(), |list| {
+            reused = list.as_raw() as usize;
+            Ok(())
+        })?;
+        device.wait_for(fence)?;
+        assert!([first, second].contains(&reused));
+        let completed = device.command_stats();
+        assert_eq!(
+            completed.created, 2,
+            "steady-state submit created a new command pair"
+        );
+        assert_eq!(completed.reused, 1);
+        Ok(())
+    }
 
     struct ReleaseGate(ID3D12Fence);
     impl Drop for ReleaseGate {

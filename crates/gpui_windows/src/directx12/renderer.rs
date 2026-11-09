@@ -1,7 +1,7 @@
 use super::{
     DirectXDevices,
     atlas::{Atlas, AtlasTexture},
-    device::{Device, KeepAlive, TextureLocation, transition},
+    device::{CommandStats, Device, KeepAlive, TextureLocation, transition},
     pipelines::{
         Pipelines, ROOT_BATCH, ROOT_CLIP_SEGMENTS, ROOT_GLOBALS, ROOT_INSTANCES,
         ROOT_TEXT_BACKGROUNDS, ROOT_TEXTURES,
@@ -41,6 +41,7 @@ const MAX_UPLOAD_POOL_BYTES: u64 = 256 * 1024 * 1024;
 const UPLOAD_ALLOCATION_ALIGNMENT: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
 const MAX_LAYER_DEPTH: usize = 8;
 const DESCRIPTORS_PER_PAGE: u32 = 256;
+const MAX_CACHED_DESCRIPTOR_PAGES: usize = 16;
 const _: () = assert!(std::mem::size_of::<GlobalParams>() == 48);
 const _: () = assert!(std::mem::offset_of!(GlobalParams, is_bgr) == 32);
 const _: () = assert!(std::mem::size_of::<PathRasterizationSprite>() == 292);
@@ -59,6 +60,8 @@ struct UploadPool {
     buffers: Vec<UploadBuffer>,
     next: usize,
     allocation_bytes: u64,
+    // Descriptor writes share the frame slot's upload-buffer fence guard.
+    descriptor_pages: Vec<ID3D12DescriptorHeap>,
 }
 impl UploadPool {
     fn begin(&mut self, completed: u64, reusable_after: u64) -> Result<()> {
@@ -145,6 +148,18 @@ impl UploadPool {
 }
 
 #[derive(Clone, Copy, Default)]
+struct RenderWork {
+    descriptor_pages_created: u64,
+    descriptor_pages_reused: u64,
+}
+impl RenderWork {
+    fn add(&mut self, other: Self) {
+        self.descriptor_pages_created += other.descriptor_pages_created;
+        self.descriptor_pages_reused += other.descriptor_pages_reused;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct CpuStage {
     total: Duration,
     maximum: Duration,
@@ -164,6 +179,8 @@ struct RendererTimings {
     skipped_present_busy: u64,
     stages: [CpuStage; 9],
     last_render: [Duration; 5],
+    work: RenderWork,
+    commands: CommandStats,
 }
 impl RendererTimings {
     fn from_environment() -> Option<Self> {
@@ -177,6 +194,8 @@ impl RendererTimings {
                 skipped_present_busy: 0,
                 stages: [CpuStage::default(); 9],
                 last_render: [Duration::ZERO; 5],
+                work: RenderWork::default(),
+                commands: CommandStats::default(),
             })
     }
 
@@ -249,6 +268,14 @@ impl RendererTimings {
             self.skipped_present_busy,
             stages,
         );
+        log::info!(
+            "[DX12 work] descriptor_pages_created={} descriptor_pages_reused={} command_pairs_created_total={} command_pairs_reused_total={}",
+            self.work.descriptor_pages_created,
+            self.work.descriptor_pages_reused,
+            self.commands.created,
+            self.commands.reused,
+        );
+        self.work = RenderWork::default();
         self.started = Instant::now();
         self.frames = 0;
         self.fence_waits = 0;
@@ -718,6 +745,7 @@ impl DirectXRenderer {
         if let (Some(started), Some(present_started), Some(timings)) =
             (started, present_started, self.timings.as_mut())
         {
+            timings.commands = self.gpu.command_stats();
             timings.frame(
                 fence_time,
                 render_time,
@@ -836,6 +864,7 @@ impl DirectXRenderer {
         let mut changes = StateChanges::new();
         let submit_started = prepare_started.map(|_| Instant::now());
         let mut record_time = Duration::ZERO;
+        let mut work = RenderWork::default();
         let result = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
             let _record_profile =
                 crate::profiling::span(profile_target, "native", "D3D12 record commands");
@@ -851,6 +880,7 @@ impl DirectXRenderer {
                 globals,
                 retained,
                 descriptors,
+                work: &mut work,
                 uploads,
                 target: target.clone(),
                 width: self.width,
@@ -885,6 +915,7 @@ impl DirectXRenderer {
         if result.is_ok() {
             changes.commit();
             if let Some(timings) = self.timings.as_mut() {
+                timings.work.add(work);
                 timings.last_render = [
                     prepare_time,
                     upload_time,
@@ -1202,14 +1233,18 @@ struct Descriptors {
     retained: Retained,
     heap: Option<ID3D12DescriptorHeap>,
     used: u32,
+    next_page: usize,
+    stride: u32,
 }
 impl Descriptors {
     fn new(gpu: Arc<Device>, retained: Retained) -> Self {
         Self {
+            stride: gpu.srv_descriptor_stride,
             gpu,
             retained,
             heap: None,
             used: DESCRIPTORS_PER_PAGE,
+            next_page: 0,
         }
     }
     fn textures(
@@ -1217,19 +1252,33 @@ impl Descriptors {
         list: &ID3D12GraphicsCommandList,
         first: Option<&AtlasTexture>,
         second: Option<&AtlasTexture>,
+        uploads: &mut UploadPool,
+        work: &mut RenderWork,
     ) -> Result<D3D12_GPU_DESCRIPTOR_HANDLE> {
         if self.used + 2 > DESCRIPTORS_PER_PAGE {
-            let heap: ID3D12DescriptorHeap = unsafe {
-                self.gpu
-                    .device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: DESCRIPTORS_PER_PAGE,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })?
+            let heap = if let Some(heap) = uploads.descriptor_pages.get(self.next_page) {
+                work.descriptor_pages_reused += 1;
+                heap.clone()
+            } else {
+                let heap: ID3D12DescriptorHeap = unsafe {
+                    self.gpu
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: DESCRIPTORS_PER_PAGE,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })?
+                };
+                if self.next_page < MAX_CACHED_DESCRIPTOR_PAGES {
+                    uploads.descriptor_pages.push(heap.clone());
+                }
+                work.descriptor_pages_created += 1;
+                heap
             };
+            self.next_page += 1;
             retain(&self.retained, heap.clone());
+            unsafe { list.SetDescriptorHeaps(&[Some(heap.clone())]) };
             self.heap = Some(heap);
             self.used = 0;
         }
@@ -1237,11 +1286,7 @@ impl Descriptors {
             .heap
             .as_ref()
             .context("D3D12 descriptor page missing")?;
-        let stride = unsafe {
-            self.gpu
-                .device
-                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-        };
+        let stride = self.stride;
         let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart() };
         for (offset, texture) in [first, second].into_iter().enumerate() {
@@ -1271,9 +1316,6 @@ impl Descriptors {
                 retain(&self.retained, texture.resource.clone());
             }
         }
-        unsafe {
-            list.SetDescriptorHeaps(&[Some(heap.clone())]);
-        }
         let table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: gpu.ptr + u64::from(self.used * stride),
         };
@@ -1293,6 +1335,7 @@ struct Encoding<'a> {
     globals: ID3D12Resource,
     retained: Retained,
     descriptors: Descriptors,
+    work: &'a mut RenderWork,
     uploads: &'a mut UploadPool,
     target: Arc<Target>,
     width: u32,
@@ -1355,7 +1398,9 @@ impl Encoding<'_> {
         if count == 0 {
             return Ok(());
         }
-        let table = self.descriptors.textures(self.list, first, second)?;
+        let table = self
+            .descriptors
+            .textures(self.list, first, second, self.uploads, self.work)?;
         retain(&self.retained, pipeline.clone());
         retain(&self.retained, self.pipelines.root_signature.clone());
         let batch = [start, 0, 0, 0];
@@ -1796,6 +1841,69 @@ impl Encoding<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly on Windows"]
+    fn native_descriptor_pages_reuse_after_the_frame_slot_fence() -> Result<()> {
+        struct ReleaseGate(ID3D12Fence);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                if let Err(error) = unsafe { self.0.Signal(1) } {
+                    log::error!("Releasing descriptor test gate: {error}");
+                }
+            }
+        }
+        let gpu = Device::new()?;
+        let gate: ID3D12Fence = unsafe { gpu.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+        let _release_gate = ReleaseGate(gate.clone());
+        let mut uploads = UploadPool::default();
+        uploads.begin(gpu.completed_value(), 0)?;
+        let retained: Retained = Arc::new(Mutex::new(Vec::new()));
+        let mut first = RenderWork::default();
+        let fence = gpu.submit_after(
+            vec![retained.clone() as KeepAlive],
+            Some((&gate, 1)),
+            |list| {
+                let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
+                for _ in 0..(DESCRIPTORS_PER_PAGE / 2 + 1) {
+                    descriptors.textures(list, None, None, &mut uploads, &mut first)?;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(first.descriptor_pages_created, 2);
+        assert_eq!(first.descriptor_pages_reused, 0);
+        assert!(uploads.begin(gpu.completed_value(), fence).is_err());
+        let page = uploads
+            .descriptor_pages
+            .first()
+            .context("descriptor page missing")?
+            .as_raw();
+        unsafe { gate.Signal(1)? };
+        gpu.wait_for(fence)?;
+        uploads.begin(gpu.completed_value(), fence)?;
+        let retained: Retained = Arc::new(Mutex::new(Vec::new()));
+        let mut second = RenderWork::default();
+        let fence = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
+            let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
+            for _ in 0..(DESCRIPTORS_PER_PAGE / 2 + 1) {
+                descriptors.textures(list, None, None, &mut uploads, &mut second)?;
+            }
+            Ok(())
+        })?;
+        gpu.wait_for(fence)?;
+        assert_eq!(second.descriptor_pages_created, 0);
+        assert_eq!(second.descriptor_pages_reused, 2);
+        assert_eq!(
+            uploads
+                .descriptor_pages
+                .first()
+                .context("descriptor page missing")?
+                .as_raw(),
+            page
+        );
+        Ok(())
+    }
 
     fn offscreen(width: u32, height: u32) -> Result<DirectXRenderer> {
         let gpu = Device::new()?;
