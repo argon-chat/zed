@@ -12,15 +12,20 @@ use cocoa::{
         NSApplicationActivationPolicy::{
             NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
         },
-        NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSVisualEffectState,
-        NSVisualEffectView, NSWindow,
+        NSControl as _, NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType, NSMenu, NSMenuItem,
+        NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSProcessInfo, NSString, NSUInteger, NSURL,
+        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSString, NSUInteger,
+        NSURL,
     },
 };
-use core_foundation::{base::CFRelease, runloop::CFRunLoopRun, string::CFStringRef};
+use core_foundation::{
+    base::CFRelease,
+    runloop::{CFRunLoopGetMain, CFRunLoopRun, CFRunLoopStop},
+    string::CFStringRef,
+};
 use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
@@ -101,8 +106,8 @@ unsafe fn build_classes() {
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
             );
             decl.add_method(
-                sel!(applicationWillTerminate:),
-                will_terminate as extern "C" fn(&mut Object, Sel, id),
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
             );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
@@ -195,6 +200,7 @@ pub(crate) struct MacPlatformState {
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_power_observers_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
+    quit_requested: bool,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -258,6 +264,7 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            quit_requested: false,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -277,6 +284,62 @@ impl MacPlatform {
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
         });
         Self(state, marker)
+    }
+
+    // Defer until GPUI releases its App borrow. The callback runs shutdown()
+    // synchronously, including waiting for every quit observer future. Only
+    // after it returns true may the platform loop return to the embedding host.
+    fn request_quit(&self) {
+        {
+            let mut state = self.0.lock();
+            if state.quit_requested {
+                return;
+            }
+            state.quit_requested = true;
+        }
+        let platform = self as *const Self as *mut c_void;
+        unsafe { DispatchQueue::main().exec_async_f(platform, finish_quit) };
+
+        extern "C" fn finish_quit(context: *mut c_void) {
+            let platform = unsafe { &*(context as *const MacPlatform) };
+            let mut callback = platform.0.lock().quit.take();
+            let ready = callback.as_mut().is_none_or(|callback| callback());
+            let headless = {
+                let mut state = platform.0.lock();
+                state.quit = callback;
+                if !ready {
+                    state.quit_requested = false;
+                }
+                state.headless
+            };
+            if !ready {
+                platform.request_quit();
+                return;
+            }
+            unsafe {
+                if headless {
+                    CFRunLoopStop(CFRunLoopGetMain());
+                } else {
+                    let app: id = msg_send![APP_CLASS, sharedApplication];
+                    app.stop_(nil);
+                    // stop: sets a flag but does not wake nextEventMatchingMask:.
+                    // An application-defined event lets run return immediately.
+                    let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+                        nil,
+                        NSEventType::NSApplicationDefined,
+                        NSPoint::new(0.0, 0.0),
+                        NSEventModifierFlags::empty(),
+                        0.0,
+                        0,
+                        nil,
+                        NSEventSubtype::NSWindowExposedEventType,
+                        0,
+                        0,
+                    );
+                    app.postEvent_atStart_(event, YES);
+                }
+            }
+        }
     }
 
     unsafe fn create_menu_bar(
@@ -554,6 +617,7 @@ impl Platform for MacPlatform {
             drop(state);
             on_finish_launching();
             unsafe { CFRunLoopRun() };
+            return;
         } else {
             state.finish_launching = Some(on_finish_launching);
             drop(state);
@@ -591,23 +655,7 @@ impl Platform for MacPlatform {
     }
 
     fn quit(&self) {
-        // Quitting the app causes us to close windows, which invokes `Window::on_close` callbacks
-        // synchronously before this method terminates. If we call `Platform::quit` while holding a
-        // borrow of the app state (which most of the time we will do), we will end up
-        // double-borrowing the app state in the `on_close` callbacks for our open windows. To solve
-        // this, we make quitting the application asynchronous so that we aren't holding borrows to
-        // the app state on the stack when we actually terminate the app.
-
-        unsafe {
-            DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
-        }
-
-        extern "C" fn quit(_: *mut c_void) {
-            unsafe {
-                let app = NSApplication::sharedApplication(nil);
-                let _: () = msg_send![app, terminate: nil];
-            }
-        }
+        self.request_quit();
     }
 
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
@@ -1378,14 +1426,12 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
     }
 }
 
-extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
     let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.quit.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().quit.get_or_insert(callback);
-    }
+    platform.request_quit();
+    // NSTerminateLater: the embedding host owns process termination after the
+    // stopped application loop returns. AppKit must not exit before host cleanup.
+    2
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {

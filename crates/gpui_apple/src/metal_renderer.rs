@@ -392,7 +392,7 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
-        let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), supports_shared_storage));
+        let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), command_queue.clone(), supports_shared_storage));
         // metal and objc2-metal expose the same Objective-C device; the borrowed
         // protocol object remains valid while `device` owns it.
         let core_video_texture_cache = unsafe {
@@ -768,14 +768,12 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::BackdropBlurRects(_) => {
                     // DirectX is the only backend with backdrop blur support.
-                    true
                 }
                 PrimitiveBatch::EffectQuads { .. } => {
                     // …and the only one with `--shading` effect pipelines. The
                     // `.slang` sources retarget (`-target wgsl` / SPIR-V), but
                     // the engine-owned vertex stage and the pipeline table are
                     // per-backend, so this is a real port rather than a flag.
-                    true
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
