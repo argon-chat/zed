@@ -2114,7 +2114,9 @@ impl Element for Div {
         });
 
         let mut child_min = point(Pixels::MAX, Pixels::MAX);
-        let mut child_max = Point::default();
+        // Child bounds are in window space, so the origin cannot be a sentinel:
+        // an ancestor's scroll may put every child's far edge below zero.
+        let mut child_max = point(Pixels::MIN, Pixels::MIN);
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
@@ -2618,6 +2620,39 @@ impl Interactivity {
             || window.is_inspector_picking(cx)
     }
 
+    fn max_scroll_offset(
+        &self,
+        bounds: Bounds<Pixels>,
+        style: &Style,
+        window: &Window,
+    ) -> Point<Pixels> {
+        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+            const ROUNDING_FACTOR: f32 = 100.0;
+            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
+        }
+
+        let rem_size = window.rem_size();
+        // Taffy lays the box out with the padding snapped to the device pixel
+        // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
+        // rem size, it exceeds `bounds` and leaves the box scrollable by the
+        // sub-pixel difference.
+        let padding = style
+            .padding
+            .to_pixels(bounds.size.into(), rem_size)
+            .map(|edge| window.pixel_snap(*edge));
+        let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+        // The floating point values produced by Taffy and ours often vary
+        // slightly after ~5 decimal places. This can lead to cases where after
+        // subtracting these, the container becomes scrollable for less than
+        // 0.00000x pixels. As we generally don't benefit from a precision that
+        // high for the maximum scroll, we round the scroll max to 2 decimal
+        // places here.
+        let padded_content_size = self.content_size + padding_size;
+        Point::from(padded_content_size - bounds.size)
+            .map(round_to_two_decimals)
+            .max(&Default::default())
+    }
+
     fn clamp_scroll_position(
         &self,
         bounds: Bounds<Pixels>,
@@ -2625,11 +2660,6 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
-        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
-            const ROUNDING_FACTOR: f32 = 100.0;
-            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
-        }
-
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
@@ -2641,26 +2671,7 @@ impl Interactivity {
                 scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
             }
 
-            let rem_size = window.rem_size();
-            // Taffy lays the box out with the padding snapped to the device pixel
-            // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
-            // rem size, it exceeds `bounds` and leaves the box scrollable by the
-            // sub-pixel difference.
-            let padding = style
-                .padding
-                .to_pixels(bounds.size.into(), rem_size)
-                .map(|edge| window.pixel_snap(*edge));
-            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
-            // The floating point values produced by Taffy and ours often vary
-            // slightly after ~5 decimal places. This can lead to cases where after
-            // subtracting these, the container becomes scrollable for less than
-            // 0.00000x pixels. As we generally don't benefit from a precision that
-            // high for the maximum scroll, we round the scroll max to 2 decimal
-            // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
-                .map(round_to_two_decimals)
-                .max(&Default::default());
+            let scroll_max = self.max_scroll_offset(bounds, style, window);
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3535,6 +3546,7 @@ impl Interactivity {
         _cx: &mut App,
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
+            let scroll_max = self.max_scroll_offset(hitbox.bounds, style, window);
             let ongoing_scroll = self.ongoing_scroll.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
@@ -3582,8 +3594,10 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    // A burst can dispatch several wheel events before prepaint.
+                    // Keep the live offset valid for subsequent handlers and hit targets.
+                    scroll_offset.y = (scroll_offset.y + delta_y).clamp(-scroll_max.y, px(0.));
+                    scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.x, px(0.));
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }
@@ -6072,6 +6086,205 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    struct ScrollBurstTestView {
+        root: ScrollHandle,
+        short: ScrollHandle,
+        long: ScrollHandle,
+        deltas: Rc<RefCell<Vec<Point<Pixels>>>>,
+    }
+
+    impl Render for ScrollBurstTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let deltas = self.deltas.clone();
+            div()
+                .id("burst-root")
+                .relative()
+                .w(px(300.))
+                .h(px(100.))
+                .overflow_scroll()
+                .track_scroll(&self.root)
+                .child(
+                    div()
+                        .id("burst-short")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.short)
+                        .child(div().w_full().h(px(20.))),
+                )
+                .child(
+                    div()
+                        .id("burst-long")
+                        .absolute()
+                        .top_0()
+                        .left(px(100.))
+                        .w(px(200.))
+                        .h(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.long)
+                        .on_scroll(move |event, window, _| {
+                            deltas
+                                .borrow_mut()
+                                .push(event.delta.pixel_delta(window.line_height()));
+                        })
+                        .child(div().w_full().h(px(600.))),
+                )
+        }
+    }
+
+    fn dispatch_test_scroll(
+        window: &mut Window,
+        cx: &mut App,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+    ) {
+        window.dispatch_event(
+            crate::PlatformInput::Scroll(ScrollEvent {
+                position,
+                delta: crate::ScrollDelta::Pixels(delta),
+                ..Default::default()
+            }),
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn wheel_bursts_and_sibling_transfer_keep_live_offsets_in_bounds(cx: &mut TestAppContext) {
+        let root = ScrollHandle::new();
+        let short = ScrollHandle::new();
+        let long = ScrollHandle::new();
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let root = root.clone();
+                let short = short.clone();
+                let long = long.clone();
+                let deltas = deltas.clone();
+                move |_, _| ScrollBurstTestView {
+                    root,
+                    short,
+                    long,
+                    deltas,
+                }
+            })
+            .into();
+
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(root.max_offset(), Point::default());
+        assert_eq!(short.max_offset(), Point::default());
+        assert_eq!(long.max_offset().y, px(500.));
+
+        cx.update_window(window, |_, window, cx| {
+            let chat_position = point(px(150.), px(50.));
+            let sidebar_position = point(px(50.), px(50.));
+            dispatch_test_scroll(window, cx, chat_position, point(px(0.), px(-0.25)));
+            assert_eq!(long.offset().y, px(-0.25));
+            assert_eq!(root.offset(), Point::default());
+
+            // Inspect live handles before any frame can repair an invalid offset.
+            for _ in 0..24 {
+                dispatch_test_scroll(window, cx, chat_position, point(px(0.), px(-1000.)));
+                assert_eq!(long.offset().y, px(-500.));
+                assert_eq!(root.offset(), Point::default());
+            }
+            for delta in [-1000., 1000., -1000.] {
+                dispatch_test_scroll(window, cx, sidebar_position, point(px(0.), px(delta)));
+                assert_eq!(short.offset(), Point::default());
+                assert_eq!(root.offset(), Point::default());
+                assert_eq!(long.offset().y, px(-500.));
+            }
+        })
+        .unwrap();
+        assert_eq!(deltas.borrow().len(), 25);
+        assert_eq!(deltas.borrow()[0], point(px(0.), px(-0.25)));
+        assert!(
+            deltas.borrow()[1..]
+                .iter()
+                .all(|delta| *delta == point(px(0.), px(-1000.)))
+        );
+    }
+
+    struct TranslatedScrollExtentTestView {
+        outer: ScrollHandle,
+        inner: ScrollHandle,
+        negative_child: bool,
+    }
+
+    impl Render for TranslatedScrollExtentTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("extent-outer")
+                .size(px(100.))
+                .overflow_scroll()
+                .track_scroll(&self.outer)
+                .child(
+                    div().relative().size(px(1000.)).child(
+                        div()
+                            .id("extent-inner")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size(px(100.))
+                            .overflow_scroll()
+                            .track_scroll(&self.inner)
+                            .child(div().w(px(100.)).h(px(20.)))
+                            // The overlay scrollbar contributes a zero-size absolute child.
+                            .child(div().absolute().top_0().left_0().size(px(0.)))
+                            .when(self.negative_child, |element| {
+                                element.child(
+                                    div().absolute().left(px(-60.)).top(px(-120.)).size(px(20.)),
+                                )
+                            }),
+                    ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn negative_ancestor_origins_do_not_create_or_inflate_scroll_extents(cx: &mut TestAppContext) {
+        // Preserve the span of authored negative absolute children too.
+        for negative_child in [false, true] {
+            let outer = ScrollHandle::new();
+            let inner = ScrollHandle::new();
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let outer = outer.clone();
+                    let inner = inner.clone();
+                    move |_, _| TranslatedScrollExtentTestView {
+                        outer,
+                        inner,
+                        negative_child,
+                    }
+                })
+                .into();
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let expected = if negative_child {
+                point(px(60.), px(40.))
+            } else {
+                Point::default()
+            };
+            assert_eq!(inner.max_offset(), expected);
+
+            // Both axes become wholly negative in window space. Repeated frames
+            // must not turn the ancestor's displacement into inner content size.
+            for displacement in [px(500.), px(800.), px(500.), px(0.)] {
+                outer.set_offset(point(-displacement, -displacement));
+                cx.update_window(window, |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+                assert_eq!(outer.offset(), point(-displacement, -displacement));
+                assert_eq!(inner.max_offset(), expected);
+                assert_eq!(inner.offset(), Point::default());
+            }
+        }
     }
 
     struct ContentSizedGrid;
