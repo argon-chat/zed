@@ -38,7 +38,9 @@ const SHADER_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
 );
 const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_UPLOAD_POOL_BYTES: u64 = 256 * 1024 * 1024;
-const UPLOAD_ALLOCATION_ALIGNMENT: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+const MIN_UPLOAD_CAPACITY: u64 = 256 * 1024;
+/// Drawn frames a slot's upload buffer may stay four times too large.
+const UPLOAD_SHRINK_FRAMES: u32 = 240;
 const MAX_LAYER_DEPTH: usize = 8;
 const DESCRIPTORS_PER_PAGE: u32 = 256;
 const MAX_CACHED_DESCRIPTOR_PAGES: usize = 16;
@@ -49,17 +51,55 @@ const _: () = assert!(std::mem::offset_of!(PathRasterizationSprite, color) == 16
 const _: () = assert!(std::mem::size_of::<PathSprite>() == 16);
 type Retained = Arc<Mutex<Vec<KeepAlive>>>;
 
+/// One persistently mapped upload-heap buffer that a frame slot sub-allocates
+/// linearly: one committed resource per slot instead of one per array, no
+/// Map/Unmap per frame, and no reallocation when the scene's mix of primitive
+/// kinds changes.
 struct UploadBuffer {
     resource: ID3D12Resource,
+    address: u64,
+    mapped: *mut u8,
     capacity: u64,
-    allocation_bytes: u64,
+}
+// The mapping belongs to `resource`, which is only written by the renderer
+// thread that owns the pool, and only after the slot's fence completed.
+unsafe impl Send for UploadBuffer {}
+impl UploadBuffer {
+    fn new(gpu: &Device, capacity: u64) -> Result<Self> {
+        let resource = gpu.create_buffer(
+            capacity,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )?;
+        let mut mapped = ptr::null_mut();
+        unsafe {
+            resource.Map(
+                0,
+                Some(&D3D12_RANGE { Begin: 0, End: 0 }),
+                Some(&mut mapped),
+            )?;
+        }
+        ensure!(!mapped.is_null(), "D3D12 upload buffer mapped to null");
+        Ok(Self {
+            address: unsafe { resource.GetGPUVirtualAddress() },
+            resource,
+            mapped: mapped.cast(),
+            capacity,
+        })
+    }
 }
 
 #[derive(Default)]
 struct UploadPool {
-    buffers: Vec<UploadBuffer>,
-    next: usize,
-    allocation_bytes: u64,
+    buffer: Option<UploadBuffer>,
+    cursor: u64,
+    /// Whether this frame's `Retained` already holds `buffer`.
+    retained: bool,
+    /// Consecutive frames that used under a quarter of `buffer`, and the most
+    /// any of them used: the size a shrunk buffer is recreated at.
+    sparse_frames: u32,
+    sparse_peak: u64,
+    capacity_hint: u64,
     // Descriptor writes share the frame slot's upload-buffer fence guard.
     descriptor_pages: Vec<ID3D12DescriptorHeap>,
 }
@@ -69,80 +109,79 @@ impl UploadPool {
             completed >= reusable_after,
             "D3D12 uploads cannot be reused before fence {reusable_after} completes"
         );
-        self.next = 0;
+        self.cursor = 0;
+        self.retained = false;
         Ok(())
     }
 
-    fn buffer(&mut self, gpu: &Device, bytes: usize) -> Result<ID3D12Resource> {
+    /// Copies `data` into the slot's buffer and returns its GPU address. An
+    /// empty array gets 256 zero bytes, a valid binding for any root view.
+    fn write(&mut self, gpu: &Device, retained: &Retained, data: &[u8]) -> Result<u64> {
         ensure!(
-            bytes <= MAX_UPLOAD_BYTES,
+            data.len() <= MAX_UPLOAD_BYTES,
             "D3D12 scene upload exceeds {MAX_UPLOAD_BYTES} bytes"
         );
-        let required = u64::try_from(bytes.max(1))
-            .context("D3D12 upload size overflow")?
-            .checked_add(255)
-            .context("D3D12 upload alignment overflow")?
-            & !255;
-        if let Some(buffer) = self
-            .buffers
-            .get(self.next)
-            .filter(|buffer| buffer.capacity >= required)
-        {
-            self.next += 1;
-            return Ok(buffer.resource.clone());
+        // 256 bytes: constant-buffer placement, and more than any root view needs.
+        let size = (data.len().max(1) as u64 + 255) & !255;
+        let fits = self
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| self.cursor + size <= buffer.capacity);
+        if !fits {
+            // Whatever this frame already wrote stays alive in `retained`
+            // until its fence; later writes continue in a larger buffer.
+            let capacity = (self.cursor + size)
+                .max(self.buffer.as_ref().map_or(0, |buffer| buffer.capacity * 2))
+                .max(self.capacity_hint)
+                .max(MIN_UPLOAD_CAPACITY)
+                .checked_next_power_of_two()
+                .context("D3D12 upload capacity overflow")?;
+            ensure!(
+                capacity <= MAX_UPLOAD_POOL_BYTES,
+                "D3D12 frame upload pool exceeds {MAX_UPLOAD_POOL_BYTES} committed bytes"
+            );
+            self.buffer = Some(UploadBuffer::new(gpu, capacity)?);
+            self.cursor = 0;
+            self.retained = false;
+            self.sparse_frames = 0;
         }
-        let capacity = required
-            .max(UPLOAD_ALLOCATION_ALIGNMENT)
-            .checked_next_power_of_two()
-            .context("D3D12 upload capacity overflow")?;
-        let allocation_bytes = capacity
-            .checked_add(UPLOAD_ALLOCATION_ALIGNMENT - 1)
-            .context("D3D12 upload allocation size overflow")?
-            & !(UPLOAD_ALLOCATION_ALIGNMENT - 1);
-        let previous = self
-            .buffers
-            .get(self.next)
-            .map_or(0, |buffer| buffer.allocation_bytes);
-        let mut total = self
-            .allocation_bytes
-            .checked_sub(previous)
-            .and_then(|total| total.checked_add(allocation_bytes))
-            .context("D3D12 upload pool accounting overflow")?;
-        // Unused slots belong to a completed frame, so they must not prevent
-        // a larger current upload from fitting within the pool's hard budget.
-        while total > MAX_UPLOAD_POOL_BYTES && self.buffers.len() > self.next + 1 {
-            if let Some(buffer) = self.buffers.pop() {
-                self.allocation_bytes -= buffer.allocation_bytes;
-                total -= buffer.allocation_bytes;
+        let buffer = self
+            .buffer
+            .as_ref()
+            .context("D3D12 upload buffer missing")?;
+        if !self.retained {
+            retain(retained, buffer.resource.clone());
+            self.retained = true;
+        }
+        let offset = self.cursor;
+        unsafe {
+            let destination = buffer.mapped.add(offset as usize);
+            if data.is_empty() {
+                ptr::write_bytes(destination, 0, 256);
+            } else {
+                ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
             }
         }
-        ensure!(
-            total <= MAX_UPLOAD_POOL_BYTES,
-            "D3D12 frame upload pool exceeds {MAX_UPLOAD_POOL_BYTES} committed bytes"
-        );
-        let resource = gpu.create_buffer(
-            capacity,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-        )?;
-        let buffer = UploadBuffer {
-            resource: resource.clone(),
-            capacity,
-            allocation_bytes,
-        };
-        if let Some(slot) = self.buffers.get_mut(self.next) {
-            *slot = buffer;
-        } else {
-            self.buffers.push(buffer);
-        }
-        self.allocation_bytes = total;
-        self.next += 1;
-        Ok(resource)
+        self.cursor += size;
+        Ok(buffer.address + offset)
     }
 
+    /// Releases a buffer that stayed four times larger than its frames need
+    /// for a while; the next frame recreates it at twice the recent peak.
     fn finish(&mut self) {
-        for buffer in self.buffers.drain(self.next..) {
-            self.allocation_bytes -= buffer.allocation_bytes;
+        let Some(buffer) = &self.buffer else { return };
+        if buffer.capacity <= MIN_UPLOAD_CAPACITY || self.cursor * 4 >= buffer.capacity {
+            self.sparse_frames = 0;
+            self.sparse_peak = 0;
+            return;
+        }
+        self.sparse_peak = self.sparse_peak.max(self.cursor);
+        self.sparse_frames += 1;
+        if self.sparse_frames >= UPLOAD_SHRINK_FRAMES {
+            self.capacity_hint = (self.sparse_peak * 2).max(MIN_UPLOAD_CAPACITY);
+            self.buffer = None;
+            self.sparse_frames = 0;
+            self.sparse_peak = 0;
         }
     }
 }
@@ -1230,64 +1269,46 @@ fn retain<T: Any + Send + Sync>(retained: &Retained, value: T) {
         .unwrap_or_else(|error| error.into_inner())
         .push(Arc::new(value));
 }
+/// A GPU virtual address inside a frame slot's upload buffer.
+type GpuAddress = u64;
+
 fn upload<T>(
     gpu: &Device,
     retained: &Retained,
     uploads: &mut UploadPool,
     data: &[T],
-) -> Result<ID3D12Resource> {
-    let bytes = size_of_val(data);
-    let resource = uploads.buffer(gpu, bytes)?;
-    let mut mapped = ptr::null_mut();
-    unsafe {
-        resource.Map(
-            0,
-            Some(&D3D12_RANGE { Begin: 0, End: 0 }),
-            Some(&mut mapped),
-        )?;
-        if bytes > 0 {
-            ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), mapped.cast::<u8>(), bytes);
-        } else {
-            ptr::write_bytes(mapped.cast::<u8>(), 0, 256);
-        }
-        resource.Unmap(
-            0,
-            Some(&D3D12_RANGE {
-                Begin: 0,
-                End: bytes.max(1),
-            }),
-        );
-    }
-    retain(retained, resource.clone());
-    Ok(resource)
+) -> Result<GpuAddress> {
+    let bytes =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size_of_val(data)) };
+    uploads.write(gpu, retained, bytes)
 }
 fn upload_or_dummy<T>(
     gpu: &Device,
     retained: &Retained,
-    dummy: &ID3D12Resource,
+    dummy: GpuAddress,
     uploads: &mut UploadPool,
     data: &[T],
-) -> Result<ID3D12Resource> {
+) -> Result<GpuAddress> {
     if data.is_empty() {
-        Ok(dummy.clone())
+        Ok(dummy)
     } else {
         upload(gpu, retained, uploads, data)
     }
 }
 
 struct SceneBuffers {
-    dummy: ID3D12Resource,
-    shadows: ID3D12Resource,
-    quads: ID3D12Resource,
-    blur_rects: ID3D12Resource,
-    effects: ID3D12Resource,
-    underlines: ID3D12Resource,
-    mono: ID3D12Resource,
-    subpixel: ID3D12Resource,
-    poly: ID3D12Resource,
-    layers: ID3D12Resource,
-    clips: ID3D12Resource,
-    text_backgrounds: ID3D12Resource,
+    dummy: GpuAddress,
+    shadows: GpuAddress,
+    quads: GpuAddress,
+    blur_rects: GpuAddress,
+    effects: GpuAddress,
+    underlines: GpuAddress,
+    mono: GpuAddress,
+    subpixel: GpuAddress,
+    poly: GpuAddress,
+    layers: GpuAddress,
+    clips: GpuAddress,
+    text_backgrounds: GpuAddress,
 }
 impl SceneBuffers {
     fn new(
@@ -1298,27 +1319,27 @@ impl SceneBuffers {
     ) -> Result<Self> {
         let dummy = upload(gpu, retained, uploads, &[0u32; 64])?;
         Ok(Self {
-            dummy: dummy.clone(),
-            shadows: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.shadows)?,
-            quads: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.quads)?,
+            dummy,
+            shadows: upload_or_dummy(gpu, retained, dummy, uploads, &scene.shadows)?,
+            quads: upload_or_dummy(gpu, retained, dummy, uploads, &scene.quads)?,
             blur_rects: upload_or_dummy(
                 gpu,
                 retained,
-                &dummy,
+                dummy,
                 uploads,
                 &scene.backdrop_blur_rects,
             )?,
-            effects: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.effect_quads)?,
-            underlines: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.underlines)?,
-            mono: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.monochrome_sprites)?,
-            subpixel: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.subpixel_sprites)?,
-            poly: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.polychrome_sprites)?,
-            layers: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.vn_layers)?,
-            clips: upload_or_dummy(gpu, retained, &dummy, uploads, &scene.vn_clip_segments)?,
+            effects: upload_or_dummy(gpu, retained, dummy, uploads, &scene.effect_quads)?,
+            underlines: upload_or_dummy(gpu, retained, dummy, uploads, &scene.underlines)?,
+            mono: upload_or_dummy(gpu, retained, dummy, uploads, &scene.monochrome_sprites)?,
+            subpixel: upload_or_dummy(gpu, retained, dummy, uploads, &scene.subpixel_sprites)?,
+            poly: upload_or_dummy(gpu, retained, dummy, uploads, &scene.polychrome_sprites)?,
+            layers: upload_or_dummy(gpu, retained, dummy, uploads, &scene.vn_layers)?,
+            clips: upload_or_dummy(gpu, retained, dummy, uploads, &scene.vn_clip_segments)?,
             text_backgrounds: upload_or_dummy(
                 gpu,
                 retained,
-                &dummy,
+                dummy,
                 uploads,
                 &scene.vn_text_backgrounds,
             )?,
@@ -1464,7 +1485,7 @@ struct Encoding<'a> {
     changes: &'a mut StateChanges,
     scene: &'a Scene,
     data: SceneBuffers,
-    globals: ID3D12Resource,
+    globals: GpuAddress,
     retained: Retained,
     descriptors: Descriptors,
     work: &'a mut RenderWork,
@@ -1518,15 +1539,15 @@ impl Encoding<'_> {
                 .SetGraphicsRootSignature(&self.pipelines.root_signature);
             self.list.SetGraphicsRootConstantBufferView(
                 ROOT_GLOBALS,
-                self.globals.GetGPUVirtualAddress(),
+                self.globals,
             );
             self.list.SetGraphicsRootShaderResourceView(
                 ROOT_CLIP_SEGMENTS,
-                self.data.clips.GetGPUVirtualAddress(),
+                self.data.clips,
             );
             self.list.SetGraphicsRootShaderResourceView(
                 ROOT_TEXT_BACKGROUNDS,
-                self.data.text_backgrounds.GetGPUVirtualAddress(),
+                self.data.text_backgrounds,
             );
         }
         self.bound.root = true;
@@ -1534,7 +1555,7 @@ impl Encoding<'_> {
     fn draw(
         &mut self,
         module: ShaderModule,
-        buffer: &ID3D12Resource,
+        buffer: GpuAddress,
         start: u32,
         count: u32,
         vertices: u32,
@@ -1548,7 +1569,7 @@ impl Encoding<'_> {
     fn draw_pipeline(
         &mut self,
         pipeline: &ID3D12PipelineState,
-        buffer: &ID3D12Resource,
+        buffer: GpuAddress,
         start: u32,
         count: u32,
         vertices: u32,
@@ -1582,7 +1603,7 @@ impl Encoding<'_> {
             }
             self.bound.batch_start = Some(start);
         }
-        let instances = unsafe { buffer.GetGPUVirtualAddress() };
+        let instances = buffer;
         if self.bound.instances != instances {
             unsafe {
                 self.list
@@ -1670,10 +1691,10 @@ impl Encoding<'_> {
         self.bind_target(&parent)?;
         target.to(self.list, SHADER_READ, self.changes);
         let texture = target.sampled();
-        let buffer = self.data.layers.clone();
+        let buffer = self.data.layers;
         self.draw(
             ShaderModule::VnLayer,
-            &buffer,
+            buffer,
             index as u32,
             1,
             4,
@@ -1685,10 +1706,10 @@ impl Encoding<'_> {
     fn batch(&mut self, batch: PrimitiveBatch) -> Result<()> {
         match batch {
             PrimitiveBatch::Quads(range) => {
-                let buffer = self.data.quads.clone();
+                let buffer = self.data.quads;
                 self.draw(
                     ShaderModule::Quad,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1698,10 +1719,10 @@ impl Encoding<'_> {
                 )
             }
             PrimitiveBatch::Shadows(range) => {
-                let buffer = self.data.shadows.clone();
+                let buffer = self.data.shadows;
                 self.draw(
                     ShaderModule::Shadow,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1711,10 +1732,10 @@ impl Encoding<'_> {
                 )
             }
             PrimitiveBatch::Underlines(range) => {
-                let buffer = self.data.underlines.clone();
+                let buffer = self.data.underlines;
                 self.draw(
                     ShaderModule::Underline,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1729,10 +1750,10 @@ impl Encoding<'_> {
                     .get(&texture_id)
                     .context("D3D12 atlas snapshot is missing a scene texture")?
                     .clone();
-                let buffer = self.data.mono.clone();
+                let buffer = self.data.mono;
                 self.draw(
                     ShaderModule::MonochromeSprite,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1747,10 +1768,10 @@ impl Encoding<'_> {
                     .get(&texture_id)
                     .context("D3D12 atlas snapshot is missing a scene texture")?
                     .clone();
-                let buffer = self.data.subpixel.clone();
+                let buffer = self.data.subpixel;
                 self.draw(
                     ShaderModule::SubpixelSprite,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1765,10 +1786,10 @@ impl Encoding<'_> {
                     .get(&texture_id)
                     .context("D3D12 atlas snapshot is missing a scene texture")?
                     .clone();
-                let buffer = self.data.poly.clone();
+                let buffer = self.data.poly;
                 self.draw(
                     ShaderModule::PolychromeSprite,
-                    &buffer,
+                    buffer,
                     range.start as u32,
                     range.len() as u32,
                     4,
@@ -1843,7 +1864,7 @@ impl Encoding<'_> {
         }
         self.draw(
             ShaderModule::PathRasterization,
-            &buffer,
+            buffer,
             0,
             1,
             vertices.len() as u32,
@@ -1892,7 +1913,7 @@ impl Encoding<'_> {
         self.bind_target(&target)?;
         self.draw(
             ShaderModule::PathSprite,
-            &buffer,
+            buffer,
             0,
             sprites.len() as u32,
             4,
@@ -2004,8 +2025,8 @@ impl Encoding<'_> {
         rect: RECT,
     ) -> Result<()> {
         self.bind_target_rect(target, rect)?;
-        let buffer = self.data.dummy.clone();
-        self.draw(module, &buffer, 0, 1, 4, Some(source), None, 1)?;
+        let buffer = self.data.dummy;
+        self.draw(module, buffer, 0, 1, 4, Some(source), None, 1)?;
         target.to(self.list, SHADER_READ, self.changes);
         Ok(())
     }
@@ -2039,10 +2060,10 @@ impl Encoding<'_> {
             #[cfg(not(test))]
             let region = Some(region);
             let (blurred, original) = self.backdrop(levels, region)?;
-            let buffer = self.data.blur_rects.clone();
+            let buffer = self.data.blur_rects;
             self.draw(
                 ShaderModule::BlurRect,
-                &buffer,
+                buffer,
                 first as u32,
                 (next - first) as u32,
                 4,
@@ -2056,11 +2077,11 @@ impl Encoding<'_> {
     }
     fn effects(&mut self, effect: u32, start: usize, end: usize) -> Result<()> {
         let (pipeline, needs_backdrop) = self.pipelines.effect(effect, FORMAT, 1)?;
-        let buffer = self.data.effects.clone();
+        let buffer = self.data.effects;
         if !needs_backdrop {
             return self.draw_pipeline(
                 &pipeline,
-                &buffer,
+                buffer,
                 start as u32,
                 (end - start) as u32,
                 4,
@@ -2086,7 +2107,7 @@ impl Encoding<'_> {
             let (blurred, original) = self.backdrop(levels, None)?;
             self.draw_pipeline(
                 &pipeline,
-                &buffer,
+                buffer,
                 first as u32,
                 (next - first) as u32,
                 4,
@@ -2563,7 +2584,7 @@ mod tests {
         let mut renderer = offscreen(32, 32)?;
         let content_mask = mask(32., 32.);
         let target = Target::new(&renderer.gpu, 32, 32, 1)?;
-        let mut identities: [Option<Vec<ID3D12Resource>>; BUFFERS] = std::array::from_fn(|_| None);
+        let mut identities: [Option<ID3D12Resource>; BUFFERS] = std::array::from_fn(|_| None);
         let mut guarded = UploadPool::default();
         assert!(
             guarded.begin(0, 1).is_err(),
@@ -2597,28 +2618,19 @@ mod tests {
                 &mut uploads,
             )?;
             uploads.finish();
-            assert_eq!(
-                uploads.buffers.len(),
-                5,
+            assert!(
+                uploads.cursor >= 5 * 256,
                 "globals, dummy, quads and both path streams must use the pool"
             );
+            let resource = &uploads.buffer.as_ref().unwrap().resource;
             if let Some(previous) = &identities[slot] {
-                assert_eq!(previous.len(), uploads.buffers.len());
-                for (previous, buffer) in previous.iter().zip(&uploads.buffers) {
-                    assert_eq!(
-                        previous.as_raw(),
-                        buffer.resource.as_raw(),
-                        "a completed slot must reuse its existing COM resource"
-                    );
-                }
-            } else {
-                identities[slot] = Some(
-                    uploads
-                        .buffers
-                        .iter()
-                        .map(|buffer| buffer.resource.clone())
-                        .collect(),
+                assert_eq!(
+                    previous.as_raw(),
+                    resource.as_raw(),
+                    "a completed slot must reuse its existing COM resource"
                 );
+            } else {
+                identities[slot] = Some(resource.clone());
             }
             renderer.uploads[slot] = uploads;
             renderer.fences[slot] = fence;
@@ -2656,16 +2668,53 @@ mod tests {
             )?;
             uploads.finish();
             assert_eq!(
-                uploads.buffers.len(),
-                2,
-                "an empty scene must retire unused quad/path upload slots"
+                uploads.cursor,
+                2 * 256,
+                "an empty scene uploads only globals and the dummy binding"
             );
-            assert_eq!(uploads.allocation_bytes, 2 * UPLOAD_ALLOCATION_ALIGNMENT);
             renderer.uploads[slot] = uploads;
             renderer.fences[slot] = fence;
         }
         renderer.gpu.wait_idle()?;
         assert_eq!(renderer.capture_target(target)?.get_pixel(16, 12).0, [0; 4]);
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_upload_pool_grows_within_a_frame_and_shrinks_when_sparse() -> Result<()> {
+        let renderer = offscreen(8, 8)?;
+        let retained = Retained::default();
+        let mut pool = UploadPool::default();
+        pool.begin(0, 0)?;
+        let small = pool.write(&renderer.gpu, &retained, &[1u8; 16])?;
+        let large_data = vec![7u8; 4 * MIN_UPLOAD_CAPACITY as usize];
+        let large = pool.write(&renderer.gpu, &retained, &large_data)?;
+        assert_ne!(small, large);
+        let grown = pool.buffer.as_ref().unwrap().capacity;
+        assert!(grown >= 4 * MIN_UPLOAD_CAPACITY);
+        assert_eq!(
+            retained.lock().unwrap().len(),
+            2,
+            "the outgrown buffer must stay alive until the frame's fence"
+        );
+        unsafe {
+            let mapped = pool.buffer.as_ref().unwrap().mapped;
+            assert_eq!(*mapped, 7);
+            assert_eq!(*mapped.add(large_data.len() - 1), 7);
+        }
+        pool.finish();
+        for frame in 0..UPLOAD_SHRINK_FRAMES {
+            assert!(pool.buffer.is_some(), "shrunk after {frame} sparse frames");
+            pool.begin(0, 0)?;
+            pool.write(&renderer.gpu, &retained, &[0u8; 64])?;
+            pool.finish();
+        }
+        assert!(pool.buffer.is_none(), "a sparse buffer must be released");
+        assert_eq!(pool.capacity_hint, MIN_UPLOAD_CAPACITY);
+        pool.begin(0, 0)?;
+        pool.write(&renderer.gpu, &retained, &[0u8; 64])?;
+        assert_eq!(pool.buffer.as_ref().unwrap().capacity, MIN_UPLOAD_CAPACITY);
         Ok(())
     }
 }
