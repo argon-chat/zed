@@ -1607,6 +1607,9 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    /// Whether a queued next-frame callback asked for a frame (passive ones do
+    /// not; see [`Window::on_next_frame_passive`]).
+    pub(crate) next_frame_wanted: Rc<Cell<bool>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -2024,6 +2027,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
+        let next_frame_wanted: Rc<Cell<bool>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
@@ -2147,6 +2151,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
+            let next_frame_wanted = next_frame_wanted.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
@@ -2253,6 +2258,7 @@ impl Window {
                             // A native frame request can re-enter while App is borrowed.
                             // Keep the callbacks queued if updating the window fails,
                             // or a self-rescheduling frame pump would be lost forever.
+                            window.next_frame_wanted.set(false);
                             for callback in next_frame_callbacks.take() {
                                 callback(window, cx);
                             }
@@ -2299,9 +2305,7 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
-                        if window.invalidator.is_dirty()
-                            || !window.next_frame_callbacks.borrow().is_empty()
-                        {
+                        if window.invalidator.is_dirty() || window.next_frame_wanted.get() {
                             window.platform_window.schedule_frame();
                         }
                     })
@@ -2311,8 +2315,8 @@ impl Window {
                 // deliver another request after a wakeup. If demand remains
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
-                // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                // source explicitly. Passive callbacks are not demand.
+                if invalidator.is_dirty() || next_frame_wanted.get() {
                     invalidator.wake_platform();
                 }
                 #[cfg(feature = "profiler")]
@@ -2558,6 +2562,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            next_frame_wanted,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -3224,10 +3229,20 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.next_frame_wanted.set(true);
         self.platform_window.schedule_frame();
         // Next-frame callbacks create frame demand without dirtying the
         // window, so the platform's frame source must be woken explicitly.
         self.invalidator.wake_platform();
+    }
+
+    /// vue-native fork: like [`Self::on_next_frame`], but rides along with the
+    /// next frame the platform delivers without asking for one. A frame source
+    /// that paces idle windows can then let a self-rescheduling pump wait for
+    /// real demand (input, an invalidation, an `on_next_frame`) or its own
+    /// deadline; one that delivers every refresh runs it on the next.
+    pub fn on_next_frame_passive(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -3254,6 +3269,7 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_next_frame(&mut self, cx: &mut App) -> usize {
         let callbacks = self.next_frame_callbacks.take();
+        self.next_frame_wanted.set(false);
         let count = callbacks.len();
         for callback in callbacks {
             callback(self, cx);
@@ -10530,6 +10546,38 @@ mod tests {
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
         );
+    }
+
+    /// A passive next-frame callback rides along with the next delivered frame
+    /// but never wakes the frame source, even when it re-arms itself.
+    #[gpui::test]
+    fn test_passive_next_frame_callbacks_are_not_demand(cx: &mut TestAppContext) {
+        fn rearm(window: &mut Window, runs: Rc<Cell<usize>>) {
+            runs.set(runs.get() + 1);
+            window.on_next_frame_passive(move |window, _| rearm(window, runs));
+        }
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let runs = Rc::new(Cell::new(0));
+        let baseline = test_window.frame_wake_count();
+        window
+            .update(cx, {
+                let runs = runs.clone();
+                move |_, window, _| window.on_next_frame_passive(move |window, _| rearm(window, runs))
+            })
+            .unwrap();
+        assert_eq!(test_window.frame_wake_count(), baseline, "queueing a passive callback is not demand");
+
+        test_window.simulate_frame_request(RequestFrameOptions { require_presentation: true, ..Default::default() });
+        test_window.simulate_frame_request(RequestFrameOptions { require_presentation: true, ..Default::default() });
+        assert_eq!(runs.get(), 2, "a passive callback runs with every delivered frame");
+        assert_eq!(test_window.frame_wake_count(), baseline, "a re-arming passive pump never wakes the frame source");
+
+        // Real demand next to the passive pump still wakes it.
+        window.update(cx, |_, window, _| window.on_next_frame(|_, _| {})).unwrap();
+        assert!(test_window.frame_wake_count() > baseline);
     }
 
     /// A frame request that arrives while next-frame callbacks are pending

@@ -472,6 +472,10 @@ impl WindowsPlatform {
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
+                    // Idle windows wait for demand (src/frame_pacing.rs).
+                    if !crate::frame_pacing::take_due(std::time::Instant::now()) {
+                        continue;
+                    }
                     for hwnd in all_windows.read().iter() {
                         unsafe {
                             if let Some(signal_at) = signal_at {

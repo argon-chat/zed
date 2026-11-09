@@ -215,6 +215,11 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             return Ok(());
         }
 
+        // Paints advance the gesture (see `update`), so keep them coming.
+        crate::frame_pacing::set_gesture_active(
+            current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA,
+        );
+
         // A new gesture interrupted inertia, so end the old sequence.
         if current == DIRECTMANIPULATION_RUNNING && previous == DIRECTMANIPULATION_INERTIA {
             self.end_gesture();
