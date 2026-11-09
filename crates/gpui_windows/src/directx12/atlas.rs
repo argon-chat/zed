@@ -18,7 +18,7 @@ use windows::{
     core::{IUnknown, Interface},
 };
 
-use super::device::{Device, KeepAlive};
+use super::{atlas_upload::UploadBatch, device::{Device, KeepAlive}};
 
 pub(super) const ATLAS_STATE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
@@ -38,6 +38,7 @@ pub(super) struct AtlasTexture {
 
 struct Textures {
     device: Arc<Device>,
+    uploads: UploadBatch,
     monochrome: AtlasTextureList<Page>,
     polychrome: AtlasTextureList<Page>,
     subpixel: AtlasTextureList<Page>,
@@ -56,12 +57,12 @@ impl Atlas {
         Self(Mutex::new(AtlasState::new(Textures::new(device))))
     }
 
-    pub(super) fn get_texture(&self, id: AtlasTextureId) -> Option<AtlasTexture> {
-        self.0
-            .lock()
-            .backend
-            .texture(id)
-            .map(|page| page.texture.clone())
+    pub(super) fn get_texture(&self, id: AtlasTextureId) -> Result<Option<AtlasTexture>> {
+        let mut state = self.0.lock();
+        // Every renderer/readback consumer snapshots through here, before taking
+        // the shared submission lock. Publish all accepted CPU copies first.
+        state.backend.flush_uploads()?;
+        Ok(state.backend.texture(id).map(|page| page.texture.clone()))
     }
 
     pub(super) fn handle_device_lost(&self, device: Arc<Device>) {
@@ -105,6 +106,9 @@ impl Atlas {
         {
             return Ok(None);
         }
+        // An immediate GPU/video writer must follow every earlier CPU write,
+        // including a pending cached tile that occupies the same atlas page.
+        state.backend.flush_uploads()?;
         let existing = state.tile(key);
         let (tile, fresh) = state
             .backend
@@ -143,7 +147,15 @@ impl PlatformAtlas for Atlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        self.0.lock().get_or_insert_with(key, build)
+        let name = match &key {
+            AtlasKey::Glyph(_) => "D3D12 build glyph tile",
+            AtlasKey::Svg(_) => "D3D12 build SVG tile",
+            AtlasKey::Image(_) => "D3D12 build image tile",
+        };
+        self.0.lock().get_or_insert_with(key, &mut || {
+            let _profile = gpui::native_profiling::current_span("paint", name);
+            build()
+        })
     }
 
     fn upload_from_d3d12(
@@ -304,9 +316,13 @@ impl AtlasBackend for Textures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile> {
+        let _profile = gpui::native_profiling::current_span("native", "D3D12 insert atlas tile");
         validate_bytes(kind, size, bytes)?;
-        let tile = self.allocate(size, kind)?;
-        if let Err(error) = self.upload(tile, bytes) {
+        let tile = {
+            let _profile = gpui::native_profiling::current_span("native", "D3D12 allocate atlas tile");
+            self.allocate(size, kind)?
+        };
+        if let Err(error) = self.stage(tile, bytes) {
             self.remove(tile);
             return Err(error);
         }
@@ -314,6 +330,7 @@ impl AtlasBackend for Textures {
     }
 
     fn remove(&mut self, tile: AtlasTile) {
+        self.uploads.cancel(tile);
         let list = self.list_mut(tile.texture_id.kind);
         let Some(slot) = list.textures.get_mut(tile.texture_id.index as usize) else {
             return;
@@ -334,6 +351,7 @@ impl Textures {
     fn new(device: Arc<Device>) -> Self {
         Self {
             device,
+            uploads: Default::default(),
             monochrome: Default::default(),
             polychrome: Default::default(),
             subpixel: Default::default(),
@@ -426,7 +444,19 @@ impl Textures {
         Ok(tile)
     }
 
-    fn upload(&self, tile: AtlasTile, bytes: &[u8]) -> Result<()> {
+    fn flush_uploads(&mut self) -> Result<()> {
+        self.uploads.flush(&self.device)
+    }
+
+    fn stage(&mut self, tile: AtlasTile, bytes: &[u8]) -> Result<()> {
+        let _profile = gpui::native_profiling::current_span("native", "D3D12 stage atlas tile");
+        let texture = self.texture(tile.texture_id).context("Atlas page missing")?.texture.clone();
+        self.uploads.queue(&self.device, tile, &texture.resource, pixel_layout(tile.texture_id.kind).1, bytes)
+    }
+
+    fn upload(&mut self, tile: AtlasTile, bytes: &[u8]) -> Result<()> {
+        self.flush_uploads()?;
+        let _profile = gpui::native_profiling::current_span("native", "D3D12 upload atlas tile");
         let page = self
             .texture(tile.texture_id)
             .context("Atlas tile refers to a missing page")?;
@@ -534,7 +564,7 @@ mod tests {
             Some(second.bounds)
         );
         let texture = atlas
-            .get_texture(second.texture_id)
+            .get_texture(second.texture_id)?
             .context("Atlas page missing")?;
         let pixels = device.read_texture_for_test(
             &texture.resource,
@@ -593,6 +623,12 @@ mod tests {
             width: DevicePixels(5),
             height: DevicePixels(3),
         };
+        // A queued CPU cache tile must be flushed before the first immediate
+        // video copy, so a later render/readback cannot overwrite decoded pixels.
+        atlas.get_or_insert_with(key.clone(), &mut || {
+            Ok(Some((size, Cow::Owned(vec![17; 60]))))
+        })?;
+        assert_eq!(atlas.0.lock().backend.uploads.pending().0, 1);
         let mut first = None;
         // No CPU wait between decoder writes: ReturnUnderlyingResource must
         // make the second write wait for the preceding native atlas copy.
@@ -612,7 +648,7 @@ mod tests {
         }
         let tile = atlas.tile(&key).context("Video atlas tile missing")?;
         let texture = atlas
-            .get_texture(tile.texture_id)
+            .get_texture(tile.texture_id)?
             .context("Video atlas page missing")?;
         let result = device.read_texture_for_test(
             &texture.resource,
@@ -637,3 +673,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "atlas_upload_tests.rs"]
+mod upload_tests;

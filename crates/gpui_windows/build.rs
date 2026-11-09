@@ -1,8 +1,12 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
+#[cfg(all(target_os = "windows", feature = "native-dx12"))]
+#[path = "build/native_dx12.rs"]
+mod native_dx12;
+
 fn main() {
-    // Native D3D12 embeds SM5.1 HLSL in debug and release alike. Export the
-    // same resolved directory used by the legacy release shader compiler.
+    // Native D3D12 builds SM5.1 bytecode in both profiles. The source directory
+    // remains available for reference-compilation tests and legacy effects.
     let effects_generated = effects_generated_dir();
     println!("cargo:rerun-if-env-changed=VN_EFFECTS_GENERATED_DIR");
     println!(
@@ -22,6 +26,13 @@ fn main() {
         // Compile HLSL shaders
         #[cfg(not(debug_assertions))]
         compile_shaders();
+        #[cfg(feature = "native-dx12")]
+        native_dx12::compile(
+            &std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()),
+            &effects_generated,
+            &std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()),
+            &shader_compilation::find_fxc_compiler(),
+        );
     }
 }
 
@@ -40,15 +51,13 @@ fn effects_generated_dir() -> std::path::PathBuf {
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
+#[cfg(all(target_os = "windows", any(not(debug_assertions), feature = "native-dx12")))]
 mod shader_compilation {
-    use std::{
-        fs,
-        io::Write,
-        path::{Path, PathBuf},
-        process::{self, Command},
-    };
+    use std::path::{Path, PathBuf};
+    #[cfg(not(debug_assertions))]
+    use std::{fs, io::Write, process::{self, Command}};
 
+    #[cfg(not(debug_assertions))]
     pub fn compile_shaders() {
         let shader_path =
             PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/shaders.hlsl");
@@ -119,6 +128,7 @@ mod shader_compilation {
     ///   fragment stage is the checked-in slangc output living next to its
     ///   `.slang` source under `crates/vn-effects/generated/`, which is what
     ///   keeps `cargo build` free of any dependency on slangc.
+    #[cfg(not(debug_assertions))]
     fn compile_effect_shaders(out_dir: &str, fxc_path: &str, rust_binding_path: &str) {
         let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let generated = super::effects_generated_dir();
@@ -206,7 +216,7 @@ mod shader_compilation {
     }
 
     /// You can set the `GPUI_FXC_PATH` environment variable to specify the path to the fxc.exe compiler.
-    fn find_fxc_compiler() -> String {
+    pub(super) fn find_fxc_compiler() -> String {
         // Check environment variable
         if let Ok(path) = std::env::var("GPUI_FXC_PATH")
             && Path::new(&path).exists()
@@ -232,6 +242,7 @@ mod shader_compilation {
         panic!("Failed to find fxc.exe");
     }
 
+    #[cfg(not(debug_assertions))]
     fn compile_shader_for_module(
         module: &str,
         out_dir: &str,
@@ -266,6 +277,7 @@ mod shader_compilation {
         generate_rust_binding(&const_name, &output_file, rust_binding_path);
     }
 
+    #[cfg(not(debug_assertions))]
     fn compile_shader_impl(
         fxc_path: &str,
         entry_point: &str,
@@ -308,6 +320,7 @@ mod shader_compilation {
         }
     }
 
+    #[cfg(not(debug_assertions))]
     fn generate_rust_binding(const_name: &str, head_file: &str, output_path: &str) {
         let header_content = fs::read_to_string(head_file).expect("Failed to read header file");
         let const_definition = {

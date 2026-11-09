@@ -3976,6 +3976,8 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let _profile_window = crate::native_profiling::window_scope(self.platform_window.as_ref());
+        let _profile = crate::native_profiling::current_span("native", "GPUI draw");
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -4026,6 +4028,7 @@ impl Window {
                 );
             }
         }
+        let _finalize = crate::native_profiling::current_span("native", "GPUI finalize frame");
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
 
@@ -4058,15 +4061,24 @@ impl Window {
                 });
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
-        self.text_system().finish_frame();
-        self.next_frame.finish(&mut self.rendered_frame);
+        {
+            let _profile = crate::native_profiling::current_span("native", "GPUI finish layout and text");
+            self.layout_engine.as_mut().unwrap().clear();
+            self.text_system().finish_frame();
+        }
+        {
+            let _profile = crate::native_profiling::current_span("native", "GPUI finish scene");
+            self.next_frame.finish(&mut self.rendered_frame);
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        self.next_frame.clear();
+        {
+            let _profile = crate::native_profiling::current_span("native", "GPUI clear previous frame");
+            self.next_frame.clear();
+        }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -4328,6 +4340,7 @@ impl Window {
                 paint: Instant::now().duration_since(paint_start),
             });
 
+        let _profile = crate::native_profiling::current_span("native", "GPUI postpaint accessibility");
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
         self.a11y.sync_active_flag();
@@ -4548,6 +4561,7 @@ impl Window {
     }
 
     fn paint_deferred_draws(&mut self, cx: &mut App) {
+        let _profile = crate::native_profiling::current_span("paint", "GPUI paint deferred draws");
         assert_eq!(self.element_id_stack.len(), 0);
 
         // Paint all deferred draws in priority order.

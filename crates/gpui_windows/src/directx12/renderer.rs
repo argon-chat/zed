@@ -849,7 +849,7 @@ impl DirectXRenderer {
             )
         {
             if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(texture_id) {
-                let texture = self.atlas.get_texture(texture_id).with_context(|| {
+                let texture = self.atlas.get_texture(texture_id)?.with_context(|| {
                     format!("D3D12 scene references missing atlas texture {texture_id:?}")
                 })?;
                 entry.insert(texture);

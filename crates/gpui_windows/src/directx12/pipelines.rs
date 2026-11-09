@@ -1,14 +1,18 @@
-use std::{ffi::CString, mem::ManuallyDrop};
+#[cfg(test)]
+use std::ffi::CString;
+use std::{borrow::Cow, mem::ManuallyDrop, time::Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
+use windows::Win32::Graphics::{
+    Direct3D::ID3DBlob,
+    Direct3D12::*,
+    Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
+};
+#[cfg(test)]
 use windows::{
-    Win32::Graphics::{
-        Direct3D::{
-            Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
-            ID3DBlob, ID3DInclude,
-        },
-        Direct3D12::*,
-        Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
+    Win32::Graphics::Direct3D::{
+        Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+        ID3DInclude,
     },
     core::{PCSTR, s},
 };
@@ -22,27 +26,39 @@ pub(super) const ROOT_CLIP_SEGMENTS: u32 = 3;
 pub(super) const ROOT_TEXT_BACKGROUNDS: u32 = 4;
 pub(super) const ROOT_TEXTURES: u32 = 5;
 
+#[cfg(test)]
 const ALPHA_CORRECTION: &str = include_str!("../alpha_correction.hlsl");
+#[cfg(test)]
 const PRIMITIVES: &str = include_str!("../shaders.hlsl");
+#[cfg(test)]
 const EFFECT_VERTEX: &str = include_str!("../effects.hlsl");
+#[cfg(test)]
 const EMOJI: &str = include_str!("../color_text_raster.hlsl");
+#[cfg(test)]
 const FROST: &str = include_str!(concat!(env!("GPUI_D3D12_EFFECTS_HLSL_DIR"), "/frost.hlsl"));
+#[cfg(test)]
 const NOISE: &str = include_str!(concat!(env!("GPUI_D3D12_EFFECTS_HLSL_DIR"), "/noise.hlsl"));
+#[cfg(test)]
 const GLOW: &str = include_str!(concat!(env!("GPUI_D3D12_EFFECTS_HLSL_DIR"), "/glow.hlsl"));
+
+mod embedded {
+    use super::{EffectShader, ShaderModule};
+    include!(concat!(env!("OUT_DIR"), "/native_dx12_shaders.rs"));
+}
 
 struct CachedPipeline {
     key: PipelineKey,
     state: ID3D12PipelineState,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PipelineKey {
     kind: PipelineKind,
     format: DXGI_FORMAT,
     samples: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PipelineKind {
     Primitive(ShaderModule),
     DynamicEffect(usize),
@@ -53,6 +69,7 @@ pub(super) struct Pipelines {
     device: ID3D12Device,
     cache: Vec<CachedPipeline>,
     dynamic_effects: Vec<shader_resources::DynamicEffect>,
+    timings: bool,
 }
 
 impl Pipelines {
@@ -62,6 +79,7 @@ impl Pipelines {
             device: device.clone(),
             cache: Vec::new(),
             dynamic_effects: shader_resources::dynamic_effects(),
+            timings: std::env::var_os("VN_DX12_TIMINGS").is_some_and(|value| value == "1"),
         })
     }
 
@@ -118,17 +136,22 @@ impl Pipelines {
             key.samples != 0,
             "D3D12 pipeline sample count must be positive"
         );
+        let bytecode_started = self.timings.then(Instant::now);
         let (vertex, fragment, blend) = match key.kind {
             PipelineKind::Primitive(module) => {
-                let (vertex, fragment) = compile_module(module)?;
-                (vertex, fragment, module_blend(module))
+                let (vertex, fragment) = embedded::module(module);
+                (
+                    Cow::Borrowed(vertex),
+                    Cow::Borrowed(fragment),
+                    module_blend(module),
+                )
             }
             PipelineKind::DynamicEffect(index) => {
                 let effect = self
                     .dynamic_effects
                     .get(index)
                     .context("D3D12 dynamic effect index is out of bounds")?;
-                let vertex = compile(EFFECT_VERTEX, "effect_vertex", true)?;
+                let vertex = embedded::effect_vertex();
                 let fragment = shader_resources::compile_hlsl_file(
                     &effect.hlsl,
                     "effect_fragment\0",
@@ -136,8 +159,8 @@ impl Pipelines {
                 )
                 .with_context(|| format!("Compiling D3D12 effect {}", effect.name))?;
                 (
-                    vertex,
-                    bytes(&fragment).to_vec(),
+                    Cow::Borrowed(vertex),
+                    Cow::Owned(bytes(&fragment).to_vec()),
                     if effect.needs_backdrop {
                         Blend::Replace
                     } else {
@@ -146,6 +169,8 @@ impl Pipelines {
                 )
             }
         };
+        let bytecode_time = bytecode_started.map(|started| started.elapsed());
+        let pipeline_started = self.timings.then(Instant::now);
         let state = create_pipeline(
             &self.device,
             &self.root_signature,
@@ -155,6 +180,15 @@ impl Pipelines {
             key.samples,
             blend,
         )?;
+        if let Some(started) = pipeline_started {
+            log::info!(
+                "[DX12 pipeline] kind={:?} samples={} bytecode_ms={:.3} pso_ms={:.3}",
+                key.kind,
+                key.samples,
+                bytecode_time.unwrap_or_default().as_secs_f64() * 1000.,
+                started.elapsed().as_secs_f64() * 1000.
+            );
+        }
         self.cache.push(CachedPipeline {
             key,
             state: state.clone(),
@@ -374,6 +408,7 @@ fn create_pipeline(
     result.context("Creating GPUI D3D12 graphics pipeline")
 }
 
+#[cfg(test)]
 fn compile_module(module: ShaderModule) -> Result<(Vec<u8>, Vec<u8>)> {
     if let ShaderModule::Effect(effect) = module {
         let fragment = match effect {
@@ -413,6 +448,7 @@ fn compile_module(module: ShaderModule) -> Result<(Vec<u8>, Vec<u8>)> {
     ))
 }
 
+#[cfg(test)]
 fn compile(source: &str, entry: &str, vertex: bool) -> Result<Vec<u8>> {
     let source = source.replace("#include \"alpha_correction.hlsl\"", ALPHA_CORRECTION);
     let entry = CString::new(entry).context("Shader entry contains a NUL byte")?;
@@ -457,33 +493,4 @@ fn blob_message(blob: &ID3DBlob) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn embedded_entrypoints_compile_for_native_d3d12() -> Result<()> {
-        let modules = [
-            ShaderModule::Quad,
-            ShaderModule::Shadow,
-            ShaderModule::BlurDownsample,
-            ShaderModule::BlurUpsample,
-            ShaderModule::BlurRect,
-            ShaderModule::Underline,
-            ShaderModule::PathRasterization,
-            ShaderModule::PathSprite,
-            ShaderModule::MonochromeSprite,
-            ShaderModule::SubpixelSprite,
-            ShaderModule::PolychromeSprite,
-            ShaderModule::EmojiRasterization,
-            ShaderModule::VnLayer,
-        ];
-        for module in modules {
-            compile_module(module).with_context(|| format!("D3D12 shader {module:?}"))?;
-        }
-        for effect in EffectShader::ALL {
-            compile_module(ShaderModule::Effect(effect))
-                .with_context(|| format!("D3D12 effect {effect:?}"))?;
-        }
-        Ok(())
-    }
-}
+mod tests;

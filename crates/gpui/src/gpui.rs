@@ -34,6 +34,8 @@ mod interactive;
 mod key_dispatch;
 mod keymap;
 mod path_builder;
+/// Optional embedder hooks for recording native drawing spans.
+pub mod native_profiling;
 mod platform;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.
