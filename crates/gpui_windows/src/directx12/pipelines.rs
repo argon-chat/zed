@@ -1,6 +1,13 @@
 #[cfg(test)]
 use std::ffi::CString;
-use std::{borrow::Cow, mem::ManuallyDrop, time::Instant};
+use std::{
+    borrow::Cow,
+    mem::ManuallyDrop,
+    sync::Arc,
+    time::Instant,
+};
+
+use parking_lot::Mutex;
 
 use anyhow::{Context as _, Result, bail, ensure};
 use windows::Win32::Graphics::{
@@ -68,9 +75,32 @@ pub(super) struct Pipelines {
     pub root_signature: ID3D12RootSignature,
     device: ID3D12Device,
     cache: Vec<CachedPipeline>,
+    /// Pipelines a background thread created ahead of their first use.
+    warmed: Arc<Mutex<Vec<CachedPipeline>>>,
     dynamic_effects: Vec<shader_resources::DynamicEffect>,
     timings: bool,
 }
+
+/// The pipelines a window's frames use, most common first. Creating a PSO the
+/// driver has not cached yet (a new build or driver) takes tens of
+/// milliseconds, which on first use landed inside a frame.
+const WARM_MODULES: [(ShaderModule, u32); 15] = [
+    (ShaderModule::Quad, 1),
+    (ShaderModule::MonochromeSprite, 1),
+    (ShaderModule::Shadow, 1),
+    (ShaderModule::PolychromeSprite, 1),
+    (ShaderModule::Underline, 1),
+    (ShaderModule::PathRasterization, 4),
+    (ShaderModule::PathSprite, 1),
+    (ShaderModule::VnLayer, 1),
+    (ShaderModule::BlurRect, 1),
+    (ShaderModule::BlurDownsample, 1),
+    (ShaderModule::BlurUpsample, 1),
+    (ShaderModule::SubpixelSprite, 1),
+    (ShaderModule::Effect(EffectShader::Frost), 1),
+    (ShaderModule::Effect(EffectShader::Noise), 1),
+    (ShaderModule::Effect(EffectShader::Glow), 1),
+];
 
 impl Pipelines {
     pub fn new(device: &ID3D12Device) -> Result<Self> {
@@ -78,9 +108,42 @@ impl Pipelines {
             root_signature: create_root_signature(device)?,
             device: device.clone(),
             cache: Vec::new(),
+            warmed: Arc::default(),
             dynamic_effects: shader_resources::dynamic_effects(),
             timings: std::env::var_os("VN_DX12_TIMINGS").is_some_and(|value| value == "1"),
         })
+    }
+
+    /// Creates the common pipelines for `format` on a background thread. A
+    /// frame that needs one first takes it from there, or creates it itself
+    /// when the thread has not reached it yet.
+    pub fn prewarm(&self, format: DXGI_FORMAT) {
+        let device = self.device.clone();
+        let root = self.root_signature.clone();
+        let warmed = Arc::downgrade(&self.warmed);
+        let spawned = std::thread::Builder::new()
+            .name("dx12-pso-warmup".into())
+            .spawn(move || {
+                for (module, samples) in WARM_MODULES {
+                    // The renderer is gone (closed window, lost device).
+                    let Some(warmed) = warmed.upgrade() else { return };
+                    let key = PipelineKey {
+                        kind: PipelineKind::Primitive(module),
+                        format,
+                        samples,
+                    };
+                    match create_primitive(&device, &root, module, format, samples) {
+                        Ok(state) => warmed.lock().push(CachedPipeline { key, state }),
+                        Err(error) => {
+                            log::warn!("D3D12 pipeline warmup stopped at {module:?}: {error:#}");
+                            return;
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("D3D12 pipeline warmup thread failed to start: {error}");
+        }
     }
 
     pub fn pipeline(
@@ -131,6 +194,19 @@ impl Pipelines {
     fn get(&mut self, key: PipelineKey) -> Result<ID3D12PipelineState> {
         if let Some(cached) = self.cache.iter().find(|cached| cached.key == key) {
             return Ok(cached.state.clone());
+        }
+        let warmed = self
+            .warmed
+            .lock()
+            .iter()
+            .find(|cached| cached.key == key)
+            .map(|cached| cached.state.clone());
+        if let Some(state) = warmed {
+            self.cache.push(CachedPipeline {
+                key,
+                state: state.clone(),
+            });
+            return Ok(state);
         }
         ensure!(
             key.samples != 0,
@@ -352,6 +428,25 @@ fn blend_description(blend: Blend) -> D3D12_BLEND_DESC {
         D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8
     };
     description
+}
+
+fn create_primitive(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    module: ShaderModule,
+    format: DXGI_FORMAT,
+    samples: u32,
+) -> Result<ID3D12PipelineState> {
+    let (vertex, fragment) = embedded::module(module);
+    create_pipeline(
+        device,
+        root,
+        vertex,
+        fragment,
+        format,
+        samples,
+        module_blend(module),
+    )
 }
 
 fn create_pipeline(

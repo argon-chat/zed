@@ -605,6 +605,7 @@ impl DirectXRenderer {
             Some(Composition::new(hwnd, &swap_chain)?)
         };
         let pipelines = Pipelines::new(&gpu.device)?;
+        pipelines.prewarm(FORMAT);
         let atlas = Arc::new(Atlas::new(gpu.clone()));
         let back_buffers = Self::buffers(&gpu, &swap_chain, 1, 1)?;
         Ok(Self {
@@ -949,6 +950,8 @@ impl DirectXRenderer {
         // Atlas insertion takes the atlas lock before submitting uploads. Snapshot it
         // before submit takes the queue lock so rendering cannot reverse that order.
         let mut textures = HashMap::new();
+        // Sprites arrive in runs that share a page; look up each run once.
+        let mut previous = None;
         for texture_id in scene
             .monochrome_sprites
             .iter()
@@ -966,6 +969,9 @@ impl DirectXRenderer {
                     .map(|sprite| sprite.tile.texture_id),
             )
         {
+            if previous.replace(texture_id) == Some(texture_id) {
+                continue;
+            }
             if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(texture_id) {
                 let texture = self.atlas.get_texture(texture_id)?.with_context(|| {
                     format!("D3D12 scene references missing atlas texture {texture_id:?}")

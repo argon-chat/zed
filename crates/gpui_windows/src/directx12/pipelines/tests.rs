@@ -142,3 +142,30 @@ fn embedded_artifacts_track_current_sources_and_transitive_includes() -> Result<
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "requires a native D3D12 hardware adapter; run explicitly on Windows"]
+fn native_prewarmed_pipelines_serve_their_first_use() -> Result<()> {
+    let device = super::super::device::Device::new()?;
+    let mut pipelines = Pipelines::new(&device.device)?;
+    let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    pipelines.prewarm(format);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    while pipelines.warmed.lock().len() < WARM_MODULES.len() {
+        ensure!(Instant::now() < deadline, "pipeline warmup did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for (module, samples) in WARM_MODULES {
+        let warmed = pipelines
+            .warmed
+            .lock()
+            .iter()
+            .find(|cached| cached.key.kind == PipelineKind::Primitive(module) && cached.key.samples == samples)
+            .map(|cached| cached.state.as_raw())
+            .context("warmed pipeline missing")?;
+        let served = pipelines.pipeline(module, format, samples)?;
+        assert_eq!(served.as_raw(), warmed, "{module:?} must come from the warmup");
+    }
+    assert_eq!(pipelines.cache.len(), WARM_MODULES.len());
+    Ok(())
+}
