@@ -211,20 +211,25 @@ impl Device {
         record: impl FnOnce(&ID3D12GraphicsCommandList) -> Result<()>,
     ) -> Result<u64> {
         unsafe { self.device.GetDeviceRemovedReason()? };
-        let mut submissions = self.retirement.submissions.lock();
-        ensure!(!submissions.shutdown, "D3D12 device is shutting down");
-        if let Some(error) = &submissions.failure {
-            bail!("D3D12 submission failed previously: {error}");
-        }
-        self.retirement.start_worker(&mut submissions)?;
-        let retired = drain_completed(&mut submissions, self.completed_value());
-        let result = (|| {
-            let pair = if let Some(pair) = submissions.command_pool.pop() {
+        let (pooled, retired) = {
+            let mut submissions = self.retirement.submissions.lock();
+            ensure!(!submissions.shutdown, "D3D12 device is shutting down");
+            if let Some(error) = &submissions.failure {
+                bail!("D3D12 submission failed previously: {error}");
+            }
+            self.retirement.start_worker(&mut submissions)?;
+            let retired = drain_completed(&mut submissions, self.completed_value());
+            (submissions.command_pool.pop(), retired)
+        };
+        // Recording a frame takes a while; only fence assignment, publication
+        // and Execute/Signal need the mutex, which keeps values in queue order.
+        let recorded = (|| {
+            let reused = pooled.is_some();
+            let pair = if let Some(pair) = pooled {
                 unsafe {
                     pair.allocator.Reset()?;
                     pair.commands.Reset(&pair.allocator, None)?;
                 }
-                submissions.command_stats.reused += 1;
                 pair
             } else {
                 let allocator: ID3D12CommandAllocator = unsafe {
@@ -239,7 +244,6 @@ impl Device {
                         None,
                     )?
                 };
-                submissions.command_stats.created += 1;
                 CommandPair {
                     allocator,
                     commands,
@@ -247,6 +251,20 @@ impl Device {
             };
             record(&pair.commands)?;
             unsafe { pair.commands.Close()? };
+            anyhow::Ok((pair, reused))
+        })();
+        let mut submissions = self.retirement.submissions.lock();
+        let result = (|| {
+            let (pair, reused) = recorded?;
+            if reused {
+                submissions.command_stats.reused += 1;
+            } else {
+                submissions.command_stats.created += 1;
+            }
+            ensure!(!submissions.shutdown, "D3D12 device is shutting down");
+            if let Some(error) = &submissions.failure {
+                bail!("D3D12 submission failed previously: {error}");
+            }
             let value = submissions
                 .next_value
                 .checked_add(1)
@@ -310,13 +328,17 @@ impl Device {
     }
 
     pub(super) fn wait_for(&self, value: u64) -> Result<()> {
-        let event = Event::new()?;
         let deadline = Instant::now() + Duration::from_secs(30);
         unsafe { self.device.GetDeviceRemovedReason()? };
-        if self.completed_value() < value {
+        // The frame loop mostly waits on fences that already completed.
+        let event = if self.completed_value() < value {
+            let event = Event::new()?;
             unsafe { self.retirement.fence.SetEventOnCompletion(value, event.0)? };
-        }
-        while self.completed_value() < value {
+            Some(event)
+        } else {
+            None
+        };
+        while let Some(event) = event.as_ref().filter(|_| self.completed_value() < value) {
             let result = unsafe { WaitForSingleObject(event.0, 100) };
             ensure!(
                 result == WAIT_OBJECT_0 || result == WAIT_TIMEOUT,
