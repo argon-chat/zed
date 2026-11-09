@@ -33,6 +33,9 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
+float content_mask_coverage(float2 position, Bounds_ScaledPixels mask,
+                            Corners_ScaledPixels radii);
+float flat_mask_coverage(float2 position, float4 mask_bounds, float4 mask_radii);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -52,6 +55,11 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla co
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  // vue-native fork: the pre-transform position, in the same space as
+  // `quad.bounds`. Equal to `position.xy` when there is no transform. The
+  // fragment shader does all of its SDF work (corner radii, border widths,
+  // dash phase) in this untransformed local frame; see `Quad::transformation`.
+  float2 local_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -62,6 +70,7 @@ struct QuadVertexOutput {
 struct QuadFragmentInput {
   uint quad_id [[flat]];
   float4 position [[position]];
+  float2 local_position;
   float4 border_color [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
@@ -78,10 +87,18 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     [[buffer(QuadInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
-  float4 device_position =
-      to_device_position(unit_vertex, quad.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
-                                                 quad.content_mask.bounds);
+  // vue-native fork: CSS `transform` (`Quad::transformation`), applied here
+  // only. The clip distances are measured from the TRANSFORMED vertex, since
+  // the content mask is in screen space.
+  float4 device_position = to_device_position_transformed(
+      unit_vertex, quad.bounds, quad.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, quad.bounds, quad.content_mask.bounds, quad.transformation);
+  // Affine in `unit_vertex`, so the rasteriser's interpolation reproduces it
+  // exactly across the quad.
+  float2 local_position =
+      unit_vertex * float2(quad.bounds.size.width, quad.bounds.size.height) +
+      float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float4 border_color = hsla_to_rgba(quad.border_color);
 
   GradientColor gradient = prepare_fill_color(
@@ -95,6 +112,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   return QuadVertexOutput{
       quad_id,
       device_position,
+      local_position,
       border_color,
       gradient.solid,
       gradient.color0,
@@ -102,12 +120,16 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
-  Quad quad = quads[input.quad_id];
-  float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
-    input.background_solid, input.background_color0, input.background_color1);
+// vue-native fork: `quad_fragment` before the content mask's corners; it
+// returns from a handful of places, and the wrapper below takes them all. Its
+// inputs are the fragment's varyings, passed one by one; `local_position` is
+// the untransformed position (see `QuadVertexOutput`), where the old body read
+// `input.position.xy`.
+float4 quad_color(Quad quad, float2 local_position, float4 input_border_color,
+                  float4 background_solid, float4 background_color0,
+                  float4 background_color1) {
+  float4 background_color = fill_color(quad.background, local_position, quad.bounds,
+    background_solid, background_color0, background_color1);
   // vue-native fork: what fills the inside of the inner border edge. A
   // BG_RING background paints only in the border area, so its inside is
   // transparent.
@@ -131,7 +153,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
   float2 half_size = size / 2.0;
-  float2 point = input.position.xy - float2(quad.bounds.origin.x, quad.bounds.origin.y);
+  float2 point = local_position - float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float2 center_to_point = point - half_size;
 
   // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -221,7 +243,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float4 color = interior_color;
   if (border_sdf < antialias_threshold) {
-    float4 border_color = input.border_color;
+    float4 border_color = input_border_color;
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -407,6 +429,20 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                              constant Quad *quads
+                              [[buffer(QuadInputIndex_Quads)]]) {
+  Quad quad = quads[input.quad_id];
+  float4 color = quad_color(quad, input.local_position, input.border_color,
+                            input.background_solid, input.background_color0,
+                            input.background_color1);
+  // vue-native fork: the content mask's rounded corners, in screen space.
+  // Straight alpha, like everything `quad_color` returns.
+  color.a *= content_mask_coverage(input.position.xy, quad.content_mask.bounds,
+                                   quad.content_mask.corner_radii);
+  return color;
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
@@ -459,6 +495,10 @@ float quarter_ellipse_sdf(float2 point, float2 radii) {
 
 struct ShadowVertexOutput {
   float4 position [[position]];
+  // vue-native fork: the pre-transform position, in the DILATED local frame
+  // the vertex shader builds below, which is the frame the gaussian is
+  // evaluated in. See `QuadVertexOutput::local_position`.
+  float2 local_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -466,6 +506,7 @@ struct ShadowVertexOutput {
 
 struct ShadowFragmentInput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint shadow_id [[flat]];
 };
@@ -492,14 +533,20 @@ vertex ShadowVertexOutput shadow_vertex(
     bounds.size.height += 2. * margin;
   }
 
-  float4 device_position =
-      to_device_position(unit_vertex, bounds, viewport_size);
-  float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+  // vue-native fork: CSS `transform`; a shadow is part of the element's
+  // painted output, so it turns with the box. See `quad_vertex`.
+  float4 device_position = to_device_position_transformed(
+      unit_vertex, bounds, shadow.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, bounds, shadow.content_mask.bounds, shadow.transformation);
+  float2 local_position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
   float4 color = hsla_to_rgba(shadow.color);
 
   return ShadowVertexOutput{
       device_position,
+      local_position,
       color,
       shadow_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -514,7 +561,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
   float2 half_size = size / 2.;
   float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
+  // vue-native fork: every SDF below runs in the untransformed local frame.
+  float2 point = input.local_position - center;
   float corner_radius;
   if (point.x < 0.) {
     if (point.y < 0.) {
@@ -532,7 +580,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(input.local_position, shadow.bounds, shadow.corner_radii);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -557,23 +605,29 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+    float element_distance = quad_sdf(input.local_position, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
   } else if (shadow.inset == 0u) {
     // vue-native fork: an outer shadow is clipped to the outside of the element's
     // border box (CSS Backgrounds 3 §7.1), so a translucent background shows what is
     // behind the element. inset == 2 is the unclipped variant.
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+    float element_distance = quad_sdf(input.local_position, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 + element_distance);
   }
 
+  // vue-native fork: the content mask's rounded corners, in screen space.
+  alpha *= content_mask_coverage(input.position.xy, shadow.content_mask.bounds,
+                                 shadow.content_mask.corner_radii);
   return input.color * float4(1., 1., 1., alpha);
 }
 
 struct UnderlineVertexOutput {
   float4 position [[position]];
+  // vue-native fork: the pre-transform position. The wave below is
+  // parameterised along the underline's own axis, not the screen's.
+  float2 local_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
   float clip_distance [[clip_distance]][4];
@@ -581,6 +635,7 @@ struct UnderlineVertexOutput {
 
 struct UnderlineFragmentInput {
   float4 position [[position]];
+  float2 local_position;
   float4 color [[flat]];
   uint underline_id [[flat]];
 };
@@ -593,13 +648,20 @@ vertex UnderlineVertexOutput underline_vertex(
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
-  float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                 underline.content_mask.bounds);
+  // vue-native fork: CSS `transform`; an underline rides with the text it
+  // decorates. See `quad_vertex`.
+  float4 device_position = to_device_position_transformed(
+      unit_vertex, underline.bounds, underline.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, underline.bounds, underline.content_mask.bounds,
+      underline.transformation);
+  float2 local_position =
+      unit_vertex * float2(underline.bounds.size.width, underline.bounds.size.height) +
+      float2(underline.bounds.origin.x, underline.bounds.origin.y);
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
       device_position,
+      local_position,
       color,
       underline_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -612,12 +674,16 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  // vue-native fork: the content mask's rounded corners, in screen space.
+  float mask = content_mask_coverage(input.position.xy,
+                                     underline.content_mask.bounds,
+                                     underline.content_mask.corner_radii);
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+    float2 st = ((input.local_position - origin) / underline.bounds.size.height) -
                 float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
@@ -630,17 +696,22 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * mask);
   } else {
-    return input.color;
+    return input.color * float4(1., 1., 1., mask);
   }
 }
 
+// vue-native fork: `sprite_id` carries the sprite to the fragment shader for
+// its content mask's rounded corners. (gpui_windows and gpui_wgpu pass the
+// mask as flat varyings instead; here the sprites buffer is already bound to
+// the fragment stage, so the id is enough.)
 struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
   float4 clip_distance;
+  uint sprite_id [[flat]];
 };
 
 struct MonochromeSpriteFragmentInput {
@@ -648,6 +719,7 @@ struct MonochromeSpriteFragmentInput {
   float2 tile_position;
   float4 color [[flat]];
   float4 clip_distance;
+  uint sprite_id [[flat]];
 };
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
@@ -670,7 +742,8 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
       device_position,
       tile_position,
       color,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      sprite_id};
 }
 
 fragment float4 monochrome_sprite_fragment(
@@ -686,13 +759,20 @@ fragment float4 monochrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
+  // vue-native fork: the content mask's rounded corners, in screen space.
+  MonochromeSprite sprite = sprites[input.sprite_id];
+  color.a *= sample.a * content_mask_coverage(input.position.xy,
+                                              sprite.content_mask.bounds,
+                                              sprite.content_mask.corner_radii);
   return color;
 }
 
 struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
+  // vue-native fork: the pre-transform position. The corner-radius SDF is
+  // evaluated against the untransformed `sprite.bounds`.
+  float2 local_position;
   uint sprite_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
@@ -700,6 +780,7 @@ struct PolychromeSpriteVertexOutput {
 struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
+  float2 local_position;
   uint sprite_id [[flat]];
 };
 
@@ -714,14 +795,20 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
+  // vue-native fork: CSS `transform`; an <img> (or a colour emoji) inside a
+  // rotated box rotates with it. See `quad_vertex`.
+  float4 device_position = to_device_position_transformed(
+      unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float2 local_position =
+      unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height) +
+      float2(sprite.bounds.origin.x, sprite.bounds.origin.y);
   return PolychromeSpriteVertexOutput{
       device_position,
       tile_position,
+      local_position,
       sprite_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
@@ -735,8 +822,9 @@ fragment float4 polychrome_sprite_fragment(
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  // vue-native fork: the sprite's own corners in its untransformed frame.
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
   float4 color = sample;
   // vue-native fork: the tint takes the pixels by its alpha, keeping theirs
@@ -752,7 +840,10 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  // vue-native fork: times the content mask's rounded corners, in screen space.
+  color.a *= sprite.opacity * saturate(0.5 - distance) *
+      content_mask_coverage(input.position.xy, sprite.content_mask.bounds,
+                            sprite.content_mask.corner_radii);
   return color;
 }
 
@@ -833,6 +924,11 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
+  // vue-native fork: the content mask's rounded corners. `path_bounds` is the
+  // path clipped to the mask's rect (the clip rect and the gradient's box);
+  // the corners need the mask itself, which `PathRasterizationVertex` carries.
+  alpha *= content_mask_coverage(input.position.xy, v.content_mask.bounds,
+                                 v.content_mask.corner_radii);
   return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -872,15 +968,22 @@ fragment float4 path_sprite_fragment(
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
 }
 
+// vue-native fork: the surfaces buffer is not bound to the fragment stage, so
+// the content mask's rect and radii ride along as flat varyings (as the
+// glyph pipelines' do in gpui_windows' shaders.hlsl); see `flat_mask_coverage`.
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  float4 mask_bounds [[flat]];
+  float4 mask_radii [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float4 mask_bounds [[flat]];
+  float4 mask_radii [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -900,9 +1003,19 @@ vertex SurfaceVertexOutput surface_vertex(
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
+  float4 mask_bounds = float4(
+      surface.content_mask.bounds.origin.x, surface.content_mask.bounds.origin.y,
+      surface.content_mask.bounds.size.width, surface.content_mask.bounds.size.height);
+  float4 mask_radii = float4(
+      surface.content_mask.corner_radii.top_left,
+      surface.content_mask.corner_radii.top_right,
+      surface.content_mask.corner_radii.bottom_right,
+      surface.content_mask.corner_radii.bottom_left);
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      mask_bounds,
+      mask_radii,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -921,7 +1034,11 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  // vue-native fork: the content mask's rounded corners, in screen space.
+  color.a *= flat_mask_coverage(input.position.xy, input.mask_bounds,
+                                input.mask_radii);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
@@ -1112,6 +1229,38 @@ float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
 
         return signed_distance_to_inset_quad - corner_radius;
     }
+}
+
+// vue-native fork: the coverage of a ROUNDED content mask at `position`, the
+// fragment's [[position]] (its pixel centre, in the device pixels the mask is
+// in). The clip distances already cut the mask's rectangle, so all-zero radii,
+// the common case, return 1 before any SDF math: one uniform branch per
+// fragment. A rounded mask is the antialiased SDF the polychrome sprite's own
+// corners use. Mirrors gpui_windows' shaders.hlsl and gpui_wgpu's shaders.wgsl.
+float content_mask_coverage(float2 position, Bounds_ScaledPixels mask,
+                            Corners_ScaledPixels radii) {
+  if (radii.top_left == 0. && radii.top_right == 0. &&
+      radii.bottom_right == 0. && radii.bottom_left == 0.) {
+    return 1.;
+  }
+  return saturate(0.5 - quad_sdf(position, mask, radii));
+}
+
+// vue-native fork: `content_mask_coverage` for a mask passed as flat varyings:
+// `mask_bounds` is (origin.x, origin.y, width, height) and `mask_radii` is
+// (top_left, top_right, bottom_right, bottom_left).
+float flat_mask_coverage(float2 position, float4 mask_bounds, float4 mask_radii) {
+  Bounds_ScaledPixels mask;
+  mask.origin.x = mask_bounds.x;
+  mask.origin.y = mask_bounds.y;
+  mask.size.width = mask_bounds.z;
+  mask.size.height = mask_bounds.w;
+  Corners_ScaledPixels radii;
+  radii.top_left = mask_radii.x;
+  radii.top_right = mask_radii.y;
+  radii.bottom_right = mask_radii.z;
+  radii.bottom_left = mask_radii.w;
+  return content_mask_coverage(position, mask, radii);
 }
 
 // A standard gaussian function, used for weighting samples
