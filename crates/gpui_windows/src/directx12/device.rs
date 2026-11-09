@@ -135,7 +135,12 @@ impl Device {
         if !explicit_match {
             candidates.retain(|(_, _, software, _)| !software);
         }
-        candidates.sort_by_key(|(_, _, software, memory)| (*software, std::cmp::Reverse(*memory)));
+        // Keep the system's adapter order. Adapter 0 drives the primary display
+        // and follows the user's per-app Windows graphics preference; on hybrid
+        // laptops it is the integrated GPU unless high performance was chosen.
+        // Ranking by dedicated memory would always wake the discrete GPU (and
+        // copy every Present across adapters when the panel hangs off the iGPU).
+        candidates.sort_by_key(|(_, _, software, _)| *software);
         let mut last_error = None;
         for (adapter, name, _, _) in candidates {
             let mut device: Option<ID3D12Device> = None;
@@ -835,6 +840,40 @@ pub(super) fn transition(
     unsafe {
         commands.ResourceBarrier(std::slice::from_ref(&barrier));
         ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+    }
+}
+
+/// Moves every resource between the same two states in one `ResourceBarrier`
+/// call, so the GPU drains once rather than once per resource.
+pub(super) fn transitions(
+    commands: &ID3D12GraphicsCommandList,
+    resources: &[&ID3D12Resource],
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    if before == after || resources.is_empty() {
+        return;
+    }
+    let mut barriers: Vec<_> = resources
+        .iter()
+        .map(|resource| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: ManuallyDrop::new(Some((*resource).clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        })
+        .collect();
+    unsafe {
+        commands.ResourceBarrier(&barriers);
+        for barrier in &mut barriers {
+            ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+        }
     }
 }
 

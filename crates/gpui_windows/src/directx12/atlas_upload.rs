@@ -4,11 +4,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use gpui::AtlasTile;
-use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
+use windows::{
+    Win32::Graphics::{Direct3D12::*, Dxgi::Common::*},
+    core::Interface,
+};
 
 use super::{
     atlas::ATLAS_STATE,
-    device::{Device, KeepAlive, TextureLocation, transition},
+    device::{Device, KeepAlive, TextureLocation, transitions},
 };
 
 const MAX_BATCH_BYTES: usize = 1024 * 1024;
@@ -171,14 +174,21 @@ impl UploadBatch {
         // Keep the pending CPU bytes on every failure. Allocation/Map failures may
         // retry; an Execute/Signal failure is gated by Device's existing failure
         // state, which also retains resources that the GPU may already consume.
+        // Batched tiles are distinct live allocations (`cancel` drops a freed
+        // tile's copy before its space can be reused), so the copies never
+        // overlap: transition each page once around all of them.
+        let mut pages: Vec<&ID3D12Resource> = Vec::new();
+        for copy in &self.copies {
+            if !pages
+                .iter()
+                .any(|page| page.as_raw() == copy.destination.as_raw())
+            {
+                pages.push(&copy.destination);
+            }
+        }
         gpu.submit(owners, |commands| {
+            transitions(commands, &pages, ATLAS_STATE, D3D12_RESOURCE_STATE_COPY_DEST);
             for copy in &self.copies {
-                transition(
-                    commands,
-                    &copy.destination,
-                    ATLAS_STATE,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                );
                 let target = TextureLocation::subresource(&copy.destination, 0);
                 let source = TextureLocation::placed(&upload, copy.footprint);
                 unsafe {
@@ -191,13 +201,8 @@ impl UploadBatch {
                         None,
                     );
                 }
-                transition(
-                    commands,
-                    &copy.destination,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    ATLAS_STATE,
-                );
             }
+            transitions(commands, &pages, D3D12_RESOURCE_STATE_COPY_DEST, ATLAS_STATE);
             Ok(())
         })?;
         // Neither CPU staging nor a new GPU upload pool remains on idle atlases.

@@ -20,7 +20,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D12::*,
@@ -478,6 +478,7 @@ pub(crate) struct DirectXRenderer {
     path_resolved: Option<Arc<Target>>,
     snapshot: Option<Arc<Target>>,
     blur: Vec<Arc<Target>>,
+    idle_frames: ScratchIdle,
     timings: Option<RendererTimings>,
     uploads: [UploadPool; BUFFERS],
     uploads_failed: bool,
@@ -551,6 +552,7 @@ impl DirectXRenderer {
             path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
+            idle_frames: ScratchIdle::default(),
             timings: RendererTimings::from_environment(),
             uploads: std::array::from_fn(|_| UploadPool::default()),
             uploads_failed: false,
@@ -648,8 +650,10 @@ impl DirectXRenderer {
         )?;
         self.width = width;
         self.height = height;
+        // The GPU is idle, so every slot's uploads are complete. Their buffers
+        // do not depend on the window size; keep them so that live resize does
+        // not recreate committed upload buffers on every step.
         self.fences = [0; BUFFERS];
-        self.uploads = std::array::from_fn(|_| UploadPool::default());
         self.layers.clear();
         self.path_msaa = None;
         self.path_resolved = None;
@@ -772,18 +776,22 @@ impl DirectXRenderer {
         let prepare_profile =
             crate::profiling::span(profile_target, "native", "D3D12 prepare pipelines");
         let prepare_started = self.timings.as_ref().map(|_| Instant::now());
+        // Scratch targets are window-sized; recreating one is a committed
+        // allocation plus page zeroing. Keep them through short gaps (a
+        // chevron scrolling out, a tooltip closing) and release them once
+        // a run of drawn frames no longer needs them.
         let depth = layer_depth(scene, 0, 0)?;
-        self.layers.truncate(depth);
-        if scene.paths.is_empty() {
+        trim_scratch(&mut self.layers, depth, &mut self.idle_frames.layers);
+        let path_targets = if scene.paths.is_empty() { 0 } else { 1 };
+        let mut held = usize::from(self.path_msaa.is_some());
+        trim_scratch_count(&mut held, path_targets, &mut self.idle_frames.paths);
+        if held == 0 {
             self.path_msaa = None;
             self.path_resolved = None;
         }
         let needs_backdrop = self.prepare_pipelines(scene)?;
-        if !needs_backdrop {
-            self.snapshot = None;
-            self.blur.clear();
-        } else {
-            let levels = scene
+        let backdrop_levels = if needs_backdrop {
+            scene
                 .backdrop_blur_rects
                 .iter()
                 .map(BackdropBlurRect::effective_kernel_levels)
@@ -794,9 +802,18 @@ impl DirectXRenderer {
                         .map(EffectQuad::effective_kernel_levels),
                 )
                 .max()
-                .unwrap_or(0);
-            self.blur.truncate(levels as usize);
+                .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        // The snapshot counts as one more level below the pyramid.
+        let mut held = usize::from(self.snapshot.is_some()) + self.blur.len();
+        let needed = if needs_backdrop { backdrop_levels + 1 } else { 0 };
+        trim_scratch_count(&mut held, needed, &mut self.idle_frames.backdrop);
+        if held == 0 {
+            self.snapshot = None;
         }
+        self.blur.truncate(held.saturating_sub(1));
         let prepare_time = prepare_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
@@ -890,6 +907,9 @@ impl DirectXRenderer {
                 path_resolved: &mut self.path_resolved,
                 snapshot: &mut self.snapshot,
                 blur: &mut self.blur,
+                bound: BoundState::default(),
+                clip: full_rect(self.width, self.height),
+                reads_backdrop: needs_backdrop,
             };
             encoding.bind_target(&target)?;
             let clear = if appearance == WindowBackgroundAppearance::Opaque {
@@ -1103,6 +1123,83 @@ impl DirectXRenderer {
     }
 }
 
+/// Drawn frames a full-window scratch target may sit unused before release.
+const SCRATCH_RELEASE_FRAMES: u32 = 90;
+
+#[derive(Default)]
+struct ScratchIdle {
+    layers: u32,
+    paths: u32,
+    backdrop: u32,
+}
+
+fn trim_scratch<T>(scratch: &mut Vec<T>, needed: usize, idle: &mut u32) {
+    let mut held = scratch.len();
+    trim_scratch_count(&mut held, needed, idle);
+    scratch.truncate(held);
+}
+/// Lowers `held` to `needed` once more is held than needed for
+/// [`SCRATCH_RELEASE_FRAMES`] consecutive drawn frames.
+fn trim_scratch_count(held: &mut usize, needed: usize, idle: &mut u32) {
+    if needed >= *held {
+        *idle = 0;
+        return;
+    }
+    *idle += 1;
+    if *idle >= SCRATCH_RELEASE_FRAMES {
+        *held = needed;
+        *idle = 0;
+    }
+}
+
+fn full_rect(width: u32, height: u32) -> RECT {
+    RECT {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    }
+}
+fn intersect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+fn is_empty(rect: &RECT) -> bool {
+    rect.left >= rect.right || rect.top >= rect.bottom
+}
+/// Whole device pixels covering `bounds`, grown by `margin` on every side.
+fn round_out(bounds: &Bounds<ScaledPixels>, margin: i32) -> RECT {
+    let clamp = |value: f32| value.clamp(i32::MIN as f32 / 2., i32::MAX as f32 / 2.) as i32;
+    RECT {
+        left: clamp(bounds.origin.x.0.floor()).saturating_sub(margin),
+        top: clamp(bounds.origin.y.0.floor()).saturating_sub(margin),
+        right: clamp((bounds.origin.x.0 + bounds.size.width.0).ceil()).saturating_add(margin),
+        bottom: clamp((bounds.origin.y.0 + bounds.size.height.0).ceil()).saturating_add(margin),
+    }
+}
+/// `rect` in a pyramid level `2^level` times smaller, rounded out by a texel.
+fn scale_down(rect: RECT, level: usize) -> RECT {
+    let divisor = 1i32 << level;
+    RECT {
+        left: rect.left.div_euclid(divisor) - 1,
+        top: rect.top.div_euclid(divisor) - 1,
+        right: (rect.right + divisor - 1).div_euclid(divisor) + 1,
+        bottom: (rect.bottom + divisor - 1).div_euclid(divisor) + 1,
+    }
+}
+/// Window pixels a blur of `levels` pyramid levels can carry into a pixel.
+/// Each down- and up-sample pass reads two source texels to either side
+/// (one-texel offsets, bilinear), i.e. `2 * 2^level` window pixels at level
+/// `level`; both chains together stay below `4 * 2^levels`, and the final
+/// bilinear read of the half-resolution level adds a few pixels more.
+fn blur_reach(levels: usize) -> i32 {
+    (4 << levels) + 8
+}
+
 fn layer_depth(scene: &Scene, group: usize, depth: usize) -> Result<usize> {
     ensure!(
         depth <= MAX_LAYER_DEPTH,
@@ -1235,6 +1332,11 @@ struct Descriptors {
     used: u32,
     next_page: usize,
     stride: u32,
+    // Tables already written to the current page, keyed by the raw resource
+    // pointers (0 for a null view). A view only names a resource; its pixels
+    // are read when the GPU executes, so one table serves every batch that
+    // samples the same pair. Cleared with the page that holds them.
+    tables: HashMap<(usize, usize), D3D12_GPU_DESCRIPTOR_HANDLE>,
 }
 impl Descriptors {
     fn new(gpu: Arc<Device>, retained: Retained) -> Self {
@@ -1245,8 +1347,11 @@ impl Descriptors {
             heap: None,
             used: DESCRIPTORS_PER_PAGE,
             next_page: 0,
+            tables: HashMap::new(),
         }
     }
+    /// Returns the table for this texture pair and whether the bound heap
+    /// changed, which invalidates the descriptor table bound before it.
     fn textures(
         &mut self,
         list: &ID3D12GraphicsCommandList,
@@ -1254,7 +1359,15 @@ impl Descriptors {
         second: Option<&AtlasTexture>,
         uploads: &mut UploadPool,
         work: &mut RenderWork,
-    ) -> Result<D3D12_GPU_DESCRIPTOR_HANDLE> {
+    ) -> Result<(D3D12_GPU_DESCRIPTOR_HANDLE, bool)> {
+        let key = (
+            first.map_or(0, |texture| texture.resource.as_raw() as usize),
+            second.map_or(0, |texture| texture.resource.as_raw() as usize),
+        );
+        if let Some(table) = self.tables.get(&key) {
+            return Ok((*table, false));
+        }
+        let mut heap_changed = false;
         if self.used + 2 > DESCRIPTORS_PER_PAGE {
             let heap = if let Some(heap) = uploads.descriptor_pages.get(self.next_page) {
                 work.descriptor_pages_reused += 1;
@@ -1281,6 +1394,8 @@ impl Descriptors {
             unsafe { list.SetDescriptorHeaps(&[Some(heap.clone())]) };
             self.heap = Some(heap);
             self.used = 0;
+            self.tables.clear();
+            heap_changed = true;
         }
         let heap = self
             .heap
@@ -1320,8 +1435,25 @@ impl Descriptors {
             ptr: gpu.ptr + u64::from(self.used * stride),
         };
         self.used += 2;
-        Ok(table)
+        self.tables.insert(key, table);
+        Ok((table, heap_changed))
     }
+}
+
+/// Command-list state already recorded, so batches only emit what changes.
+/// The root signature and its frame-constant arguments are bound once per
+/// command list; a heap switch invalidates only the descriptor table.
+#[derive(Default)]
+struct BoundState {
+    root: bool,
+    pipeline: usize,
+    instances: u64,
+    batch_start: Option<u32>,
+    table: u64,
+    topology: Option<D3D_PRIMITIVE_TOPOLOGY>,
+    // Pipelines kept alive for this frame's fence; a cache entry outlives the
+    // frame only while the renderer does.
+    retained_pipelines: Vec<usize>,
 }
 
 struct Encoding<'a> {
@@ -1345,11 +1477,22 @@ struct Encoding<'a> {
     path_resolved: &'a mut Option<Arc<Target>>,
     snapshot: &'a mut Option<Arc<Target>>,
     blur: &'a mut Vec<Arc<Target>>,
+    bound: BoundState,
+    /// Device pixels of the current window-sized target that can still reach
+    /// the screen: the whole window, narrowed by each enclosing layer.
+    clip: RECT,
+    reads_backdrop: bool,
 }
 impl Encoding<'_> {
+    /// Binds a window-sized target, scissored to the current clip.
     fn bind_target(&mut self, target: &Arc<Target>) -> Result<()> {
+        let clip = self.clip;
+        self.bind_target_rect(target, clip)
+    }
+    fn bind_target_rect(&mut self, target: &Arc<Target>, rect: RECT) -> Result<()> {
         target.to(self.list, D3D12_RESOURCE_STATE_RENDER_TARGET, self.changes);
         retain(&self.retained, target.clone());
+        let rect = intersect(rect, full_rect(target.width, target.height));
         unsafe {
             self.list
                 .OMSetRenderTargets(1, Some(&target.rtv()), false, None);
@@ -1361,15 +1504,32 @@ impl Encoding<'_> {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]);
-            self.list
-                .RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-                    left: 0,
-                    top: 0,
-                    right: target.width as i32,
-                    bottom: target.height as i32,
-                }]);
+            self.list.RSSetScissorRects(&[rect]);
         }
         Ok(())
+    }
+    fn bind_root(&mut self) {
+        if self.bound.root {
+            return;
+        }
+        retain(&self.retained, self.pipelines.root_signature.clone());
+        unsafe {
+            self.list
+                .SetGraphicsRootSignature(&self.pipelines.root_signature);
+            self.list.SetGraphicsRootConstantBufferView(
+                ROOT_GLOBALS,
+                self.globals.GetGPUVirtualAddress(),
+            );
+            self.list.SetGraphicsRootShaderResourceView(
+                ROOT_CLIP_SEGMENTS,
+                self.data.clips.GetGPUVirtualAddress(),
+            );
+            self.list.SetGraphicsRootShaderResourceView(
+                ROOT_TEXT_BACKGROUNDS,
+                self.data.text_backgrounds.GetGPUVirtualAddress(),
+            );
+        }
+        self.bound.root = true;
     }
     fn draw(
         &mut self,
@@ -1398,41 +1558,55 @@ impl Encoding<'_> {
         if count == 0 {
             return Ok(());
         }
-        let table = self
+        let (table, heap_changed) = self
             .descriptors
             .textures(self.list, first, second, self.uploads, self.work)?;
-        retain(&self.retained, pipeline.clone());
-        retain(&self.retained, self.pipelines.root_signature.clone());
-        let batch = [start, 0, 0, 0];
-        unsafe {
-            self.list.SetPipelineState(pipeline);
-            self.list
-                .SetGraphicsRootSignature(&self.pipelines.root_signature);
-            self.list.SetGraphicsRootConstantBufferView(
-                ROOT_GLOBALS,
-                self.globals.GetGPUVirtualAddress(),
-            );
-            self.list
-                .SetGraphicsRoot32BitConstants(ROOT_BATCH, 4, batch.as_ptr().cast(), 0);
-            self.list
-                .SetGraphicsRootShaderResourceView(ROOT_INSTANCES, buffer.GetGPUVirtualAddress());
-            self.list.SetGraphicsRootShaderResourceView(
-                ROOT_CLIP_SEGMENTS,
-                self.data.clips.GetGPUVirtualAddress(),
-            );
-            self.list.SetGraphicsRootShaderResourceView(
-                ROOT_TEXT_BACKGROUNDS,
-                self.data.text_backgrounds.GetGPUVirtualAddress(),
-            );
-            self.list
-                .SetGraphicsRootDescriptorTable(ROOT_TEXTURES, table);
-            self.list.IASetPrimitiveTopology(if vertices == 4 {
-                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
-            } else {
-                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
-            });
-            self.list.DrawInstanced(vertices, count, 0, 0);
+        if heap_changed {
+            self.bound.table = 0;
         }
+        self.bind_root();
+        let pipeline_key = pipeline.as_raw() as usize;
+        if self.bound.pipeline != pipeline_key {
+            if !self.bound.retained_pipelines.contains(&pipeline_key) {
+                retain(&self.retained, pipeline.clone());
+                self.bound.retained_pipelines.push(pipeline_key);
+            }
+            unsafe { self.list.SetPipelineState(pipeline) };
+            self.bound.pipeline = pipeline_key;
+        }
+        if self.bound.batch_start != Some(start) {
+            let batch = [start, 0, 0, 0];
+            unsafe {
+                self.list
+                    .SetGraphicsRoot32BitConstants(ROOT_BATCH, 4, batch.as_ptr().cast(), 0);
+            }
+            self.bound.batch_start = Some(start);
+        }
+        let instances = unsafe { buffer.GetGPUVirtualAddress() };
+        if self.bound.instances != instances {
+            unsafe {
+                self.list
+                    .SetGraphicsRootShaderResourceView(ROOT_INSTANCES, instances);
+            }
+            self.bound.instances = instances;
+        }
+        if self.bound.table != table.ptr {
+            unsafe {
+                self.list
+                    .SetGraphicsRootDescriptorTable(ROOT_TEXTURES, table);
+            }
+            self.bound.table = table.ptr;
+        }
+        let topology = if vertices == 4 {
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+        } else {
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+        };
+        if self.bound.topology != Some(topology) {
+            unsafe { self.list.IASetPrimitiveTopology(topology) };
+            self.bound.topology = Some(topology);
+        }
+        unsafe { self.list.DrawInstanced(vertices, count, 0, 0) };
         Ok(())
     }
     fn group(&mut self, group: usize, depth: usize) -> Result<()> {
@@ -1459,6 +1633,19 @@ impl Encoding<'_> {
             depth < MAX_LAYER_DEPTH,
             "D3D12 isolated layer nesting exceeds {MAX_LAYER_DEPTH}"
         );
+        // The composite covers only `layer.bounds`, inside the enclosing clip;
+        // isolated pixels anywhere else can never reach the screen. A backdrop
+        // read inside the group samples around its own bounds, so scenes with
+        // one keep clearing and drawing the whole layer as before.
+        let parent_clip = self.clip;
+        let clip = if self.reads_backdrop {
+            parent_clip
+        } else {
+            intersect(round_out(&layer.bounds, 0), parent_clip)
+        };
+        if is_empty(&clip) {
+            return Ok(());
+        }
         while self.layers.len() <= depth {
             self.layers
                 .push(Target::new(self.gpu, self.width, self.height, 1)?);
@@ -1470,12 +1657,15 @@ impl Encoding<'_> {
             .clone();
         let parent = self.target.clone();
         self.target = target.clone();
+        self.clip = clip;
         self.bind_target(&target)?;
         unsafe {
             self.list
-                .ClearRenderTargetView(target.rtv(), &[0.0; 4], None);
+                .ClearRenderTargetView(target.rtv(), &[0.0; 4], Some(&[clip]));
         }
-        self.group(layer.group as usize, depth + 1)?;
+        let drawn = self.group(layer.group as usize, depth + 1);
+        self.clip = parent_clip;
+        drawn?;
         self.target = parent.clone();
         self.bind_target(&parent)?;
         target.to(self.list, SHADER_READ, self.changes);
@@ -1608,6 +1798,17 @@ impl Encoding<'_> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
+        let mut union = first_path.clipped_bounds();
+        for path in paths.iter().skip(1) {
+            union = union.union(&path.clipped_bounds());
+        }
+        // Path sprites sample the resolved texture only inside their clipped
+        // bounds, texel for pixel. Rasterize, clear and resolve just that
+        // region (with a pixel of slack) instead of the whole window.
+        let region = intersect(round_out(&union, 1), self.clip);
+        if is_empty(&region) {
+            return Ok(());
+        }
         if self.path_msaa.is_none() {
             *self.path_msaa = Some(Target::new(self.gpu, self.width, self.height, 4)?);
         }
@@ -1635,9 +1836,10 @@ impl Encoding<'_> {
             }));
         }
         let buffer = upload(self.gpu, &self.retained, self.uploads, &vertices)?;
-        self.bind_target(&msaa)?;
+        self.bind_target_rect(&msaa, region)?;
         unsafe {
-            self.list.ClearRenderTargetView(msaa.rtv(), &[0.0; 4], None);
+            self.list
+                .ClearRenderTargetView(msaa.rtv(), &[0.0; 4], Some(&[region]));
         }
         self.draw(
             ShaderModule::PathRasterization,
@@ -1652,9 +1854,24 @@ impl Encoding<'_> {
         msaa.to(self.list, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, self.changes);
         resolved.to(self.list, D3D12_RESOURCE_STATE_RESOLVE_DEST, self.changes);
         retain(&self.retained, resolved.clone());
-        unsafe {
-            self.list
-                .ResolveSubresource(&resolved.resource, 0, &msaa.resource, 0, FORMAT);
+        match self.list.cast::<ID3D12GraphicsCommandList1>() {
+            Ok(list) => unsafe {
+                list.ResolveSubresourceRegion(
+                    &resolved.resource,
+                    0,
+                    region.left as u32,
+                    region.top as u32,
+                    &msaa.resource,
+                    0,
+                    Some(&region),
+                    FORMAT,
+                    D3D12_RESOLVE_MODE_AVERAGE,
+                );
+            },
+            Err(_) => unsafe {
+                self.list
+                    .ResolveSubresource(&resolved.resource, 0, &msaa.resource, 0, FORMAT);
+            },
         }
         resolved.to(self.list, SHADER_READ, self.changes);
         let sprites = if paths
@@ -1668,11 +1885,7 @@ impl Encoding<'_> {
                 })
                 .collect::<Vec<_>>()
         } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
+            vec![PathSprite { bounds: union }]
         };
         let buffer = upload(self.gpu, &self.retained, self.uploads, &sprites)?;
         let target = self.target.clone();
@@ -1703,7 +1916,14 @@ impl Encoding<'_> {
         }
         Ok(())
     }
-    fn backdrop(&mut self, levels: usize) -> Result<(AtlasTexture, AtlasTexture)> {
+    /// Snapshots the current target and blurs it. `region` limits the work to
+    /// the window pixels the consumer reads, already including the kernel's
+    /// reach; `None` keeps the whole window for effects that sample freely.
+    fn backdrop(
+        &mut self,
+        levels: usize,
+        region: Option<RECT>,
+    ) -> Result<(AtlasTexture, AtlasTexture)> {
         let levels = levels.min(MAX_BACKDROP_BLUR_KERNEL_LEVELS as usize);
         self.ensure_blur(levels)?;
         let snapshot = self
@@ -1711,13 +1931,38 @@ impl Encoding<'_> {
             .as_ref()
             .context("D3D12 backdrop snapshot missing")?
             .clone();
+        let full = full_rect(self.width, self.height);
+        let region = region.map_or(full, |region| intersect(region, full));
         self.target
             .to(self.list, D3D12_RESOURCE_STATE_COPY_SOURCE, self.changes);
         snapshot.to(self.list, D3D12_RESOURCE_STATE_COPY_DEST, self.changes);
         retain(&self.retained, snapshot.clone());
-        unsafe {
-            self.list
-                .CopyResource(&snapshot.resource, &self.target.resource);
+        if region == full {
+            unsafe {
+                self.list
+                    .CopyResource(&snapshot.resource, &self.target.resource);
+            }
+        } else {
+            let source = TextureLocation::subresource(&self.target.resource, 0);
+            let destination = TextureLocation::subresource(&snapshot.resource, 0);
+            let region_box = D3D12_BOX {
+                left: region.left as u32,
+                top: region.top as u32,
+                front: 0,
+                right: region.right as u32,
+                bottom: region.bottom as u32,
+                back: 1,
+            };
+            unsafe {
+                self.list.CopyTextureRegion(
+                    destination.raw(),
+                    region.left as u32,
+                    region.top as u32,
+                    0,
+                    source.raw(),
+                    Some(&region_box),
+                );
+            }
         }
         snapshot.to(self.list, SHADER_READ, self.changes);
         let target = self.target.clone();
@@ -1733,7 +1978,8 @@ impl Encoding<'_> {
                 .get(level)
                 .context("D3D12 blur pyramid level missing")?
                 .clone();
-            self.blur_pass(ShaderModule::BlurDownsample, &source, &target)?;
+            let rect = scale_down(region, level + 1);
+            self.blur_pass(ShaderModule::BlurDownsample, &source, &target, rect)?;
             source = target.sampled();
         }
         for level in (1..levels).rev() {
@@ -1742,7 +1988,8 @@ impl Encoding<'_> {
                 .get(level - 1)
                 .context("D3D12 blur pyramid target missing")?
                 .clone();
-            self.blur_pass(ShaderModule::BlurUpsample, &source, &target)?;
+            let rect = scale_down(region, level);
+            self.blur_pass(ShaderModule::BlurUpsample, &source, &target, rect)?;
             source = target.sampled();
         }
         let target = self.target.clone();
@@ -1754,8 +2001,9 @@ impl Encoding<'_> {
         module: ShaderModule,
         source: &AtlasTexture,
         target: &Arc<Target>,
+        rect: RECT,
     ) -> Result<()> {
-        self.bind_target(target)?;
+        self.bind_target_rect(target, rect)?;
         let buffer = self.data.dummy.clone();
         self.draw(module, &buffer, 0, 1, 4, Some(source), None, 1)?;
         target.to(self.list, SHADER_READ, self.changes);
@@ -1777,7 +2025,20 @@ impl Encoding<'_> {
                 }
                 next += 1;
             }
-            let (blurred, original) = self.backdrop(levels)?;
+            let mut union = self.scene.backdrop_blur_rects[first].bounds;
+            for rect in &self.scene.backdrop_blur_rects[first + 1..next] {
+                union = union.union(&rect.bounds);
+            }
+            let region = intersect(round_out(&union, blur_reach(levels)), self.clip);
+            if is_empty(&intersect(round_out(&union, 0), self.clip)) {
+                first = next;
+                continue;
+            }
+            #[cfg(test)]
+            let region = (!tests::FULL_WINDOW_BACKDROP.with(|full| full.get())).then_some(region);
+            #[cfg(not(test))]
+            let region = Some(region);
+            let (blurred, original) = self.backdrop(levels, region)?;
             let buffer = self.data.blur_rects.clone();
             self.draw(
                 ShaderModule::BlurRect,
@@ -1822,7 +2083,7 @@ impl Encoding<'_> {
                 }
                 next += 1;
             }
-            let (blurred, original) = self.backdrop(levels)?;
+            let (blurred, original) = self.backdrop(levels, None)?;
             self.draw_pipeline(
                 &pipeline,
                 &buffer,
@@ -1842,6 +2103,12 @@ impl Encoding<'_> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Forces whole-window backdrops to produce a region-test reference.
+        pub(super) static FULL_WINDOW_BACKDROP: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     #[::core::prelude::v1::test]
     #[ignore = "requires a native D3D12 hardware adapter; run explicitly on Windows"]
     fn native_descriptor_pages_reuse_after_the_frame_slot_fence() -> Result<()> {
@@ -1858,6 +2125,24 @@ mod tests {
         let _release_gate = ReleaseGate(gate.clone());
         let mut uploads = UploadPool::default();
         uploads.begin(gpu.completed_value(), 0)?;
+        // Distinct pairs need distinct tables; one more pair than fits a page.
+        let textures = (0..(DESCRIPTORS_PER_PAGE / 2 + 1))
+            .map(|_| {
+                Ok(AtlasTexture {
+                    resource: gpu.create_texture_multisampled(
+                        1,
+                        1,
+                        FORMAT,
+                        D3D12_RESOURCE_FLAG_NONE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        1,
+                    )?,
+                    format: FORMAT,
+                    width: 1,
+                    height: 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let retained: Retained = Arc::new(Mutex::new(Vec::new()));
         let mut first = RenderWork::default();
         let fence = gpu.submit_after(
@@ -1865,8 +2150,14 @@ mod tests {
             Some((&gate, 1)),
             |list| {
                 let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
-                for _ in 0..(DESCRIPTORS_PER_PAGE / 2 + 1) {
+                let (repeated, _) =
                     descriptors.textures(list, None, None, &mut uploads, &mut first)?;
+                let (again, heap_changed) =
+                    descriptors.textures(list, None, None, &mut uploads, &mut first)?;
+                assert_eq!(repeated.ptr, again.ptr, "a repeated pair must reuse its table");
+                assert!(!heap_changed);
+                for texture in &textures {
+                    descriptors.textures(list, Some(texture), None, &mut uploads, &mut first)?;
                 }
                 Ok(())
             },
@@ -1886,8 +2177,9 @@ mod tests {
         let mut second = RenderWork::default();
         let fence = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
             let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
-            for _ in 0..(DESCRIPTORS_PER_PAGE / 2 + 1) {
-                descriptors.textures(list, None, None, &mut uploads, &mut second)?;
+            descriptors.textures(list, None, None, &mut uploads, &mut second)?;
+            for texture in &textures {
+                descriptors.textures(list, Some(texture), None, &mut uploads, &mut second)?;
             }
             Ok(())
         })?;
@@ -1926,6 +2218,7 @@ mod tests {
             path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
+            idle_frames: ScratchIdle::default(),
             timings: None,
             uploads: std::array::from_fn(|_| UploadPool::default()),
             uploads_failed: false,
@@ -2005,6 +2298,11 @@ mod tests {
             "the fractional triangle edge must retain MSAA coverage"
         );
         renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+        assert!(
+            renderer.path_msaa.is_some(),
+            "a short gap must keep the MSAA scratch for the next path frame"
+        );
+        draw_repeatedly(&mut renderer, &Scene::default(), SCRATCH_RELEASE_FRAMES)?;
         assert!(
             renderer.path_msaa.is_none() && renderer.path_resolved.is_none(),
             "a scene without paths must release the full-window MSAA scratch textures"
@@ -2117,7 +2415,7 @@ mod tests {
             "pixels outside the triangle clip must remain transparent"
         );
         assert_eq!(renderer.layers.len(), 2);
-        renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+        draw_repeatedly(&mut renderer, &Scene::default(), SCRATCH_RELEASE_FRAMES)?;
         assert!(
             renderer.layers.is_empty(),
             "closed isolated groups must release their scratch targets"
@@ -2177,20 +2475,86 @@ mod tests {
         let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
         assert_eq!(image.get_pixel(2, 32).0, [255, 0, 0, 255]);
         assert_eq!(image.get_pixel(16, 16).0, [0, 0, 255, 255]);
-        assert!(
-            renderer.blur.is_empty(),
-            "zero-radius effects must not retain blur levels"
-        );
         assert_eq!(
             image.get_pixel(28, 28).0,
             [0, 255, 0, 255],
             "a later primitive must paint above the effect"
         );
-        renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+        assert_eq!(
+            renderer.blur.len(),
+            2,
+            "a short gap must not release blur levels a recent frame used"
+        );
+        draw_repeatedly(&mut renderer, &scene, SCRATCH_RELEASE_FRAMES)?;
+        assert!(
+            renderer.blur.is_empty() && renderer.snapshot.is_some(),
+            "zero-radius effects must not retain blur levels"
+        );
+        draw_repeatedly(&mut renderer, &Scene::default(), SCRATCH_RELEASE_FRAMES)?;
         assert!(
             renderer.snapshot.is_none() && renderer.blur.is_empty(),
             "closing the backdrop scene must release its scratch textures"
         );
+        Ok(())
+    }
+
+    fn draw_repeatedly(renderer: &mut DirectXRenderer, scene: &Scene, frames: u32) -> Result<()> {
+        for _ in 0..frames {
+            renderer.render_to_image(scene, WindowBackgroundAppearance::Transparent)?;
+        }
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_backdrop_blur_region_matches_whole_window_blur() -> Result<()> {
+        // A blur rect whose kernel reach stays inside the window takes the
+        // region-limited path; one covering the window takes the full path.
+        // Both must agree with a whole-window reference inside the rect.
+        let content_mask = mask(256., 256.);
+        let scene = |rect: Bounds<ScaledPixels>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., 256., 256.), rgb(0x000000), content_mask));
+            for index in 0..8 {
+                let x = 16. + index as f32 * 28.;
+                scene.insert_primitive(quad(bounds(x, 0., 12., 256.), rgb(0xffffff), content_mask));
+            }
+            scene.insert_primitive(BackdropBlurRect {
+                bounds: rect,
+                content_mask,
+                blur_radius: ScaledPixels(6.),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let small = bounds(96., 96., 64., 64.);
+        let scene = scene(small);
+        let levels = scene.backdrop_blur_rects[0].effective_kernel_levels() as usize;
+        assert!(levels > 0, "the fixture must blur");
+        assert!(
+            intersect(round_out(&small, blur_reach(levels)), full_rect(256, 256))
+                != full_rect(256, 256),
+            "the fixture must exercise the region-limited path"
+        );
+        let mut limited = offscreen(256, 256)?;
+        let limited_image =
+            limited.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+        FULL_WINDOW_BACKDROP.with(|full| full.set(true));
+        let mut reference = offscreen(256, 256)?;
+        let reference_image =
+            reference.render_to_image(&scene, WindowBackgroundAppearance::Transparent);
+        FULL_WINDOW_BACKDROP.with(|full| full.set(false));
+        let reference_image = reference_image?;
+        for y in 96..160 {
+            for x in 96..160 {
+                let a = limited_image.get_pixel(x, y).0;
+                let b = reference_image.get_pixel(x, y).0;
+                for channel in 0..4 {
+                    close_channel(a[channel], b[channel]);
+                }
+            }
+        }
         Ok(())
     }
     #[::core::prelude::v1::test]

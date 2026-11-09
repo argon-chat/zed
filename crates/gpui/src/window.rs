@@ -2263,9 +2263,13 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
+                // vue-native: only macOS ProMotion underclocks an idle layer. On
+                // Windows a present re-renders the whole unchanged scene, so the
+                // sustain would cost a full GPU frame per refresh for a second.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || (cfg!(target_os = "macos")
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 if should_draw {
