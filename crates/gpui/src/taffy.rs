@@ -1,3 +1,7 @@
+mod layout_bounds;
+
+use layout_bounds::LayoutIdMap;
+
 use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
     Style, Window, size,
@@ -6,7 +10,7 @@ use crate::{
         round_to_device_pixel,
     },
 };
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashSet;
 use std::{fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -30,9 +34,9 @@ struct NodeContext {
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
-    absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
+    absolute_layout_bounds: LayoutIdMap<Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
-    absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
+    absolute_outer_origins: LayoutIdMap<Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
 }
@@ -45,8 +49,8 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
-            absolute_layout_bounds: FxHashMap::default(),
-            absolute_outer_origins: FxHashMap::default(),
+            absolute_layout_bounds: LayoutIdMap::default(),
+            absolute_outer_origins: LayoutIdMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
         }
