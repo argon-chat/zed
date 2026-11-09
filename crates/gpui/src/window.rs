@@ -1467,17 +1467,20 @@ impl Frame {
             .as_deref()
     }
 
+    // The iterator is stack-only: native WM_NCHITTEST can precede every mouse
+    // move, so constructing its paint-order traversal must not allocate.
+    fn topmost_hitboxes(&self) -> impl Iterator<Item = &Hitbox> {
+        let in_paint_order = self.vn_hit_order.len() == self.hitboxes.len();
+        (0..self.hitboxes.len()).rev().map(move |index| {
+            let index = if in_paint_order { self.vn_hit_order[index] as usize } else { index };
+            &self.hitboxes[index]
+        })
+    }
+
     pub(crate) fn hit_test(&self, position: Point<Pixels>, scale_factor: f32) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        // vue-native fork: topmost PAINTED first (`vn_hit_order`).
-        let in_paint_order = (self.vn_hit_order.len() == self.hitboxes.len())
-            .then(|| self.vn_hit_order.iter().rev().map(|&i| &self.hitboxes[i as usize]));
-        let topmost_first: Box<dyn Iterator<Item = &Hitbox>> = match in_paint_order {
-            Some(order) => Box::new(order),
-            None => Box::new(self.hitboxes.iter().rev()),
-        };
-        for hitbox in topmost_first {
+        for hitbox in self.topmost_hitboxes() {
             if Self::box_contains(hitbox, position, scale_factor) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -7008,12 +7011,20 @@ impl Window {
     /// Resolves native caption behavior at a point in the current painted frame.
     /// This does not reuse or modify the hit set narrowed for a DOM input event.
     pub fn window_control_area_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
-        let hits = self.rendered_frame.hit_test(position, self.scale_factor);
-        hits.ids.iter().find_map(|id| {
-            self.rendered_frame.window_control_hitboxes.iter()
-                .find(|(_, hitbox)| hitbox.id == *id)
-                .map(|(area, _)| *area)
-        })
+        for hitbox in self.rendered_frame.topmost_hitboxes() {
+            if !Frame::box_contains(hitbox, position, self.scale_factor) {
+                continue;
+            }
+            if let Some((area, _)) = self.rendered_frame.window_control_hitboxes.iter()
+                .find(|(_, control)| control.id == hitbox.id)
+            {
+                return Some(*area);
+            }
+            if hitbox.behavior == HitboxBehavior::BlockMouse {
+                break;
+            }
+        }
+        None
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -8431,6 +8442,17 @@ impl Window {
     /// Focus the current window and bring it to the foreground at the platform level.
     pub fn activate_window(&self) {
         self.platform_window.activate();
+    }
+
+    /// Shows a previously hidden window, optionally requesting focus. Returns
+    /// false if unsupported; otherwise `completed` reports the native result.
+    pub fn show_window(
+        &self,
+        activate: bool,
+        should_show: impl FnOnce() -> bool + 'static,
+        completed: impl FnOnce(bool) + 'static,
+    ) -> bool {
+        self.platform_window.show_window(activate, Box::new(should_show), Box::new(completed))
     }
 
     /// Requests that the operating system draw attention to this window.

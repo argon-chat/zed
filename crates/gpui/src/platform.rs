@@ -1246,6 +1246,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Shows a previously hidden window without synthesizing input. Returns
+    /// false when unsupported. A supported backend calls `completed` after the
+    /// native show, or with false if showing was cancelled or failed. A queued
+    /// show checks `should_show` immediately before touching the native window.
+    /// `activate` requests focus; false preserves the current foreground window.
+    fn show_window(
+        &self,
+        _activate: bool,
+        _should_show: Box<dyn FnOnce() -> bool>,
+        _completed: Box<dyn FnOnce(bool)>,
+    ) -> bool {
+        false
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
