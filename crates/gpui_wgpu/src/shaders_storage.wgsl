@@ -2,41 +2,24 @@
 // with storage buffer support; `shaders_webgl.wgsl` is the WebGL2 counterpart that
 // decodes the same records from a texture instead.
 //
-// All buffers share `@group(1) @binding(0)` because each pipeline binds only the
-// buffer its own entry points read.
+// vue-native fork: the buffer is plain words and `shaders_decode.wgsl` reads the
+// records out of it, as it does on WebGL. See that file for why no
+// `array<Quad>` can describe the Rust layout.
+//
+// Every pipeline binds its instance buffer at `@group(1) @binding(0)`.
 
-@group(1) @binding(0) var<storage, read> b_quads: array<Quad>;
-@group(1) @binding(0) var<storage, read> b_shadows: array<Shadow>;
-@group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
-@group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
-@group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
-@group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
-@group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+@group(1) @binding(0) var<storage, read> b_instances: array<u32>;
 
-fn load_quad(instance_id: u32) -> Quad {
-    return b_quads[instance_id];
+struct InstanceCursor {
+    word_index: u32,
 }
 
-fn load_shadow(instance_id: u32) -> Shadow {
-    return b_shadows[instance_id];
+fn instance_cursor(word_index: u32) -> InstanceCursor {
+    return InstanceCursor(word_index);
 }
 
-fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    return b_path_vertices[vertex_id];
-}
-
-fn load_path_sprite(instance_id: u32) -> PathSprite {
-    return b_path_sprites[instance_id];
-}
-
-fn load_underline(instance_id: u32) -> Underline {
-    return b_underlines[instance_id];
-}
-
-fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    return b_mono_sprites[instance_id];
-}
-
-fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    return b_poly_sprites[instance_id];
+fn read_word(cursor: ptr<function, InstanceCursor>) -> u32 {
+    let word_index = (*cursor).word_index;
+    (*cursor).word_index = word_index + 1u;
+    return b_instances[word_index];
 }

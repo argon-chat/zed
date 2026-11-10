@@ -25,6 +25,7 @@ const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 const STORAGE_BUFFER_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
     include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_decode.wgsl"),
 );
 
 /// Shader variant for WebGL2, which has no storage buffers: the shared shader
@@ -32,6 +33,7 @@ const STORAGE_BUFFER_SHADERS: &str = concat!(
 const WEBGL_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
     include_str!("shaders_webgl.wgsl"),
+    include_str!("shaders_decode.wgsl"),
 );
 
 /// Subpixel text rendering requires dual-source blending, which WebGL2 lacks, so
@@ -41,6 +43,7 @@ const SUBPIXEL_SHADERS: &str = concat!(
     "enable dual_source_blending;\n",
     include_str!("shaders.wgsl"),
     include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_decode.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
 
@@ -258,6 +261,11 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
+    /// vue-native fork: whether the window asked for a transparent
+    /// background. An opaque one clears to opaque black: X11 windows sit on a
+    /// 32-bit ARGB visual, and a compositor shows a transparent clear through
+    /// them whatever the surface's alpha mode says.
+    transparent: bool,
     max_texture_size: u32,
     is_bgr: bool,
     failed_frame_count: u32,
@@ -511,6 +519,7 @@ impl WgpuRenderer {
             atlas,
             transparent_alpha_mode,
             opaque_alpha_mode,
+            transparent: config.transparent,
             max_texture_size,
             is_bgr: false,
             failed_frame_count: 0,
@@ -1085,6 +1094,7 @@ impl WgpuRenderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        self.transparent = transparent;
         let new_alpha_mode = if transparent {
             self.transparent_alpha_mode
         } else {
@@ -1228,7 +1238,11 @@ impl WgpuRenderer {
             &frame_view,
             size,
             premultiplied_alpha,
-            wgpu::Color::TRANSPARENT,
+            if self.transparent {
+                wgpu::Color::TRANSPARENT
+            } else {
+                wgpu::Color::BLACK
+            },
         ) {
             log::error!("{error:#}");
             return false;
@@ -2193,6 +2207,7 @@ impl WgpuRenderer {
         } else {
             self.opaque_alpha_mode
         };
+        self.transparent = config.transparent;
 
         self.surface_config.width = width;
         self.surface_config.height = height;
@@ -2694,7 +2709,26 @@ mod tests {
             border_color: color,
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
+            transformation: Default::default(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_renderer_fills_rounded_bordered_quads() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        let mut quad = solid_quad(0.0, 0.0, 64.0, 32.0, gpui::red());
+        quad.corner_radii = Corners::all(8.0.into());
+        quad.border_widths = Edges::all(1.0.into());
+        quad.border_color = gpui::blue();
+        scene.insert_primitive(quad);
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
+        assert_pixel(&image, 32, 16, RED);
+        assert_pixel(&image, 32, 0, BLUE);
+        Ok(())
     }
 
     /// Channels are compared with a small tolerance so the assertions hold across
@@ -2845,7 +2879,7 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         // vue-native fork: Quad, Shadow, Underline and PolychromeSprite each
         // grew a 6-word `transformation` (CSS `transform`), so every stride
-        // below moved by 6. `shaders_webgl.wgsl`'s `load_*` cursors must move
+        // below moved by 6. `shaders_decode.wgsl`'s `load_*` cursors must move
         // with them or the loader reads the next record's bytes.
         //
         // `Background` then grew from 18 words to 57 (eight colour stops,
@@ -2869,122 +2903,60 @@ mod tests {
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 38 * 4);
     }
 
+    /// vue-native fork: the 89 words `shaders_decode.wgsl`'s `load_quad`
+    /// reads, in its order.
     #[test]
-    fn webgl_quad_layout_matches_fixed_decoder() {
+    fn quad_words_match_the_shader_decoder() {
+        let hsla = |h: f32| Hsla {
+            h,
+            s: h + 1.0,
+            l: h + 2.0,
+            a: h + 3.0,
+        };
+        let bounds = |x: f32| Bounds {
+            origin: Point {
+                x: x.into(),
+                y: (x + 1.0).into(),
+            },
+            size: Size {
+                width: (x + 2.0).into(),
+                height: (x + 3.0).into(),
+            },
+        };
         let quad = Quad {
             order: 41,
             border_style: BorderStyle::Dashed,
-            bounds: Bounds {
-                origin: Point {
-                    x: 1.0.into(),
-                    y: 2.0.into(),
-                },
-                size: Size {
-                    width: 3.0.into(),
-                    height: 4.0.into(),
-                },
-            },
+            bounds: bounds(1.0),
             content_mask: ContentMask {
-                corner_radii: Default::default(),
-                bounds: Bounds {
-                    origin: Point {
-                        x: 5.0.into(),
-                        y: 6.0.into(),
-                    },
-                    size: Size {
-                        width: 7.0.into(),
-                        height: 8.0.into(),
-                    },
-                },
+                bounds: bounds(5.0),
+                corner_radii: Corners::all(9.0.into()),
             },
             background: linear_gradient(
                 11.0,
-                linear_color_stop(
-                    Hsla {
-                        h: 12.0,
-                        s: 13.0,
-                        l: 14.0,
-                        a: 15.0,
-                    },
-                    16.0,
-                ),
-                linear_color_stop(
-                    Hsla {
-                        h: 17.0,
-                        s: 18.0,
-                        l: 19.0,
-                        a: 20.0,
-                    },
-                    21.0,
-                ),
+                linear_color_stop(hsla(12.0), 16.0),
+                linear_color_stop(hsla(17.0), 21.0),
             )
             .color_space(ColorSpace::Oklab),
-            border_color: Hsla {
-                h: 22.0,
-                s: 23.0,
-                l: 24.0,
-                a: 25.0,
-            },
-            corner_radii: Corners {
-                top_left: 26.0.into(),
-                top_right: 27.0.into(),
-                bottom_right: 28.0.into(),
-                bottom_left: 29.0.into(),
-            },
-            border_widths: Edges {
-                top: 30.0.into(),
-                right: 31.0.into(),
-                bottom: 32.0.into(),
-                left: 33.0.into(),
-            },
+            border_color: hsla(22.0),
+            corner_radii: Corners::all(26.0.into()),
+            border_widths: Edges::all(30.0.into()),
+            transformation: Default::default(),
         };
 
         let bytes = unsafe { WgpuRendererCore::instance_bytes(std::slice::from_ref(&quad)) };
         let words: &[u32] = bytemuck::cast_slice(bytes);
-        assert_eq!(
-            words,
-            &[
-                41,
-                1,
-                1.0_f32.to_bits(),
-                2.0_f32.to_bits(),
-                3.0_f32.to_bits(),
-                4.0_f32.to_bits(),
-                5.0_f32.to_bits(),
-                6.0_f32.to_bits(),
-                7.0_f32.to_bits(),
-                8.0_f32.to_bits(),
-                1,
-                1,
-                0,
-                0,
-                0,
-                0,
-                11.0_f32.to_bits(),
-                12.0_f32.to_bits(),
-                13.0_f32.to_bits(),
-                14.0_f32.to_bits(),
-                15.0_f32.to_bits(),
-                16.0_f32.to_bits(),
-                17.0_f32.to_bits(),
-                18.0_f32.to_bits(),
-                19.0_f32.to_bits(),
-                20.0_f32.to_bits(),
-                21.0_f32.to_bits(),
-                0,
-                22.0_f32.to_bits(),
-                23.0_f32.to_bits(),
-                24.0_f32.to_bits(),
-                25.0_f32.to_bits(),
-                26.0_f32.to_bits(),
-                27.0_f32.to_bits(),
-                28.0_f32.to_bits(),
-                29.0_f32.to_bits(),
-                30.0_f32.to_bits(),
-                31.0_f32.to_bits(),
-                32.0_f32.to_bits(),
-                33.0_f32.to_bits(),
-            ]
-        );
+        let f = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let mut expected = vec![41, 1];
+        expected.extend(f(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 9.0, 9.0, 9.0]));
+        // Background: tag, colour space, solid, angle, 8 stops, count, flags,
+        // params, tile.
+        expected.extend([1, 1, 0, 0, 0, 0]);
+        expected.extend(f(&[11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0]));
+        expected.extend([0; 6 * 5]);
+        expected.extend([2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        expected.extend(f(&[22.0, 23.0, 24.0, 25.0, 26.0, 26.0, 26.0, 26.0]));
+        expected.extend(f(&[30.0, 30.0, 30.0, 30.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]));
+        assert_eq!(expected.len(), 89);
+        assert_eq!(words, expected.as_slice());
     }
 }
