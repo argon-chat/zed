@@ -1,8 +1,8 @@
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
-    kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
-    ns_string, renderer,
+    fullscreen_backdrop::FullscreenBackdrop, kTISPropertyInputSourceIsASCIICapable,
+    kTISPropertyInputSourceType, kTISTypeKeyboardInputMode, ns_string, renderer,
 };
 use anyhow::Result;
 use block2::RcBlock;
@@ -451,6 +451,10 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             window_will_enter_fullscreen as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(windowDidFailToEnterFullScreen:),
+            window_did_fail_to_enter_fullscreen as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(windowWillExitFullScreen:),
             window_will_exit_fullscreen as extern "C" fn(&Object, Sel, id),
         );
@@ -661,6 +665,9 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
+    // The desktop picture under `blurred_view` while a blurred window is in
+    // native fullscreen (`fullscreen_backdrop.rs`).
+    fullscreen_backdrop: FullscreenBackdrop,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
@@ -1096,6 +1103,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
+                fullscreen_backdrop: FullscreenBackdrop::new(),
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
@@ -1870,13 +1878,8 @@ impl PlatformWindow for MacWindow {
 
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
-            let background_color = if opaque {
-                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
-            } else {
-                // Not using `+[NSColor clearColor]` to avoid broken shadow.
-                NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
-            };
-            this.native_window.setBackgroundColor_(background_color);
+            this.native_window
+                .setBackgroundColor_(window_background_color(background_appearance));
 
             if background_appearance != WindowBackgroundAppearance::Blurred {
                 if let Some(blur_view) = this.blurred_view {
@@ -1899,10 +1902,22 @@ impl PlatformWindow for MacWindow {
                 this.blurred_view = Some(blur_view.autorelease());
             }
         }
+        drop(this);
+        // A blurred window that is already fullscreen gets its picture now; any
+        // other appearance drops one it had.
+        sync_fullscreen_backdrop(&self.0, None, false);
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.0.as_ref().lock().background_appearance
+    }
+
+    fn is_background_appearance_drawn(&self) -> bool {
+        self.0
+            .as_ref()
+            .lock()
+            .fullscreen_backdrop
+            .draws_appearance()
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -3031,6 +3046,103 @@ extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
             lock.native_window.setTitlebarAppearsTransparent_(NO);
         }
     }
+    drop(lock);
+    // Before the transition, so the window never shows the empty Space's black
+    // and the picture is decoded while the animation runs. Asked here, the
+    // desktop picture is still the one of the Space the window is leaving.
+    sync_fullscreen_backdrop(&window_state, Some(true), true);
+}
+
+extern "C" fn window_did_fail_to_enter_fullscreen(this: &Object, _: Sel, _: id) {
+    // SAFETY: registered only on GPUI window classes, whose WINDOW_STATE_IVAR
+    // holds the window state.
+    let window_state = unsafe { get_window_state(this) };
+    sync_fullscreen_backdrop(&window_state, Some(false), false);
+}
+
+/// The background colour `set_background_appearance` gives the `NSWindow`.
+///
+/// # Safety
+/// Main thread.
+unsafe fn window_background_color(appearance: WindowBackgroundAppearance) -> id {
+    unsafe {
+        if appearance == WindowBackgroundAppearance::Opaque {
+            NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 1f64)
+        } else {
+            // Not using `+[NSColor clearColor]` to avoid broken shadow.
+            NSColor::colorWithSRGBRed_green_blue_alpha_(nil, 0f64, 0f64, 0f64, 0.0001)
+        }
+    }
+}
+
+/// Puts the desktop picture behind a blurred window in native fullscreen, or
+/// takes it away (`fullscreen_backdrop.rs`). `fullscreen` is given by the
+/// fullscreen delegate methods, which run before AppKit's own answer settles;
+/// `None` asks the window. `reload` finds the picture again even when one is
+/// shown (a fullscreen entry, a screen change); otherwise an active picture is
+/// kept and only the window's side of it is re-applied.
+fn sync_fullscreen_backdrop(
+    window_state: &Arc<Mutex<MacWindowState>>,
+    fullscreen: Option<bool>,
+    reload: bool,
+) {
+    let mut lock = window_state.lock();
+    let fullscreen = fullscreen.unwrap_or_else(|| lock.is_fullscreen());
+    let native_window = lock.native_window;
+    let blur_view = lock
+        .blurred_view
+        .filter(|_| lock.background_appearance == WindowBackgroundAppearance::Blurred);
+    // SAFETY (every block below): main thread (AppKit delegate methods and
+    // `PlatformWindow` calls); `native_window` is this state's live window and
+    // `blur_view` its live blur view, a subview of the window's content view.
+    let Some(blur_view) = blur_view.filter(|_| fullscreen) else {
+        if lock.fullscreen_backdrop.is_active() {
+            unsafe {
+                lock.fullscreen_backdrop.leave(blur_view);
+                if blur_view.is_some() {
+                    native_window
+                        .setBackgroundColor_(window_background_color(lock.background_appearance));
+                }
+            }
+        }
+        return;
+    };
+    if lock.fullscreen_backdrop.is_active() && !reload {
+        unsafe { lock.fullscreen_backdrop.reassert(native_window, blur_view) };
+        return;
+    }
+    let Some(job) = (unsafe { lock.fullscreen_backdrop.enter(native_window, blur_view) }) else {
+        return;
+    };
+    let generation = job.generation;
+    let decode = lock.background_executor.spawn(async move { job.decode() });
+    let state = Arc::downgrade(window_state);
+    lock.foreground_executor
+        .spawn(async move {
+            let picture = decode.await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let mut lock = state.lock();
+            if lock.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let native_window = lock.native_window;
+            let Some(blur_view) = lock.blurred_view else {
+                return;
+            };
+            // SAFETY: main thread (a foreground task); the window is open and
+            // `blur_view` is its live blur view.
+            unsafe {
+                lock.fullscreen_backdrop.show_decoded(
+                    generation,
+                    picture,
+                    native_window,
+                    blur_view,
+                );
+            }
+        })
+        .detach();
 }
 
 extern "C" fn window_will_exit_fullscreen(this: &Object, _: Sel, _: id) {
@@ -3066,6 +3178,11 @@ extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: id) {
     // Keep using the native windowed frames when restoring them on the next entry.
     lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
     lock.move_traffic_light();
+    drop(lock);
+    // After the transition, not before: the exit animation lands on the same
+    // picture the window was showing, and only then does the blur go back to
+    // blending with the real desktop behind it.
+    sync_fullscreen_backdrop(&window_state, Some(false), false);
 }
 
 pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bool {
@@ -3122,7 +3239,12 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.start_display_link();
+    let refresh_picture = lock.fullscreen_backdrop.is_active();
     drop(lock);
+    if refresh_picture {
+        // A fullscreen window moved to another screen: that screen's picture.
+        sync_fullscreen_backdrop(&window_state, None, true);
+    }
     update_window_scale_factor(&window_state);
     report_display_change(&window_state);
 }

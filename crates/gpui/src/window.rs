@@ -3626,6 +3626,15 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Whether the window currently draws the appearance last given to
+    /// [`Self::set_background_appearance`]. `false` only while the platform
+    /// stands in for it — a blurred macOS window in native fullscreen whose
+    /// desktop picture could not be shown behind the blur — so an app can
+    /// paint a background of its own exactly then.
+    pub fn is_background_appearance_drawn(&self) -> bool {
+        self.platform_window.is_background_appearance_drawn()
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
