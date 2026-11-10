@@ -211,6 +211,23 @@ fn create_with_fallback<T>(factory: impl FnOnce() -> Result<T>, fallback: impl F
 }
 
 #[cfg(test)]
+mod software_adapter_tests {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
+
+    /// WARP is the only adapter in a VM without a GPU (Windows Sandbox, a
+    /// basic-display RDP host); it has no video engine.
+    #[test]
+    fn the_warp_adapter_gets_a_device() {
+        let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS::default()) }.unwrap();
+        let warp: IDXGIAdapter1 = unsafe { factory.EnumWarpAdapter() }.unwrap();
+        let mut context = None;
+        let mut level = Default::default();
+        super::get_device(&warp, Some(&mut context), Some(&mut level), false).expect("a WARP device");
+        assert!(context.is_some());
+    }
+}
+
+#[cfg(test)]
 mod factory_fallback_tests {
     use std::cell::Cell;
 
@@ -400,18 +417,22 @@ fn get_device(
     // Foundation decode `<video>` directly into textures the renderer can
     // sample. It costs nothing when no video is playing — the flag only makes
     // the video interfaces *available*.
-    let device_flags = if debug_layer_available {
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT
-            | D3D11_CREATE_DEVICE_DEBUG
+    //
+    // An adapter without a video engine refuses the flag with
+    // DXGI_ERROR_UNSUPPORTED: WARP, the only adapter in a VM without a GPU
+    // (Windows Sandbox, a basic-display RDP host). The UI does not need video,
+    // so it gets a device without it; `<video>` then decodes off this device.
+    let base_flags = if debug_layer_available {
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG
     } else {
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT
     };
-    unsafe {
+    let create = |flags, device: &mut Option<ID3D11Device>| unsafe {
         D3D11CreateDevice(
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            device_flags,
+            flags,
             // 4x MSAA is required for Direct3D Feature Level 10.1 or better
             Some(&[
                 D3D_FEATURE_LEVEL_11_1,
@@ -419,10 +440,14 @@ fn get_device(
                 D3D_FEATURE_LEVEL_10_1,
             ]),
             D3D11_SDK_VERSION,
-            Some(&mut device),
+            Some(device),
             feature_level,
             context,
-        )?;
+        )
+    };
+    if let Err(error) = create(base_flags | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &mut device) {
+        log::warn!("Direct3D 11 device without video support ({error})");
+        create(base_flags, &mut device)?;
     }
     let device = device.unwrap();
     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
