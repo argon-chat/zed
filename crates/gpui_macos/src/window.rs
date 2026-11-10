@@ -906,7 +906,8 @@ impl MacWindowState {
         let screen_frame = self
             .native_window()
             .screen()
-            .map_or_default(|screen| screen.visibleFrame());
+            .map(|screen| screen.visibleFrame())
+            .unwrap_or_default();
         bounds.size == rect_to_size(screen_frame)
     }
 
@@ -967,7 +968,8 @@ impl MacWindowState {
         let NSSize { width, height } = self
             .native_window()
             .contentView()
-            .map_or_default(|view| view.frame().size);
+            .map(|view| view.frame().size)
+            .unwrap_or_default();
         size(px(width as f32), px(height as f32))
     }
 
@@ -1078,7 +1080,8 @@ impl MacWindow {
             let target_screen = target_screen.or_else(|| NSScreen::mainScreen(marker));
             let screen_frame = target_screen
                 .as_ref()
-                .map_or_default(|screen| screen.frame());
+                .map(|screen| screen.frame())
+                .unwrap_or_default();
 
             let window_rect = NSRect::new(
                 NSPoint::new(
