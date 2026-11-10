@@ -1536,14 +1536,16 @@ impl DirectXResources {
         disable_direct_composition: bool,
     ) -> Result<Self> {
         let swap_chain = if disable_direct_composition {
-            create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)?
+            create_swap_chain(&devices.dxgi_factory, &devices.device, hwnd, width, height)
+                .context("Creating the window swap chain")?
         } else {
             create_swap_chain_for_composition(
                 &devices.dxgi_factory,
                 &devices.device,
                 width,
                 height,
-            )?
+            )
+            .context("Creating the composition swap chain")?
         };
 
         let (
@@ -1555,7 +1557,8 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
-        set_rasterizer_state(&devices.device, &devices.device_context)?;
+        set_rasterizer_state(&devices.device, &devices.device_context)
+            .context("Setting the rasterizer state")?;
 
         Ok(Self {
             swap_chain,
@@ -2232,6 +2235,12 @@ fn create_swap_chain_for_composition(
     Ok(unsafe { dxgi_factory.CreateSwapChainForComposition(device, &desc, None)? })
 }
 
+/// vue-native: whether `devices` can make the swap chain DirectComposition
+/// presents (see `WindowsPlatform::attach_gpu`).
+pub(crate) fn probe_composition_swap_chain(devices: &DirectXDevices) -> Result<()> {
+    create_swap_chain_for_composition(&devices.dxgi_factory, &devices.device, 1, 1).map(drop)
+}
+
 fn create_swap_chain(
     dxgi_factory: &IDXGIFactory6,
     device: &ID3D11Device,
@@ -2279,11 +2288,14 @@ fn create_resources(
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
-        create_render_target_and_its_view(swap_chain, &devices.device)?;
+        create_render_target_and_its_view(swap_chain, &devices.device)
+            .context("Creating the render target")?;
     let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
+        create_path_intermediate_texture(&devices.device, width, height)
+            .context("Creating the path texture")?;
     let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)
+            .context("Creating the path MSAA texture")?;
     let viewport = D3D11_VIEWPORT {
         TopLeftX: 0.0,
         TopLeftY: 0.0,

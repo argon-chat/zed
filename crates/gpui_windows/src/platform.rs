@@ -71,7 +71,9 @@ pub struct WindowsPlatform {
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     power_saving_notification: RefCell<Option<HPOWERNOTIFY>>,
-    disable_direct_composition: bool,
+    /// Asked for with GPUI_DISABLE_DIRECT_COMPOSITION, or set when the GPU
+    /// refuses a composition swap chain (see `attach_gpu`).
+    disable_direct_composition: Cell<bool>,
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
@@ -280,7 +282,7 @@ impl WindowsPlatform {
             text_system,
             suspend_resume_notification: RefCell::new(None),
             power_saving_notification: RefCell::new(None),
-            disable_direct_composition,
+            disable_direct_composition: Cell::new(disable_direct_composition),
             has_package_identity: has_package_identity(),
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
@@ -313,7 +315,7 @@ impl WindowsPlatform {
             validation_number: self.inner.validation_number,
             main_receiver: self.inner.main_receiver.clone(),
             platform_window_handle: self.handle,
-            disable_direct_composition: self.disable_direct_composition,
+            disable_direct_composition: self.disable_direct_composition.get(),
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
@@ -411,6 +413,18 @@ impl WindowsPlatform {
     /// Creates the DirectX devices that windows draw with, and starts vsync.
     fn attach_gpu(&self) -> Result<()> {
         let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        // vue-native: a paravirtualized GPU (Windows Sandbox's GPU-P adapters)
+        // refuses composition swap chains with E_INVALIDARG, so no window
+        // could open. Asked once, before any window: the choice also decides
+        // the windows' WS_EX_NOREDIRECTIONBITMAP.
+        if !self.disable_direct_composition.get()
+            && let Err(error) = crate::directx_renderer::probe_composition_swap_chain(&devices)
+        {
+            log::warn!(
+                "DirectComposition is unavailable on this GPU ({error:#}); presenting to windows directly"
+            );
+            self.disable_direct_composition.set(true);
+        }
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
         self.begin_vsync_thread();
         Ok(())
