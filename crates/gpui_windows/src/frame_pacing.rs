@@ -44,6 +44,16 @@ pub fn pace_frames(until: Option<Instant>) {
     PACED_UNTIL.store(until.map_or(0, stamp), Ordering::Release);
 }
 
+/// [`pace_frames`] from inside a frame, before its draw: the demand raised so
+/// far is what this frame is about to draw (an embedder that repaints from its
+/// frame callback raises it through the window's frame waker), so it does not
+/// ask for the next refresh. Demand that arrives later still does; one that
+/// raced in just before this call waits for the deadline at most.
+pub fn pace_frames_from_frame(until: Instant) {
+    DEMAND.store(false, Ordering::Release);
+    pace_frames(Some(until));
+}
+
 /// Ask for the next refresh to be delivered. Callable from any thread.
 pub fn wake_frames() {
     DEMAND.store(true, Ordering::Release);
@@ -109,6 +119,13 @@ mod tests {
         wake_frames();
         pace_frames(Some(now + Duration::from_secs(1)));
         assert!(take_due(now));
+
+        // Paced from inside a frame, the frame's own demand is what it draws.
+        wake_frames();
+        pace_frames_from_frame(now + Duration::from_secs(1));
+        assert!(!take_due(now));
+        wake_frames();
+        assert!(take_due(now), "demand after it is served");
         pace_frames(None);
     }
 
