@@ -335,6 +335,14 @@ impl CosmicTextSystemState {
         Ok(())
     }
 
+    /// Does any face in the database name itself `family`?
+    fn has_family(&self, family: &str) -> bool {
+        self.font_system
+            .db()
+            .faces()
+            .any(|face| face.families.iter().any(|(name, _)| name == family))
+    }
+
     #[profiling::function]
     fn load_family(
         &mut self,
@@ -384,6 +392,23 @@ impl CosmicTextSystemState {
         };
 
         let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
+        // vue-native fork: the system UI font is a family this build does not
+        // bundle (Zed ships IBM Plex Sans with itself): when the system lacks
+        // it, the desktop's sans-serif (fontconfig's, through fontdb), else the
+        // first common UI family installed.
+        let system_family;
+        let name = if name == self.system_font_fallback && !self.has_family(name) {
+            let db = self.font_system.db();
+            let sans = db.family_name(&cosmic_text::fontdb::Family::SansSerif).to_owned();
+            system_family = [sans.as_str(), "Noto Sans", "Cantarell", "Ubuntu", "DejaVu Sans", "Liberation Sans"]
+                .into_iter()
+                .find(|family| self.has_family(family))
+                .unwrap_or(name)
+                .to_owned();
+            system_family.as_str()
+        } else {
+            name
+        };
 
         let families = self
             .font_system
@@ -957,6 +982,8 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
             clipped.push(FontRun {
                 len: end - start,
                 font_id: run.font_id,
+                tracking: run.tracking,
+                word_spacing: run.word_spacing,
             });
         }
     }

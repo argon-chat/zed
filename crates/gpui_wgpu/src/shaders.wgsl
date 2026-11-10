@@ -677,8 +677,8 @@ fn gradient_color(background: Background, position_in: vec2<f32>, bounds_in: Bou
             let center = gradient_center(background, box);
             let spoke = position - center;
             let angle = atan2(spoke.x, -spoke.y);
-            let from = background.gradient_angle_or_pattern_height * M_PI_F / 180.0;
-            let t = fract((angle - from) / (2.0 * M_PI_F) + 1.0);
+            let start_angle = background.gradient_angle_or_pattern_height * M_PI_F / 180.0;
+            let t = fract((angle - start_angle) / (2.0 * M_PI_F) + 1.0);
             background_color = gradient_dither(gradient_ramp(background, t, 1.0), position);
         }
         case 2u: {

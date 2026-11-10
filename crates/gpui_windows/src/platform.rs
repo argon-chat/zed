@@ -416,7 +416,9 @@ impl WindowsPlatform {
         // vue-native: a paravirtualized GPU (Windows Sandbox's GPU-P adapters)
         // refuses composition swap chains with E_INVALIDARG, so no window
         // could open. Asked once, before any window: the choice also decides
-        // the windows' WS_EX_NOREDIRECTIONBITMAP.
+        // the windows' WS_EX_NOREDIRECTIONBITMAP. The D3D11 renderer's swap
+        // chain only: the D3D12 one (`native-dx12`) is made on its queue.
+        #[cfg(not(feature = "native-dx12"))]
         if !self.disable_direct_composition.get()
             && let Err(error) = crate::directx_renderer::probe_composition_swap_chain(&devices)
         {
