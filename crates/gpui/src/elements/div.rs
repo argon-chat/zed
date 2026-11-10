@@ -2172,6 +2172,25 @@ impl Element for Div {
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
+        // vue-native fork: an absolutely positioned child counts toward the
+        // scrollable overflow as its own box, from this element's edge
+        // (`out_of_flow_extent`), and not into the span the end padding is
+        // added to. Spanned with the rest, a close button in the padding or a
+        // scrollbar at the padding box's corner counted the padding twice and
+        // made every padded scroll container scroll by it.
+        let mut out_of_flow_extent = Size::<Pixels>::default();
+        let mut in_flow = 0usize;
+        let mut measure = |child_bounds: Bounds<Pixels>, absolute: bool| {
+            if absolute {
+                let far = child_bounds.bottom_right() - bounds.origin;
+                out_of_flow_extent.width = out_of_flow_extent.width.max(far.x);
+                out_of_flow_extent.height = out_of_flow_extent.height.max(far.y);
+            } else {
+                in_flow += 1;
+                child_min = child_min.min(&child_bounds.origin);
+                child_max = child_max.max(&child_bounds.bottom_right());
+            }
+        };
         let content_size = if request_layout.child_layout_ids.is_empty() {
             bounds.size
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
@@ -2179,23 +2198,22 @@ impl Element for Div {
             state.child_bounds = Vec::with_capacity(request_layout.child_layout_ids.len());
             for child_layout_id in &request_layout.child_layout_ids {
                 let child_bounds = window.layout_bounds(*child_layout_id);
-                child_min = child_min.min(&child_bounds.origin);
-                child_max = child_max.max(&child_bounds.bottom_right());
+                measure(child_bounds, window.layout_is_absolute(*child_layout_id));
                 state.child_bounds.push(child_bounds);
             }
-            (child_max - child_min).into()
+            if in_flow == 0 { Size::default() } else { (child_max - child_min).into() }
         } else {
             for child_layout_id in &request_layout.child_layout_ids {
                 let child_bounds = window.layout_bounds(*child_layout_id);
-                child_min = child_min.min(&child_bounds.origin);
-                child_max = child_max.max(&child_bounds.bottom_right());
+                measure(child_bounds, window.layout_is_absolute(*child_layout_id));
 
                 if has_prepaint_listener {
                     children_bounds.push(child_bounds);
                 }
             }
-            (child_max - child_min).into()
+            if in_flow == 0 { Size::default() } else { (child_max - child_min).into() }
         };
+        self.interactivity.out_of_flow_extent = out_of_flow_extent;
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             scroll_handle.scroll_to_active_item();
@@ -2326,6 +2344,9 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
+    /// vue-native fork: how far the absolutely positioned children reach from
+    /// the element's origin; [`Div`]'s prepaint sets it.
+    pub(crate) out_of_flow_extent: Size<Pixels>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
@@ -2692,6 +2713,10 @@ impl Interactivity {
         // high for the maximum scroll, we round the scroll max to 2 decimal
         // places here.
         let padded_content_size = self.content_size + padding_size;
+        let padded_content_size = size(
+            padded_content_size.width.max(self.out_of_flow_extent.width),
+            padded_content_size.height.max(self.out_of_flow_extent.height),
+        );
         Point::from(padded_content_size - bounds.size)
             .map(round_to_two_decimals)
             .max(&Default::default())
@@ -6275,7 +6300,8 @@ mod tests {
 
     #[gpui::test]
     fn negative_ancestor_origins_do_not_create_or_inflate_scroll_extents(cx: &mut TestAppContext) {
-        // Preserve the span of authored negative absolute children too.
+        // An authored absolute child above and left of the box adds nothing:
+        // as in CSS, overflow on the start sides cannot be scrolled to.
         for negative_child in [false, true] {
             let outer = ScrollHandle::new();
             let inner = ScrollHandle::new();
@@ -6292,11 +6318,7 @@ mod tests {
                 .into();
             cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
                 .unwrap();
-            let expected = if negative_child {
-                point(px(60.), px(40.))
-            } else {
-                Point::default()
-            };
+            let expected = Point::default();
             assert_eq!(inner.max_offset(), expected);
 
             // Both axes become wholly negative in window space. Repeated frames
@@ -6312,6 +6334,50 @@ mod tests {
                 assert_eq!(inner.max_offset(), expected);
                 assert_eq!(inner.offset(), Point::default());
             }
+        }
+    }
+
+    struct PaddedScrollExtentTestView {
+        handle: ScrollHandle,
+        far_child: bool,
+    }
+
+    impl Render for PaddedScrollExtentTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("padded")
+                .size(px(100.))
+                .p(px(10.))
+                .overflow_scroll()
+                .track_scroll(&self.handle)
+                // Fills the content box exactly.
+                .child(div().w(px(80.)).h(px(80.)))
+                // A close button in the padding, and the overlay scrollbar's
+                // zero-size box at the padding box's corner.
+                .child(div().absolute().top(px(4.)).right(px(4.)).size(px(6.)))
+                .child(div().absolute().top_0().right_0().size(px(0.)))
+                .when(self.far_child, |element| {
+                    element.child(div().absolute().left(px(150.)).top_0().size(px(20.)))
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn absolute_children_count_as_their_own_box_not_with_the_padding(cx: &mut TestAppContext) {
+        // vue-native fork: CSS scrollable overflow. The in-flow content plus
+        // the end padding, and each absolute child's own box; never an
+        // absolute child plus the padding again.
+        for (far_child, expected) in [(false, Point::default()), (true, point(px(70.), px(0.)))] {
+            let handle = ScrollHandle::new();
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let handle = handle.clone();
+                    move |_, _| PaddedScrollExtentTestView { handle, far_child }
+                })
+                .into();
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            assert_eq!(handle.max_offset(), expected, "far child: {far_child}");
         }
     }
 

@@ -6979,6 +6979,14 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
+    /// vue-native fork: whether the layout node is out of flow (`position:
+    /// absolute`).
+    pub fn layout_is_absolute(&self, layout_id: LayoutId) -> bool {
+        self.layout_engine
+            .as_ref()
+            .is_some_and(|engine| engine.is_absolute(layout_id))
+    }
+
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///
