@@ -40,8 +40,6 @@ const PRIMITIVES: &str = include_str!("../shaders.hlsl");
 #[cfg(test)]
 const EFFECT_VERTEX: &str = include_str!("../effects.hlsl");
 #[cfg(test)]
-const EMOJI: &str = include_str!("../color_text_raster.hlsl");
-#[cfg(test)]
 const FROST: &str = include_str!(concat!(env!("GPUI_D3D12_EFFECTS_HLSL_DIR"), "/frost.hlsl"));
 #[cfg(test)]
 const NOISE: &str = include_str!(concat!(env!("GPUI_D3D12_EFFECTS_HLSL_DIR"), "/noise.hlsl"));
@@ -390,8 +388,7 @@ fn module_blend(module: ShaderModule) -> Blend {
         }
         ShaderModule::PathRasterization
         | ShaderModule::PathSprite
-        | ShaderModule::VnLayer
-        | ShaderModule::EmojiRasterization => Blend::Premultiplied,
+        | ShaderModule::VnLayer => Blend::Premultiplied,
         ShaderModule::SubpixelSprite => Blend::Subpixel,
         ShaderModule::Effect(effect) if effect.needs_backdrop() => Blend::Replace,
         _ => Blend::Straight,
@@ -528,18 +525,12 @@ fn compile_module(module: ShaderModule) -> Result<(Vec<u8>, Vec<u8>)> {
         ShaderModule::MonochromeSprite => "monochrome_sprite",
         ShaderModule::SubpixelSprite => "subpixel_sprite",
         ShaderModule::PolychromeSprite => "polychrome_sprite",
-        ShaderModule::EmojiRasterization => "emoji_rasterization",
         ShaderModule::VnLayer => "vn_layer",
         ShaderModule::Effect(_) => bail!("Effect shaders require their shared vertex stage"),
     };
-    let source = if module == ShaderModule::EmojiRasterization {
-        EMOJI
-    } else {
-        PRIMITIVES
-    };
     Ok((
-        compile(source, &format!("{prefix}_vertex"), true)?,
-        compile(source, &format!("{prefix}_fragment"), false)?,
+        compile(PRIMITIVES, &format!("{prefix}_vertex"), true)?,
+        compile(PRIMITIVES, &format!("{prefix}_fragment"), false)?,
     ))
 }
 

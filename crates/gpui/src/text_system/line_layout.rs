@@ -2,11 +2,16 @@ use crate::{
     FontId, GlyphId, Hyphens, Pixels, PlatformTextSystem, Point, SharedString, Size, TextWrap,
     WordBreak, point, px,
 };
-use collections::FxHashMap;
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use collections::{FxHashMap, FxHashSet};
+use icu_segmenter::{
+    LineSegmenter,
+    options::{LineBreakOptions, LineBreakWordOption},
+};
+use itertools::Itertools;
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
+    cell::RefCell,
     hash::{Hash, Hasher},
     ops::Range,
     sync::{
@@ -222,10 +227,10 @@ impl LineLayout {
 
     /// vue-native fork: where the line breaks when wrapped at `wrap_width`
     /// under `rules` (CSS Text 3 §5). A line breaks at its last soft wrap
-    /// opportunity that fits ([`break_before`]). A word that fits nowhere is
-    /// broken where it overflows when `rules` allow that (`overflow-wrap:
-    /// break-word | anywhere`, `word-break: break-word`), and otherwise
-    /// overflows its line, which then breaks at the next opportunity.
+    /// opportunity that fits ([`LineLayout::wrap_glyphs`]). A word that fits
+    /// nowhere is broken where it overflows when `rules` allow that
+    /// (`overflow-wrap: break-word | anywhere`, `word-break: break-word`), and
+    /// otherwise overflows its line, which then breaks at the next opportunity.
     /// `hyphen_width` is the width of the hyphen a soft-hyphen break shows: a
     /// line that ends in one must fit it.
     pub(crate) fn wrap(
@@ -235,9 +240,9 @@ impl LineLayout {
         max_lines: Option<usize>,
         rules: TextWrap,
         hyphen_width: Pixels,
+        scratch: &mut WrapScratch,
     ) -> Wrapping {
         let mut out = Wrapping::default();
-        let mut seen_non_whitespace = false;
         // The last opportunity on the current line: the glyph the next line
         // would start at, its x, where the line's content ends before it
         // (trailing spaces hang; a hyphen counts), and whether it shows a
@@ -254,36 +259,20 @@ impl LineLayout {
         // edge: it breaks at the next opportunity, wherever that is.
         let mut overflowing = false;
         let mut widest = px(0.);
-        let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                        text[..glyph.index].ends_with('\u{AD}'),
-                    )
-                })
-            })
-            .peekable();
+        let full = |out: &Wrapping| {
+            max_lines.is_some_and(|max| out.boundaries.len() >= max.saturating_sub(1))
+        };
 
-        'glyphs: while let Some((boundary, ch, x, after_soft_hyphen)) = glyphs.next() {
-            if ch == '\n' {
-                continue;
-            }
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x, _)| *x);
-            let full = |out: &Wrapping| {
-                max_lines.is_some_and(|max| out.boundaries.len() >= max.saturating_sub(1))
-            };
-
-            if let Some(hyphen) =
-                break_before(prev_ch, ch, after_soft_hyphen, seen_non_whitespace, rules)
-            {
+        'glyphs: for WrapGlyph {
+            boundary,
+            prev_ch,
+            ch,
+            x,
+            next_x,
+            opportunity,
+        } in self.wrap_glyphs(text, rules, scratch)
+        {
+            if let Some(hyphen) = opportunity {
                 let end = if hyphen {
                     content_end + hyphen_width
                 } else {
@@ -303,9 +292,6 @@ impl LineLayout {
                 } else if !hyphen || end - last_boundary_x <= wrap_width {
                     candidate = Some((boundary, x, end, hyphen));
                 }
-            }
-            if ch != ' ' {
-                seen_non_whitespace = true;
             }
 
             // A space that crosses the edge hangs (CSS Text 3 §4.1.3): the
@@ -339,7 +325,6 @@ impl LineLayout {
             if ch != ' ' {
                 content_end = next_x;
             }
-            prev_ch = ch;
         }
         widest = widest.max(content_end - last_boundary_x);
         if widest > wrap_width {
@@ -364,35 +349,23 @@ impl LineLayout {
         let mut start_x = px(0.);
         let mut end_x = px(0.);
         let mut seen_non_whitespace = false;
-        let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .flat_map(|run| run.glyphs.iter())
-            .map(|glyph| {
-                let ch = text[glyph.index..].chars().next().unwrap_or(' ');
-                (
-                    ch,
-                    glyph.position.x,
-                    text[..glyph.index].ends_with('\u{AD}'),
-                )
-            })
-            .peekable();
-        while let Some((ch, x, after_soft_hyphen)) = glyphs.next() {
-            let next_x = glyphs.peek().map_or(self.width, |(_, x, _)| *x);
-            if ch == '\n' {
-                continue;
-            }
-            let opportunity =
-                break_before(prev_ch, ch, after_soft_hyphen, seen_non_whitespace, rules).or_else(
-                    || {
-                        (rules.min_content_breaks_words()
-                            && seen_non_whitespace
-                            && ch != ' '
-                            && !continues_cluster(prev_ch, ch))
-                        .then_some(false)
-                    },
-                );
+        let mut scratch = WrapScratch::default();
+        for WrapGlyph {
+            prev_ch,
+            ch,
+            x,
+            next_x,
+            opportunity,
+            ..
+        } in self.wrap_glyphs(text, rules, &mut scratch)
+        {
+            let opportunity = opportunity.or_else(|| {
+                (rules.min_content_breaks_words()
+                    && seen_non_whitespace
+                    && ch != ' '
+                    && !continues_cluster(prev_ch, ch))
+                .then_some(false)
+            });
             if let Some(hyphen) = opportunity {
                 let hyphen = if hyphen { hyphen_width } else { px(0.) };
                 widest = widest.max(end_x - start_x + hyphen);
@@ -402,10 +375,116 @@ impl LineLayout {
                 seen_non_whitespace = true;
                 end_x = next_x;
             }
-            prev_ch = ch;
         }
         widest.max(end_x - start_x)
     }
+
+    /// vue-native fork: the line's glyphs in visual order, one per shaped
+    /// cluster, newlines skipped, each with the soft wrap opportunity before
+    /// it under `rules`.
+    ///
+    /// The opportunities are UAX #14's ([`css_break_indices`], tailored by
+    /// `word-break` and `hyphens`), less those inside a shaped cluster.
+    /// Transitions between line-break segments are detected rather than
+    /// glyph indices matched directly, to accommodate RTL text (a workaround
+    /// for the lack of complete UAX #9 support). The first segment that is
+    /// not a space opens no opportunity: a line never breaks before its first
+    /// word.
+    fn wrap_glyphs<'a>(
+        &'a self,
+        text: &'a str,
+        rules: TextWrap,
+        scratch: &'a mut WrapScratch,
+    ) -> impl Iterator<Item = WrapGlyph> + 'a {
+        // Shaping can combine characters across a line break opportunity, so we ignore those
+        // break opportunities that would separate them.
+        let WrapScratch {
+            glyph_indices,
+            break_indices,
+        } = scratch;
+        glyph_indices.clear();
+        glyph_indices.extend(
+            self.runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index)),
+        );
+        break_indices.clear();
+        break_indices
+            .extend(css_break_indices(text, rules).filter(|index| glyph_indices.contains(index)));
+        let break_indices = &*break_indices;
+        let mut glyphs = self
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(move |(run_ix, run)| {
+                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                    (
+                        WrapBoundary { run_ix, glyph_ix },
+                        glyph.index,
+                        glyph.position.x,
+                    )
+                })
+            })
+            .dedup_by(|(_, previous_index, ..), (_, index, ..)| previous_index == index)
+            .peekable();
+        let mut current_segment: Option<Range<usize>> = None;
+        let mut prev_ch = '\0';
+        std::iter::from_fn(move || {
+            loop {
+                let (boundary, index, x) = glyphs.next()?;
+                let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
+                let ch = text[index..].chars().next().unwrap_or(' ');
+                if ch == '\n' {
+                    continue;
+                }
+                let mut opportunity = None;
+                if ch != ' '
+                    && current_segment
+                        .as_ref()
+                        .is_none_or(|segment| !segment.contains(&index))
+                {
+                    let segment =
+                        break_indices.partition_point(|break_index| *break_index <= index);
+                    let start = segment
+                        .checked_sub(1)
+                        .and_then(|previous| break_indices.get(previous))
+                        .copied()
+                        .unwrap_or(0);
+                    let end = break_indices.get(segment).copied().unwrap_or(text.len());
+                    if current_segment.is_some() {
+                        // A break after a soft hyphen shows a hyphen; under
+                        // `hyphens: none` there is no such break.
+                        opportunity = Some(text[..start].ends_with('\u{AD}'));
+                    }
+                    current_segment = Some(start..end);
+                }
+                let glyph = WrapGlyph {
+                    boundary,
+                    prev_ch,
+                    ch,
+                    x,
+                    next_x,
+                    opportunity,
+                };
+                prev_ch = ch;
+                return Some(glyph);
+            }
+        })
+    }
+}
+
+/// vue-native fork: one glyph of [`LineLayout::wrap_glyphs`].
+struct WrapGlyph {
+    boundary: WrapBoundary,
+    /// The character of the glyph before, `'\0'` for the first.
+    prev_ch: char,
+    ch: char,
+    x: Pixels,
+    /// Where the next glyph starts, or the line's width after the last.
+    next_x: Pixels,
+    /// A soft wrap opportunity before this glyph: `Some(true)` when the
+    /// break shows a hyphen.
+    opportunity: Option<bool>,
 }
 
 /// vue-native fork: what [`LineLayout::wrap`] decided for one line of text.
@@ -429,51 +508,41 @@ impl Wrapping {
     }
 }
 
-/// vue-native fork: is there a soft wrap opportunity before `ch`, which
-/// follows `prev`? `Some(true)` when the break shows a hyphen.
-///
-/// The usual opportunities are gpui's: after a space, and before a character
-/// that is not a word character ([`LineWrapper::is_word_char`]), which is how a
-/// URL breaks before its `/` and CJK text between any two letters. Then CSS
-/// Text 3's:
-/// - after a soft hyphen (U+00AD) under `hyphens: manual`, with a hyphen
-///   shown; never before one, and never after one under `hyphens: none`;
-/// - after a zero width space (U+200B);
+/// vue-native fork: the byte offsets in `text` a line may break before under
+/// `rules`: UAX #14's opportunities ([`LineWrapper::break_indices`]), tailored
+/// by CSS Text 3:
 /// - `word-break: break-all`: between any two letters, though not before
-///   punctuation that never starts a line (UAX #14 LB13 and LB21);
-/// - `word-break: keep-all`: CJK letters are word characters, so no break
-///   between two of them.
+///   punctuation that never starts a line; `keep-all`: no break between two
+///   CJK letters (UAX #14's own tailorings, the same as CSS's);
+/// - after a soft hyphen (U+00AD) only under `hyphens: manual`;
+/// - after a zero width space (U+200B), as UAX #14 has it.
 ///
-/// Never before the first character that is not a space, or inside a
-/// grapheme cluster ([`continues_cluster`]).
-fn break_before(
-    prev: char,
-    ch: char,
-    after_soft_hyphen: bool,
-    seen_non_whitespace: bool,
-    rules: TextWrap,
-) -> Option<bool> {
-    if !seen_non_whitespace || ch == ' ' || ch == '\u{AD}' || continues_cluster(prev, ch) {
-        return None;
-    }
-    if after_soft_hyphen {
-        return (rules.hyphens == Hyphens::Manual).then_some(true);
-    }
-    if prev == '\u{200B}' {
-        return Some(false);
-    }
-    let word = LineWrapper::is_word_char(ch)
-        || (rules.word_break == WordBreak::KeepAll && is_cjk_letter(ch));
-    if !word || prev == ' ' {
-        return Some(false);
-    }
-    (rules.word_break == WordBreak::BreakAll && !never_starts_a_line(ch)).then_some(false)
+/// No opportunity splits a grapheme cluster.
+fn css_break_indices(text: &str, rules: TextWrap) -> impl Iterator<Item = usize> + '_ {
+    let word_option = match rules.word_break {
+        WordBreak::BreakAll => Some(LineBreakWordOption::BreakAll),
+        WordBreak::KeepAll => Some(LineBreakWordOption::KeepAll),
+        WordBreak::Normal | WordBreak::BreakWord => None,
+    };
+    let indices: Box<dyn Iterator<Item = usize> + '_> = match word_option {
+        None => Box::new(LineWrapper::break_indices(text)),
+        Some(word_option) => {
+            let mut options = LineBreakOptions::default();
+            options.word_option = Some(word_option);
+            Box::new(LineSegmenter::new_for_non_complex_scripts(options).segment_str(text))
+        }
+    };
+    indices.filter(move |index| {
+        rules.hyphens == Hyphens::Manual || !text[..*index].ends_with('\u{AD}')
+    })
 }
 
 /// Does `ch` belong to the grapheme cluster `prev` is in? A combining mark,
 /// a joiner, a variation selector, an emoji modifier or tag, or anything
 /// after a zero width joiner. A shaper usually gives a cluster one glyph, but
 /// not always; a break between two of its glyphs would split a character.
+/// Used where a line breaks inside a word (`overflow-wrap`), which UAX #14's
+/// opportunities say nothing about.
 fn continues_cluster(prev: char, ch: char) -> bool {
     prev == '\u{200D}'
         || matches!(
@@ -495,46 +564,6 @@ fn continues_cluster(prev: char, ch: char) -> bool {
                 | '\u{E0020}'..='\u{E007F}'
                 | '\u{E0100}'..='\u{E01EF}'
         )
-}
-
-/// A CJK letter, for `word-break: keep-all`: Han, kana and Hangul.
-fn is_cjk_letter(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{1100}'..='\u{11FF}'
-            | '\u{3040}'..='\u{30FF}'
-            | '\u{3130}'..='\u{318F}'
-            | '\u{31F0}'..='\u{31FF}'
-            | '\u{3400}'..='\u{4DBF}'
-            | '\u{4E00}'..='\u{9FFF}'
-            | '\u{AC00}'..='\u{D7AF}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{20000}'..='\u{2FA1F}'
-    )
-}
-
-/// Punctuation a line never starts with, even under `word-break: break-all`.
-fn never_starts_a_line(ch: char) -> bool {
-    matches!(
-        ch,
-        '!' | ')'
-            | ']'
-            | '}'
-            | '"'
-            | '\''
-            | '’'
-            | '”'
-            | '»'
-            | '…'
-            | ','
-            | '.'
-            | ':'
-            | ';'
-            | '?'
-            | '%'
-            | '-'
-            | '⋯'
-    )
 }
 
 /// A line of text that has been wrapped to fit a given width
@@ -643,7 +672,7 @@ impl WrappedLineLayout {
 
     fn _index_for_position(
         &self,
-        mut position: Point<Pixels>,
+        position: Point<Pixels>,
         line_height: Pixels,
         closest: bool,
     ) -> Result<usize, usize> {
@@ -702,7 +731,7 @@ impl WrappedLineLayout {
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
         let mut line_start_ix = 0;
-        let mut line_end_indices = self
+        let line_end_indices = self
             .wrap_boundaries
             .iter()
             .map(|wrap_boundary| {
@@ -731,8 +760,8 @@ impl WrappedLineLayout {
 }
 
 pub(crate) struct LineLayoutCache {
-    previous_frame: Mutex<FrameCache>,
-    current_frame: RwLock<FrameCache>,
+    state: RefCell<LineLayoutCacheState>,
+    wrap_scratch: RefCell<WrapScratch>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
     /// Advances when [`TextSystem::add_fonts`] successfully changes the font database.
     font_generation: Arc<AtomicUsize>,
@@ -741,22 +770,23 @@ pub(crate) struct LineLayoutCache {
 }
 
 #[derive(Default)]
+pub(crate) struct WrapScratch {
+    glyph_indices: FxHashSet<usize>,
+    break_indices: Vec<usize>,
+}
+
+#[derive(Default)]
+struct LineLayoutCacheState {
+    previous_frame: FrameCache,
+    current_frame: FrameCache,
+}
+
+#[derive(Default)]
 struct FrameCache {
     lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
     wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
     used_lines: Vec<Arc<CacheKey>>,
     used_wrapped_lines: Vec<Arc<CacheKey>>,
-
-    // Content-addressable caches keyed by caller-provided text hash + layout params.
-    // These allow cache hits without materializing a contiguous `SharedString`.
-    //
-    // IMPORTANT: To support allocation-free lookups, we store these maps using a key type
-    // (`HashedCacheKeyRef`) that can be computed without building a contiguous `&str`/`SharedString`.
-    // On miss, we allocate once and store under an owned `HashedCacheKey`.
-    lines_by_hash: FxHashMap<Arc<HashedCacheKey>, Arc<LineLayout>>,
-    wrapped_lines_by_hash: FxHashMap<Arc<HashedCacheKey>, Arc<WrappedLineLayout>>,
-    used_lines_by_hash: Vec<Arc<HashedCacheKey>>,
-    used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
 #[derive(Clone, Default)]
@@ -764,8 +794,6 @@ pub(crate) struct LineLayoutIndex {
     font_generation: usize,
     lines_index: usize,
     wrapped_lines_index: usize,
-    lines_by_hash_index: usize,
-    wrapped_lines_by_hash_index: usize,
 }
 
 impl LineLayoutCache {
@@ -775,8 +803,8 @@ impl LineLayoutCache {
     ) -> Self {
         let cached_font_generation = font_generation.load(Ordering::Acquire);
         Self {
-            previous_frame: Mutex::default(),
-            current_frame: RwLock::default(),
+            state: RefCell::default(),
+            wrap_scratch: RefCell::default(),
             platform_text_system,
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
@@ -785,13 +813,12 @@ impl LineLayoutCache {
 
     pub fn layout_index(&self) -> LineLayoutIndex {
         let font_generation = self.clear_if_font_generation_changed();
-        let frame = self.current_frame.read();
+        let state = self.state.borrow();
+        let frame = &state.current_frame;
         LineLayoutIndex {
             font_generation,
             lines_index: frame.used_lines.len(),
             wrapped_lines_index: frame.used_wrapped_lines.len(),
-            lines_by_hash_index: frame.used_lines_by_hash.len(),
-            wrapped_lines_by_hash_index: frame.used_wrapped_lines_by_hash.len(),
         }
     }
 
@@ -802,8 +829,11 @@ impl LineLayoutCache {
         {
             return;
         }
-        let mut current_frame = &mut *self.current_frame.write();
-        let mut previous_frame = &mut *self.previous_frame.lock();
+        let mut state = self.state.borrow_mut();
+        let LineLayoutCacheState {
+            previous_frame,
+            current_frame,
+        } = &mut *state;
 
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
@@ -820,24 +850,6 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines.push(key.clone());
         }
-
-        for key in &previous_frame.used_lines_by_hash
-            [range.start.lines_by_hash_index..range.end.lines_by_hash_index]
-        {
-            if let Some((key, line)) = previous_frame.lines_by_hash.remove_entry(key) {
-                current_frame.lines_by_hash.insert(key, line);
-            }
-            current_frame.used_lines_by_hash.push(key.clone());
-        }
-
-        for key in &previous_frame.used_wrapped_lines_by_hash
-            [range.start.wrapped_lines_by_hash_index..range.end.wrapped_lines_by_hash_index]
-        {
-            if let Some((key, line)) = previous_frame.wrapped_lines_by_hash.remove_entry(key) {
-                current_frame.wrapped_lines_by_hash.insert(key, line);
-            }
-            current_frame.used_wrapped_lines_by_hash.push(key.clone());
-        }
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
@@ -845,33 +857,25 @@ impl LineLayoutCache {
         if index.font_generation != font_generation {
             return;
         }
-        let mut current_frame = &mut *self.current_frame.write();
+        let mut state = self.state.borrow_mut();
+        let current_frame = &mut state.current_frame;
         current_frame.used_lines.truncate(index.lines_index);
         current_frame
             .used_wrapped_lines
             .truncate(index.wrapped_lines_index);
-        current_frame
-            .used_lines_by_hash
-            .truncate(index.lines_by_hash_index);
-        current_frame
-            .used_wrapped_lines_by_hash
-            .truncate(index.wrapped_lines_by_hash_index);
     }
 
     pub fn finish_frame(&self) {
         let _font_generation = self.clear_if_font_generation_changed();
-        let mut curr_frame = self.current_frame.write();
-        let mut prev_frame = self.previous_frame.lock();
-        std::mem::swap(&mut *prev_frame, &mut *curr_frame);
-        curr_frame.lines.clear();
-        curr_frame.wrapped_lines.clear();
-        curr_frame.used_lines.clear();
-        curr_frame.used_wrapped_lines.clear();
-
-        curr_frame.lines_by_hash.clear();
-        curr_frame.wrapped_lines_by_hash.clear();
-        curr_frame.used_lines_by_hash.clear();
-        curr_frame.used_wrapped_lines_by_hash.clear();
+        let LineLayoutCacheState {
+            previous_frame,
+            current_frame,
+        } = &mut *self.state.borrow_mut();
+        std::mem::swap(previous_frame, current_frame);
+        current_frame.lines.clear();
+        current_frame.wrapped_lines.clear();
+        current_frame.used_lines.clear();
+        current_frame.used_wrapped_lines.clear();
     }
 
     /// vue-native fork: the width of the hyphen a soft-hyphen break shows,
@@ -922,26 +926,35 @@ impl LineLayoutCache {
             wrap: rules,
         } as &dyn AsCacheKeyRef;
 
-        let current_frame = self.current_frame.upgradable_read();
-        if let Some(layout) = current_frame.wrapped_lines.get(key) {
+        let state = self.state.borrow();
+        if let Some(layout) = state.current_frame.wrapped_lines.get(key) {
             return layout.clone();
         }
+        drop(state);
 
-        let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
+        let mut state = self.state.borrow_mut();
+        let previous_frame_entry = state.previous_frame.wrapped_lines.remove_entry(key);
         if let Some((key, layout)) = previous_frame_entry {
-            let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-            current_frame
+            state
+                .current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
+            state.current_frame.used_wrapped_lines.push(key);
             layout
         } else {
-            drop(current_frame);
+            drop(state);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
             let wrapping = if let Some(wrap_width) = wrap_width {
                 let hyphen_width = self.hyphen_width(&text, font_size, runs, rules);
-                unwrapped_layout.wrap(text.as_ref(), wrap_width, max_lines, rules, hyphen_width)
+                unwrapped_layout.wrap(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    rules,
+                    hyphen_width,
+                    &mut self.wrap_scratch.borrow_mut(),
+                )
             } else {
                 Wrapping::default()
             };
@@ -961,11 +974,12 @@ impl LineLayoutCache {
                 wrap: rules,
             });
 
-            let mut current_frame = self.current_frame.write();
-            current_frame
+            let mut state = self.state.borrow_mut();
+            state
+                .current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
+            state.current_frame.used_wrapped_lines.push(key);
 
             layout
         }
@@ -993,13 +1007,18 @@ impl LineLayoutCache {
         } as &dyn AsCacheKeyRef;
 
         count_lookup();
-        let current_frame = self.current_frame.upgradable_read();
-        if let Some(layout) = current_frame.lines.get(key) {
+        let state = self.state.borrow();
+        if let Some(layout) = state.current_frame.lines.get(key) {
             return layout.clone();
         }
+        drop(state);
 
-        let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-        if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+        let mut state = self.state.borrow_mut();
+        let LineLayoutCacheState {
+            previous_frame,
+            current_frame,
+        } = &mut *state;
+        if let Some((key, layout)) = previous_frame.lines.remove_entry(key) {
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -1034,176 +1053,18 @@ impl LineLayoutCache {
         }
     }
 
-    /// Try to retrieve a previously-shaped line layout using a caller-provided content hash.
-    ///
-    /// This is a *non-allocating* cache probe: it does not materialize any text. If the layout
-    /// is not already cached in either the current frame or previous frame, returns `None`.
-    ///
-    /// Contract (caller enforced):
-    /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
-    /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn try_layout_line_by_hash(
-        &self,
-        text_hash: u64,
-        text_len: usize,
-        font_size: Pixels,
-        runs: &[FontRun],
-        force_width: Option<Pixels>,
-    ) -> Option<Arc<LineLayout>> {
-        let _font_generation = self.clear_if_font_generation_changed();
-        let key_ref = HashedCacheKeyRef {
-            text_hash,
-            text_len,
-            font_size,
-            runs,
-            wrap_width: None,
-            force_width,
-        };
-
-        let current_frame = self.current_frame.read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
-            return Some(layout.clone());
-        }
-
-        let previous_frame = self.previous_frame.lock();
-        if let Some((_, layout)) = previous_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
-            return Some(layout.clone());
-        }
-
-        None
-    }
-
-    /// Layout a line of text using a caller-provided content hash as the cache key.
-    ///
-    /// This enables cache hits without materializing a contiguous `SharedString` for `text`.
-    /// If the cache misses, `materialize_text` is invoked to produce the `SharedString` for shaping.
-    ///
-    /// Contract (caller enforced):
-    /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
-    /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn layout_line_by_hash(
-        &self,
-        text_hash: u64,
-        text_len: usize,
-        font_size: Pixels,
-        runs: &[FontRun],
-        force_width: Option<Pixels>,
-        materialize_text: impl FnOnce() -> SharedString,
-    ) -> Arc<LineLayout> {
-        let _font_generation = self.clear_if_font_generation_changed();
-        let key_ref = HashedCacheKeyRef {
-            text_hash,
-            text_len,
-            font_size,
-            runs,
-            wrap_width: None,
-            force_width,
-        };
-
-        // Fast path: already cached (no allocation).
-        count_lookup();
-        let current_frame = self.current_frame.upgradable_read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
-            return layout.clone();
-        }
-
-        let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-
-        // Try to reuse from previous frame without allocating; do a linear scan to find a matching key.
-        // (We avoid `drain()` here because it would eagerly move all entries.)
-        let mut previous_frame = self.previous_frame.lock();
-        if let Some(existing_key) = previous_frame
-            .used_lines_by_hash
-            .iter()
-            .find(|key| {
-                HashedCacheKeyRef {
-                    text_hash: key.text_hash,
-                    text_len: key.text_len,
-                    font_size: key.font_size,
-                    runs: key.runs.as_slice(),
-                    wrap_width: key.wrap_width,
-                    force_width: key.force_width,
-                } == key_ref
-            })
-            .cloned()
-        {
-            if let Some((key, layout)) = previous_frame.lines_by_hash.remove_entry(&existing_key) {
-                current_frame
-                    .lines_by_hash
-                    .insert(key.clone(), layout.clone());
-                current_frame.used_lines_by_hash.push(key);
-                return layout;
-            }
-        }
-
-        let text = materialize_text();
-        let shaping = std::time::Instant::now();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
-        count_shape(shaping);
-
-        apply_spacing_to_layout(&mut layout, &text, runs);
-        if let Some(force_width) = force_width {
-            apply_force_width_to_layout(&mut layout, force_width);
-        }
-
-        let key = Arc::new(HashedCacheKey {
-            text_hash,
-            text_len,
-            font_size,
-            runs: SmallVec::from(runs),
-            wrap_width: None,
-            force_width,
-        });
-        let layout = Arc::new(layout);
-        current_frame
-            .lines_by_hash
-            .insert(key.clone(), layout.clone());
-        current_frame.used_lines_by_hash.push(key);
-        layout
-    }
-
     fn clear_if_font_generation_changed(&self) -> usize {
         let font_generation = self.font_generation.load(Ordering::Acquire);
         if self.cached_font_generation.load(Ordering::Acquire) == font_generation {
             return font_generation;
         }
 
-        let mut current_frame = self.current_frame.write();
+        let mut state = self.state.borrow_mut();
         if self.cached_font_generation.load(Ordering::Acquire) == font_generation {
             return font_generation;
         }
 
-        *current_frame = FrameCache::default();
-        *self.previous_frame.lock() = FrameCache::default();
+        *state = LineLayoutCacheState::default();
         self.cached_font_generation
             .store(font_generation, Ordering::Release);
         font_generation
@@ -1350,77 +1211,9 @@ struct CacheKeyRef<'a> {
     wrap: TextWrap,
 }
 
-#[derive(Clone, Debug)]
-struct HashedCacheKey {
-    text_hash: u64,
-    text_len: usize,
-    font_size: Pixels,
-    runs: SmallVec<[FontRun; 1]>,
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
-}
-
-#[derive(Copy, Clone)]
-struct HashedCacheKeyRef<'a> {
-    text_hash: u64,
-    text_len: usize,
-    font_size: Pixels,
-    runs: &'a [FontRun],
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
-}
-
 impl PartialEq for dyn AsCacheKeyRef + '_ {
     fn eq(&self, other: &dyn AsCacheKeyRef) -> bool {
         self.as_cache_key_ref() == other.as_cache_key_ref()
-    }
-}
-
-impl PartialEq for HashedCacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs.as_slice() == other.runs.as_slice()
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
-    }
-}
-
-impl Eq for HashedCacheKey {}
-
-impl Hash for HashedCacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.as_slice().hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
-    }
-}
-
-impl PartialEq for HashedCacheKeyRef<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs == other.runs
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
-    }
-}
-
-impl Eq for HashedCacheKeyRef<'_> {}
-
-impl Hash for HashedCacheKeyRef<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
     }
 }
 
@@ -1472,7 +1265,49 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlyphId, OverflowWrap};
+    use crate::{
+        GlyphId, NoopTextSystem, OverflowWrap, TextRun, TextSystem, WindowTextSystem, font,
+    };
+
+    impl LineLayout {
+        /// Upstream's wrapping entry point, as these tests call it: gpui's
+        /// own rules ([`TextWrap::BREAK_WORD`]), no soft hyphens shown.
+        fn compute_wrap_boundaries(
+            &self,
+            text: &str,
+            wrap_width: Pixels,
+            max_lines: Option<usize>,
+            scratch: &mut WrapScratch,
+        ) -> SmallVec<[WrapBoundary; 1]> {
+            self.wrap(
+                text,
+                wrap_width,
+                max_lines,
+                TextWrap::BREAK_WORD,
+                px(0.),
+                scratch,
+            )
+            .boundaries
+        }
+    }
+
+    #[test]
+    fn shape_line_shares_its_text_with_the_layout_cache() {
+        let text_system =
+            WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(NoopTextSystem::new()))));
+        // Long enough to be stored on the heap rather than inline.
+        let text = SharedString::from("let value = compute_something(argument_one, argument_two);");
+        let runs = [TextRun {
+            len: text.len(),
+            font: font(".ZedMono"),
+            ..Default::default()
+        }];
+
+        text_system.shape_line(text.clone(), px(14.), &runs, None);
+        let state = text_system.line_layout_cache.state.borrow();
+        let (key, _) = state.current_frame.lines.iter().next().unwrap();
+        assert_eq!(key.text.as_ptr(), text.as_ptr());
+    }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -1503,6 +1338,87 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_wrap_preserves_shaped_clusters() {
+        let mut layout = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(5., 0),
+            glyph_at(10., 3),
+            glyph_at(15., 3),
+        ]);
+        layout.width = px(20.);
+        layout.len = "你好".len();
+        assert_eq!(
+            layout
+                .compute_wrap_boundaries("你好", px(15.), None, &mut WrapScratch::default())
+                .as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 2
+            }],
+        );
+
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(10., 0)]);
+        layout.width = px(20.);
+        layout.len = 1;
+        assert!(
+            layout
+                .compute_wrap_boundaries("a", px(10.), None, &mut WrapScratch::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_wrap_right_to_left_text() {
+        for (text, indices, expected_boundaries) in [
+            ("אבג דהו", vec![11, 9, 7, 6, 4, 2, 0], vec![4]),
+            ("a אבג b", vec![0, 1, 6, 4, 2, 8, 9], vec![2, 6]),
+        ] {
+            let mut layout = make_layout(
+                indices
+                    .iter()
+                    .enumerate()
+                    .map(|(position, index)| glyph_at(position as f32 * 10., *index))
+                    .collect(),
+            );
+            layout.width = px(indices.len() as f32 * 10.);
+            layout.len = text.len();
+            assert_eq!(
+                layout.compute_wrap_boundaries(text, px(40.), None, &mut WrapScratch::default()),
+                expected_boundaries
+                    .into_iter()
+                    .map(|glyph_ix| WrapBoundary {
+                        run_ix: 0,
+                        glyph_ix
+                    })
+                    .collect::<SmallVec<[WrapBoundary; 1]>>(),
+                "{text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_ignores_breaks_inside_shaped_clusters() {
+        let text = "x a-bcde";
+        let mut layout = make_layout(
+            [0, 1, 2, 5, 6, 7]
+                .into_iter()
+                .map(|index| glyph_at(index as f32 * 10., index))
+                .collect(),
+        );
+        layout.width = px(80.);
+        layout.len = text.len();
+        assert_eq!(
+            layout
+                .compute_wrap_boundaries(text, px(60.), None, &mut WrapScratch::default())
+                .as_slice(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 2
+            }],
+        );
     }
 
     #[test]
@@ -1610,7 +1526,10 @@ mod tests {
     }
 
     fn boundary(glyph_ix: usize) -> WrapBoundary {
-        WrapBoundary { run_ix: 0, glyph_ix }
+        WrapBoundary {
+            run_ix: 0,
+            glyph_ix,
+        }
     }
 
     const HYPHEN: Pixels = px(10.);
@@ -1631,7 +1550,14 @@ mod tests {
 
     /// Where `text` breaks at `width`, and how wide its widest overflowing line is.
     fn wrap(text: &str, width: f32, rules: TextWrap) -> (Vec<usize>, Vec<usize>, Pixels) {
-        let w = monospaced(text).wrap(text, px(width), None, rules, HYPHEN);
+        let w = monospaced(text).wrap(
+            text,
+            px(width),
+            None,
+            rules,
+            HYPHEN,
+            &mut WrapScratch::default(),
+        );
         (
             w.boundaries.iter().map(|b| b.glyph_ix).collect(),
             w.hyphens.to_vec(),
@@ -1648,8 +1574,8 @@ mod tests {
         assert_eq!(min_content("ab cd efg", NORMAL), px(30.));
         // Spaces end a stretch and hang: they never count.
         assert_eq!(min_content("abc   de ", NORMAL), px(30.));
-        // A break opportunity before a non-word character, as the wrapper has it.
-        assert_eq!(min_content("a/bcd", NORMAL), px(40.));
+        // UAX #14: a break after a solidus, never before it ("a/" + "bcd").
+        assert_eq!(min_content("a/bcd", NORMAL), px(30.));
         // One word: all of it.
         assert_eq!(min_content("abcdef", NORMAL), px(60.));
         assert_eq!(min_content("   ", NORMAL), px(0.));

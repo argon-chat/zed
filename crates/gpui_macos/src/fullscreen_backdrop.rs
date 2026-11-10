@@ -76,14 +76,6 @@ use crate::{
     window_appearance::{NSAppearanceNameAqua, NSAppearanceNameDarkAqua},
 };
 use block2::RcBlock;
-use cocoa::{
-    appkit::{
-        NSColor, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
-        NSVisualEffectBlendingMode, NSVisualEffectView, NSWindow, NSWindowOrderingMode,
-    },
-    base::{id, nil},
-    foundation::{NSArray, NSInteger, NSRect},
-};
 use core_foundation::{
     base::{CFType, TCFType},
     boolean::CFBoolean,
@@ -104,11 +96,17 @@ use dispatch2::{
     DispatchSource,
 };
 use gpui::{BackgroundExecutor, ForegroundExecutor};
-use objc::{
+use objc2::{
     class, msg_send,
-    runtime::{BOOL, YES},
-    sel, sel_impl,
+    rc::Retained,
+    runtime::{AnyObject, Bool},
+    sel,
 };
+use objc2_app_kit::{
+    NSAutoresizingMaskOptions, NSColor, NSVisualEffectBlendingMode, NSWindowOrderingMode,
+};
+use objc2_core_graphics::CGColor;
+use objc2_foundation::{NSArray, NSInteger, NSRect};
 use std::{
     cell::{Cell, OnceCell, RefCell},
     ffi::c_void,
@@ -118,7 +116,6 @@ use std::{
 
 type CGImageSourceRef = *const c_void;
 type CGImageRef = *const c_void;
-type CGColorRef = *const c_void;
 type CGColorSpaceRef = *const c_void;
 type CGContextRef = *mut c_void;
 
@@ -167,14 +164,14 @@ unsafe extern "C" {
 
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
-    static kCAFilterLinear: id;
+    static kCAFilterLinear: *mut AnyObject;
 }
 
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
-    static NSWorkspaceDesktopImageScalingKey: id;
-    static NSWorkspaceDesktopImageAllowClippingKey: id;
-    static NSWorkspaceDesktopImageFillColorKey: id;
+    static NSWorkspaceDesktopImageScalingKey: *mut AnyObject;
+    static NSWorkspaceDesktopImageAllowClippingKey: *mut AnyObject;
+    static NSWorkspaceDesktopImageFillColorKey: *mut AnyObject;
 }
 
 /// `kCGImageAlphaPremultipliedLast`: RGBA8, what [`average_color`] reads.
@@ -236,7 +233,7 @@ pub(crate) struct FullscreenBackdrop {
     shown: Option<Rc<CachedPicture>>,
     /// The layer-hosting view that draws `shown`. One +1 reference of our
     /// own, besides the content view's.
-    picture_view: Option<id>,
+    picture_view: Option<Retained<AnyObject>>,
     /// Whether the blur blends within the window (over the picture or the
     /// fill); `false` while it still blends behind it.
     within_window: bool,
@@ -493,7 +490,7 @@ impl FullscreenBackdrop {
     /// # Safety
     /// Main thread; `window` is a live `NSWindow`.
     pub(crate) unsafe fn prefetch(
-        window: id,
+        window: *mut AnyObject,
         background: &BackgroundExecutor,
         foreground: &ForegroundExecutor,
     ) {
@@ -515,8 +512,8 @@ impl FullscreenBackdrop {
     /// view, a subview of the window's content view.
     pub(crate) unsafe fn enter(
         &mut self,
-        window: id,
-        blur_view: id,
+        window: *mut AnyObject,
+        blur_view: *mut AnyObject,
         transitioning: bool,
         background: &BackgroundExecutor,
         foreground: &ForegroundExecutor,
@@ -570,7 +567,7 @@ impl FullscreenBackdrop {
     ///
     /// # Safety
     /// As [`Self::enter`].
-    pub(crate) unsafe fn did_enter(&mut self, window: id, blur_view: id) {
+    pub(crate) unsafe fn did_enter(&mut self, window: *mut AnyObject, blur_view: *mut AnyObject) {
         self.transitioning = false;
         if self.is_active() && !self.within_window {
             unsafe {
@@ -586,7 +583,7 @@ impl FullscreenBackdrop {
     ///
     /// # Safety
     /// As [`Self::enter`].
-    pub(crate) unsafe fn reassert(&mut self, window: id, blur_view: id) {
+    pub(crate) unsafe fn reassert(&mut self, window: *mut AnyObject, blur_view: *mut AnyObject) {
         if self.within_window {
             let fill = self.fill;
             unsafe { without_animation(|| self.blend_within(window, blur_view, fill)) }
@@ -601,7 +598,12 @@ impl FullscreenBackdrop {
     /// # Safety
     /// Main thread; `window` is the live `NSWindow`, `blur_view`, when given,
     /// its live blur view.
-    pub(crate) unsafe fn leave(&mut self, window: id, blur_view: Option<id>, background: id) {
+    pub(crate) unsafe fn leave(
+        &mut self,
+        window: *mut AnyObject,
+        blur_view: Option<*mut AnyObject>,
+        background: &NSColor,
+    ) {
         self.source = None;
         self.wanted = None;
         self.shown = None;
@@ -611,12 +613,9 @@ impl FullscreenBackdrop {
             without_animation(|| {
                 self.remove_picture();
                 if let Some(blur_view) = blur_view {
-                    NSVisualEffectView::setBlendingMode_(
-                        blur_view,
-                        NSVisualEffectBlendingMode::BehindWindow,
-                    );
-                    let _: () = msg_send![blur_view, setNeedsDisplay: YES];
-                    window.setBackgroundColor_(background);
+                    let _: () = msg_send![blur_view, setBlendingMode: NSVisualEffectBlendingMode::BehindWindow];
+                    let _: () = msg_send![blur_view, setNeedsDisplay: Bool::YES];
+                    let _: () = msg_send![window, setBackgroundColor: background];
                 }
             });
         }
@@ -631,8 +630,8 @@ impl FullscreenBackdrop {
         &mut self,
         key: &PictureKey,
         decoded: Decoded,
-        window: id,
-        blur_view: id,
+        window: *mut AnyObject,
+        blur_view: *mut AnyObject,
     ) {
         if !self.is_active() || self.wanted.as_ref() != Some(key) {
             return;
@@ -647,7 +646,12 @@ impl FullscreenBackdrop {
 
     /// Puts `picture` under the blur, the blur within the window and the
     /// window background in the picture's colour, in one transaction.
-    unsafe fn show(&mut self, picture: Rc<CachedPicture>, window: id, blur_view: id) {
+    unsafe fn show(
+        &mut self,
+        picture: Rc<CachedPicture>,
+        window: *mut AnyObject,
+        blur_view: *mut AnyObject,
+    ) {
         let same = self
             .shown
             .as_ref()
@@ -658,10 +662,13 @@ impl FullscreenBackdrop {
         unsafe {
             let fill = picture.average.unwrap_or_else(|| neutral(window));
             without_animation(|| {
-                let layer: id = match self.picture_view {
-                    Some(view) => msg_send![view, layer],
+                let layer: *mut AnyObject = match &self.picture_view {
+                    Some(view) => msg_send![&**view, layer],
                     None => self.add_picture_view(window, blur_view),
                 };
+                if layer.is_null() {
+                    return;
+                }
                 // The picture is decoded small and scaled up by the layer: the
                 // gravity scales it to the layer's bounds (the screen's logical
                 // size) for Fill, Fit and Stretch, and the contents scale keeps
@@ -670,7 +677,9 @@ impl FullscreenBackdrop {
                 // screen's, not from the decoded pixels.
                 let backing: f64 = msg_send![window, backingScaleFactor];
                 let scale = picture_contents_scale(picture.image_px, picture.decoded_px, backing);
-                let _: () = msg_send![layer, setContents: picture.image.0 as id];
+                // `contents` is an `id`; a `CGImage` is a valid one.
+                let contents = picture.image.0 as *mut AnyObject;
+                let _: () = msg_send![layer, setContents: contents];
                 let _: () =
                     msg_send![layer, setContentsGravity: ns_string(picture.fit.contents_gravity())];
                 let _: () = msg_send![layer, setContentsScale: scale];
@@ -687,7 +696,7 @@ impl FullscreenBackdrop {
     /// No picture can be shown: the window stands in with the neutral fill
     /// and says so. Mid-transition, a blur still blending behind the window
     /// keeps doing so until [`Self::did_enter`].
-    unsafe fn go_flat(&mut self, window: id, blur_view: id) {
+    unsafe fn go_flat(&mut self, window: *mut AnyObject, blur_view: *mut AnyObject) {
         self.source = Some(blur_source(true, false));
         self.shown = None;
         unsafe {
@@ -702,23 +711,37 @@ impl FullscreenBackdrop {
         }
     }
 
-    /// A new layer-hosting view below the blur view, returning its layer.
-    unsafe fn add_picture_view(&mut self, window: id, blur_view: id) -> id {
+    /// A new layer-hosting view below the blur view, returning its layer
+    /// (null if AppKit could not make the view).
+    unsafe fn add_picture_view(
+        &mut self,
+        window: *mut AnyObject,
+        blur_view: *mut AnyObject,
+    ) -> *mut AnyObject {
         unsafe {
-            let content_view: id = window.contentView();
-            let view: id = msg_send![class!(NSView), alloc];
-            let view: id = NSView::initWithFrame_(view, NSView::bounds(content_view));
+            let content_view: *mut AnyObject = msg_send![window, contentView];
+            let bounds: NSRect = msg_send![content_view, bounds];
+            let view: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let view: *mut AnyObject = msg_send![view, initWithFrame: bounds];
+            // `alloc`/`initWithFrame:` hand us the +1 reference we keep.
+            let Some(view) = Retained::from_raw(view) else {
+                return ptr::null_mut();
+            };
             // Layer-hosting (the layer is set before `wantsLayer`), so AppKit
             // never draws into it or replaces its contents.
-            let layer: id = msg_send![class!(CALayer), layer];
-            let _: () = msg_send![layer, setMasksToBounds: YES];
-            let _: () = msg_send![view, setLayer: layer];
-            let _: () = msg_send![view, setWantsLayer: YES];
-            view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+            let layer: *mut AnyObject = msg_send![class!(CALayer), layer];
+            let _: () = msg_send![layer, setMasksToBounds: Bool::YES];
+            let _: () = msg_send![&*view, setLayer: layer];
+            let _: () = msg_send![&*view, setWantsLayer: Bool::YES];
+            let _: () = msg_send![
+                &*view,
+                setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable
+            ];
             let _: () = msg_send![
                 content_view,
-                addSubview: view
-                positioned: NSWindowOrderingMode::NSWindowBelow
+                addSubview: &*view,
+                positioned: NSWindowOrderingMode::Below,
                 relativeTo: blur_view
             ];
             self.picture_view = Some(view);
@@ -728,42 +751,33 @@ impl FullscreenBackdrop {
 
     /// Within-window blending over what is under the blur view, with `fill`
     /// as the window background beneath it all.
-    unsafe fn blend_within(&mut self, window: id, blur_view: id, fill: Rgb) {
+    unsafe fn blend_within(
+        &mut self,
+        window: *mut AnyObject,
+        blur_view: *mut AnyObject,
+        fill: Rgb,
+    ) {
         unsafe {
             // Within-window blending samples the views under the blur view,
             // which have to be layer-backed (they are by default since 10.14).
-            let content_view: id = window.contentView();
-            let _: () = msg_send![content_view, setWantsLayer: YES];
-            NSVisualEffectView::setBlendingMode_(
-                blur_view,
-                NSVisualEffectBlendingMode::WithinWindow,
-            );
-            let _: () = msg_send![blur_view, setNeedsDisplay: YES];
-            window.setBackgroundColor_(NSColor::colorWithSRGBRed_green_blue_alpha_(
-                nil, fill.r, fill.g, fill.b, 1.0,
-            ));
+            let content_view: *mut AnyObject = msg_send![window, contentView];
+            let _: () = msg_send![content_view, setWantsLayer: Bool::YES];
+            let _: () =
+                msg_send![blur_view, setBlendingMode: NSVisualEffectBlendingMode::WithinWindow];
+            let _: () = msg_send![blur_view, setNeedsDisplay: Bool::YES];
+            let color = NSColor::colorWithSRGBRed_green_blue_alpha(fill.r, fill.g, fill.b, 1.0);
+            let _: () = msg_send![window, setBackgroundColor: &*color];
         }
         self.within_window = true;
         self.fill = fill;
     }
 
     unsafe fn remove_picture(&mut self) {
+        // Dropping the `Retained` gives up our own reference; the content
+        // view's goes with `removeFromSuperview`.
         if let Some(view) = self.picture_view.take() {
             unsafe {
-                let _: () = msg_send![view, removeFromSuperview];
-                let _: () = msg_send![view, release];
-            }
-        }
-    }
-}
-
-impl Drop for FullscreenBackdrop {
-    fn drop(&mut self) {
-        if let Some(view) = self.picture_view.take() {
-            // SAFETY: our own +1 reference; the content view keeps its own
-            // while the window lives.
-            unsafe {
-                let _: () = msg_send![view, release];
+                let _: () = msg_send![&*view, removeFromSuperview];
             }
         }
     }
@@ -774,7 +788,7 @@ impl Drop for FullscreenBackdrop {
 unsafe fn without_animation<R>(f: impl FnOnce() -> R) -> R {
     unsafe {
         let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: Bool::YES];
         let result = f();
         let _: () = msg_send![class!(CATransaction), commit];
         result
@@ -784,23 +798,23 @@ unsafe fn without_animation<R>(f: impl FnOnce() -> R) -> R {
 /// The desktop picture of the window's screen, if it may be shown: a file
 /// outside the privacy-guarded folders. Neither reads nor opens the file —
 /// the decode does, off the main thread.
-unsafe fn find_picture(window: id) -> Option<Wanted> {
+unsafe fn find_picture(window: *mut AnyObject) -> Option<Wanted> {
     unsafe {
-        let screen: id = msg_send![window, screen];
-        if screen == nil {
+        let screen: *mut AnyObject = msg_send![window, screen];
+        if screen.is_null() {
             return None;
         }
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let url: id = msg_send![workspace, desktopImageURLForScreen: screen];
-        if url == nil {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let url: *mut AnyObject = msg_send![workspace, desktopImageURLForScreen: screen];
+        if url.is_null() {
             return None;
         }
-        let is_file: BOOL = msg_send![url, isFileURL];
-        if is_file != YES {
+        let is_file: Bool = msg_send![url, isFileURL];
+        if !is_file.as_bool() {
             return None;
         }
-        let path: id = msg_send![url, path];
-        if path == nil {
+        let path: *mut AnyObject = msg_send![url, path];
+        if path.is_null() {
             return None;
         }
         let path = path.to_str().to_owned();
@@ -812,17 +826,17 @@ unsafe fn find_picture(window: id) -> Option<Wanted> {
             return None;
         }
 
-        let frame: NSRect = NSScreen::frame(screen);
-        let scale = NSScreen::backingScaleFactor(screen);
+        let frame: NSRect = msg_send![screen, frame];
+        let scale: f64 = msg_send![screen, backingScaleFactor];
         let screen_px = (frame.size.width * scale, frame.size.height * scale);
-        let options: id = msg_send![workspace, desktopImageOptionsForScreen: screen];
+        let options: *mut AnyObject = msg_send![workspace, desktopImageOptionsForScreen: screen];
         let scaling = option(options, NSWorkspaceDesktopImageScalingKey).map(|n| {
             let n: NSInteger = msg_send![n, integerValue];
             n as i64
         });
         let allow_clipping = option(options, NSWorkspaceDesktopImageAllowClippingKey).map(|b| {
-            let b: BOOL = msg_send![b, boolValue];
-            b == YES
+            let b: Bool = msg_send![b, boolValue];
+            b.as_bool()
         });
         let fill = option(options, NSWorkspaceDesktopImageFillColorKey)
             .and_then(|color| srgb(color))
@@ -839,6 +853,7 @@ unsafe fn find_picture(window: id) -> Option<Wanted> {
             screen_px: screen_px_u32,
             decode_long_side,
         };
+        // An `NSURL` is toll-free bridged to `CFURL`; the job owns this +1.
         CFRetain(url as *const c_void);
         Some(Wanted {
             key,
@@ -854,11 +869,12 @@ unsafe fn find_picture(window: id) -> Option<Wanted> {
 }
 
 /// The screen's `CGDirectDisplayID`.
-unsafe fn display_id(screen: id) -> u32 {
+unsafe fn display_id(screen: *mut AnyObject) -> u32 {
     unsafe {
-        let description: id = msg_send![screen, deviceDescription];
-        let number: id = msg_send![description, objectForKey: ns_string("NSScreenNumber")];
-        if number == nil {
+        let description: *mut AnyObject = msg_send![screen, deviceDescription];
+        let number: *mut AnyObject =
+            msg_send![description, objectForKey: ns_string("NSScreenNumber")];
+        if number.is_null() {
             return 0;
         }
         msg_send![number, unsignedIntValue]
@@ -866,86 +882,88 @@ unsafe fn display_id(screen: id) -> u32 {
 }
 
 /// The colour the desktop fills around a fitted or centred picture, if set.
-unsafe fn fill_color(window: id) -> Option<CGColorRef> {
+unsafe fn fill_color(window: *mut AnyObject) -> Option<*const CGColor> {
     unsafe {
-        let screen: id = msg_send![window, screen];
-        if screen == nil {
+        let screen: *mut AnyObject = msg_send![window, screen];
+        if screen.is_null() {
             return None;
         }
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let options: id = msg_send![workspace, desktopImageOptionsForScreen: screen];
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let options: *mut AnyObject = msg_send![workspace, desktopImageOptionsForScreen: screen];
         let color = option(options, NSWorkspaceDesktopImageFillColorKey)?;
-        let cg: CGColorRef = msg_send![color, CGColor];
+        let cg: *const CGColor = msg_send![color, CGColor];
         (!cg.is_null()).then_some(cg)
     }
 }
 
 /// The fill for a window without a picture: its background colour in its
 /// effective appearance, never lighter than a mid grey ([`neutral_fill`]).
-unsafe fn neutral(window: id) -> Rgb {
+unsafe fn neutral(window: *mut AnyObject) -> Rgb {
     unsafe {
-        let appearance: id = msg_send![window, effectiveAppearance];
-        if appearance == nil {
+        let appearance: *mut AnyObject = msg_send![window, effectiveAppearance];
+        if appearance.is_null() {
             return neutral_fill(None, false);
         }
         let names =
-            NSArray::arrayWithObjects(nil, &[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]);
-        let best: id = msg_send![appearance, bestMatchFromAppearancesWithNames: names];
-        let dark = best != nil && {
-            let equal: BOOL = msg_send![best, isEqualToString: NSAppearanceNameDarkAqua];
-            equal == YES
+            NSArray::<AnyObject>::from_slice(&[&*NSAppearanceNameAqua, &*NSAppearanceNameDarkAqua]);
+        let best: *mut AnyObject =
+            msg_send![appearance, bestMatchFromAppearancesWithNames: &*names];
+        let dark = !best.is_null() && {
+            let equal: Bool = msg_send![best, isEqualToString: NSAppearanceNameDarkAqua];
+            equal.as_bool()
         };
         neutral_fill(window_background_in(appearance), dark)
     }
 }
 
 /// `NSColor.windowBackgroundColor` resolved for `appearance` (macOS 11+).
-unsafe fn window_background_in(appearance: id) -> Option<Rgb> {
+unsafe fn window_background_in(appearance: *mut AnyObject) -> Option<Rgb> {
     unsafe {
-        let can: BOOL =
-            msg_send![appearance, respondsToSelector: sel!(performAsCurrentDrawingAppearance:)];
-        if can != YES {
+        let can: Bool = msg_send![
+            appearance,
+            respondsToSelector: sel!(performAsCurrentDrawingAppearance:)
+        ];
+        if !can.as_bool() {
             return None;
         }
         let resolved = Rc::new(Cell::new(None));
         let out = resolved.clone();
         let block = RcBlock::new(move || {
-            let color: id = msg_send![class!(NSColor), windowBackgroundColor];
+            let color: *mut AnyObject = msg_send![class!(NSColor), windowBackgroundColor];
             out.set(srgb(color).map(|(rgb, _)| rgb));
         });
-        let block: *const c_void = &*block as *const _ as *const c_void;
-        let _: () = msg_send![appearance, performAsCurrentDrawingAppearance: block];
+        let _: () = msg_send![appearance, performAsCurrentDrawingAppearance: &*block];
         resolved.get()
     }
 }
 
 /// An `NSColor` as sRGB components and alpha.
-unsafe fn srgb(color: id) -> Option<(Rgb, f64)> {
+unsafe fn srgb(color: *mut AnyObject) -> Option<(Rgb, f64)> {
     unsafe {
-        let space: id = msg_send![class!(NSColorSpace), sRGBColorSpace];
-        let color: id = msg_send![color, colorUsingColorSpace: space];
-        if color == nil {
+        let space: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        let color: *mut AnyObject = msg_send![color, colorUsingColorSpace: space];
+        if color.is_null() {
             return None;
         }
         let (mut r, mut g, mut b, mut a) = (0f64, 0f64, 0f64, 0f64);
         let _: () = msg_send![
             color,
-            getRed: &mut r as *mut f64
-            green: &mut g as *mut f64
-            blue: &mut b as *mut f64
+            getRed: &mut r as *mut f64,
+            green: &mut g as *mut f64,
+            blue: &mut b as *mut f64,
             alpha: &mut a as *mut f64
         ];
         Some((Rgb::new(r, g, b), a))
     }
 }
 
-unsafe fn option(options: id, key: id) -> Option<id> {
-    if options == nil {
+unsafe fn option(options: *mut AnyObject, key: *mut AnyObject) -> Option<*mut AnyObject> {
+    if options.is_null() {
         return None;
     }
     unsafe {
-        let value: id = msg_send![options, objectForKey: key];
-        (value != nil).then_some(value)
+        let value: *mut AnyObject = msg_send![options, objectForKey: key];
+        (!value.is_null()).then_some(value)
     }
 }
 

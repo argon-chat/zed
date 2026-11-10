@@ -1844,7 +1844,7 @@ fn effects_advisory(message: &str) {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
@@ -2829,7 +2829,6 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
-        EmojiRasterization,
         /// vue-native fork: an isolated layer's composite through its clip
         /// shape (`vn_layer_*` in shaders.hlsl).
         VnLayer,
@@ -3151,10 +3150,6 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
                 },
-                ShaderModule::EmojiRasterization => match target {
-                    ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
-                },
                 ShaderModule::VnLayer => match target {
                     ShaderTarget::Vertex => VN_LAYER_VERTEX_BYTES,
                     ShaderTarget::Fragment => VN_LAYER_FRAGMENT_BYTES,
@@ -3198,29 +3193,21 @@ pub(crate) mod shader_resources {
                         "ps_5_0\0",
                     ),
                 },
-                _ => {
-                    let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                        "color_text_raster.hlsl"
-                    } else {
-                        "shaders.hlsl"
-                    };
-                    (
-                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join(format!("src/{}", shader_name)),
-                        format!(
-                            "{}_{}\0",
-                            entry.as_str(),
-                            match target {
-                                ShaderTarget::Vertex => "vertex",
-                                ShaderTarget::Fragment => "fragment",
-                            }
-                        ),
+                _ => (
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shaders.hlsl"),
+                    format!(
+                        "{}_{}\0",
+                        entry.as_str(),
                         match target {
-                            ShaderTarget::Vertex => "vs_4_1\0",
-                            ShaderTarget::Fragment => "ps_4_1\0",
-                        },
-                    )
-                }
+                            ShaderTarget::Vertex => "vertex",
+                            ShaderTarget::Fragment => "fragment",
+                        }
+                    ),
+                    match target {
+                        ShaderTarget::Vertex => "vs_4_1\0",
+                        ShaderTarget::Fragment => "ps_4_1\0",
+                    },
+                ),
             };
 
             // The same runtime compile an app-supplied effect goes through —
@@ -3254,7 +3241,6 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
-                ShaderModule::EmojiRasterization => "emoji_rasterization",
                 ShaderModule::VnLayer => "vn_layer",
             }
         }

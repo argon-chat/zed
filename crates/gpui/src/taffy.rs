@@ -315,35 +315,54 @@ impl TaffyLayoutEngine {
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+                |input, id, node_context, style| {
+                    taffy::compute_leaf_layout(
+                        input,
+                        style,
+                        // vue-native fork: a leaf's padding, border and size
+                        // can be a `DefiniteLength::Calc` too (taffy 0.15 asks
+                        // the caller to resolve them here, not the tree).
+                        resolve_calc_handle,
+                        |known_dimensions, available_space| {
+                            let Some(node_context) = node_context else {
+                                return taffy::geometry::Size::default();
+                            };
 
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
+                            let known_dimensions = Size {
+                                width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+                                height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                            };
 
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
+                            let available_space: Size<AvailableSpace> = available_space.into();
+                            let untransform = |ev: AvailableSpace| match ev {
+                                AvailableSpace::Definite(pixels) => {
+                                    AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                                }
+                                AvailableSpace::MinContent => AvailableSpace::MinContent,
+                                AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+                            };
+                            let available_space = size(
+                                untransform(available_space.width),
+                                untransform(available_space.height),
+                            );
 
-                    if retention.enabled {
-                        retained::note_measure(retention, id, known_dimensions, available_space);
-                    }
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                            if retention.enabled {
+                                retained::note_measure(
+                                    retention,
+                                    id,
+                                    known_dimensions,
+                                    available_space,
+                                );
+                            }
+                            let measured_size: Size<Pixels> = (node_context.measure)(
+                                known_dimensions,
+                                available_space,
+                                window,
+                                cx,
+                            );
+                            snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                        },
+                    )
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -642,10 +661,10 @@ impl ToTaffy<taffy::style::Style> for Style {
             margin: self.margin.to_taffy(rem_size, scale_factor),
             padding: self.padding.to_taffy(rem_size, scale_factor),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
-            align_items: self.align_items.map(|x| x.into()),
+            align_items: self.align_items.map(Into::into).unwrap_or_default(),
             align_self: self.align_self.map(|x| x.into()),
-            align_content: self.align_content.map(|x| x.into()),
-            justify_content: self.justify_content.map(|x| x.into()),
+            align_content: self.align_content.map(Into::into).unwrap_or_default(),
+            justify_content: self.justify_content.map(Into::into).unwrap_or_default(),
             gap: self.gap.to_taffy(rem_size, scale_factor),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),
@@ -669,7 +688,7 @@ impl ToTaffy<taffy::style::Style> for Style {
                 crate::GridAutoFlow::RowDense => taffy::GridAutoFlow::RowDense,
                 crate::GridAutoFlow::ColumnDense => taffy::GridAutoFlow::ColumnDense,
             },
-            justify_items: self.vn_justify_items.map(|x| x.into()),
+            justify_items: self.vn_justify_items.map(Into::into).unwrap_or_default(),
             justify_self: self.vn_justify_self.map(|x| x.into()),
             grid_row: self
                 .grid_location
@@ -796,6 +815,26 @@ fn calc_handle(fraction: f32, pixels: Pixels, scale_factor: f32) -> Result<*cons
     #[cfg(not(target_pointer_width = "64"))]
     {
         Err(length)
+    }
+}
+
+/// vue-native fork: the inverse of [`calc_handle`], for the leaves taffy 0.15
+/// lays out through `compute_leaf_layout` with a caller-supplied resolver. It
+/// must decode exactly what the vendored taffy's
+/// `TaffyView::resolve_calc_value` does for every other node.
+#[inline(always)]
+fn resolve_calc_handle(val: *const (), basis: f32) -> f32 {
+    #[cfg(target_pointer_width = "64")]
+    {
+        let bits = val as usize as u64;
+        let length = f32::from_bits((bits >> 32) as u32);
+        let fraction = f32::from_bits(bits as u32 & !0b111);
+        fraction * basis + length
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let _ = (val, basis);
+        0.0
     }
 }
 

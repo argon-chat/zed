@@ -490,7 +490,7 @@ impl Composition {
     fn new(hwnd: HWND, swap_chain: &IDXGISwapChain3) -> Result<Self> {
         let device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice(None::<&IDXGIDevice>)? };
-        let target = unsafe { device.CreateTargetForHwnd(hwnd, true)? };
+        let target = unsafe { device.CreateTargetForHwnd(hwnd, false)? };
         let visual = unsafe { device.CreateVisual()? };
         unsafe {
             visual.SetContent(swap_chain)?;

@@ -193,13 +193,6 @@ struct Capture {
     bounds: Rc<RefCell<Vec<(u32, Bounds<Pixels>)>>>,
 }
 
-impl IntoElement for Capture {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl Element for Capture {
     type RequestLayoutState = ();
     type PrepaintState = ();
@@ -250,13 +243,6 @@ struct FreshMeasured {
     generation: u32,
     fresh: Rc<Cell<Option<(u32, Size<Pixels>)>>>,
     painted: MeasuredSnapshot,
-}
-
-impl IntoElement for FreshMeasured {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 impl Element for FreshMeasured {

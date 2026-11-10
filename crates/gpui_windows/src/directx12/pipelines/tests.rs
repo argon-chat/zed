@@ -14,7 +14,6 @@ fn modules() -> impl Iterator<Item = ShaderModule> {
         ShaderModule::MonochromeSprite,
         ShaderModule::SubpixelSprite,
         ShaderModule::PolychromeSprite,
-        ShaderModule::EmojiRasterization,
         ShaderModule::VnLayer,
     ]
     .into_iter()

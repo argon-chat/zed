@@ -5,7 +5,6 @@ use windows::{Win32::Graphics::Direct3D12::ID3D12Device, core::Interface};
 mod atlas;
 mod atlas_upload;
 mod device;
-pub(crate) mod glyphs;
 mod pipelines;
 mod renderer;
 mod video;
