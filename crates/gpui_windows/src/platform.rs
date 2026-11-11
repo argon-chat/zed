@@ -1794,9 +1794,25 @@ fn handle_gpu_device_lost(
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
 
-    *directx_devices = try_to_recover_from_device_lost(|| {
-        DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
-    })?;
+    // A driver update or a GPU that is being re-plugged leaves no usable
+    // adapter for several seconds, far longer than one round of retries, and
+    // the caller panics without devices. Keep asking for about a minute.
+    const RECOVERY_ROUNDS: usize = 60;
+    let mut round = 0;
+    *directx_devices = loop {
+        round += 1;
+        match try_to_recover_from_device_lost(|| {
+            DirectXDevices::new()
+                .context("Failed to recreate new DirectX devices after device lost")
+        }) {
+            Ok(devices) => break devices,
+            Err(error) if round < RECOVERY_ROUNDS => {
+                log::warn!("DirectX devices are not back yet ({error:#}); retrying");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     log::info!("DirectX devices successfully recreated.");
 
     let lparam = LPARAM(directx_devices as *const _ as _);

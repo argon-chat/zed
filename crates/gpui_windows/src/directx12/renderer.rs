@@ -820,8 +820,15 @@ impl DirectXRenderer {
             Err(error) => {
                 // Execute may have succeeded even if its completion Signal failed.
                 // Never map that generation again using the preceding frame's fence.
-                self.skip_draws = true;
-                self.uploads_failed = true;
+                //
+                // An error raised before Execute (an effect that does not
+                // compile, layers nested too deep, a missing atlas page) left
+                // nothing for the GPU to read: the slot's uploads are reusable
+                // under its previous fence, and the next scene may well draw.
+                if self.gpu.submission_failed() {
+                    self.skip_draws = true;
+                    self.uploads_failed = true;
+                }
                 return Err(error);
             }
         };

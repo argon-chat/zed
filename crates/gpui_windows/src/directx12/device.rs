@@ -92,6 +92,9 @@ impl Drop for Event {
     }
 }
 
+/// Set once a hardware adapter gave this process a device (`Device::new`).
+static HAD_HARDWARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Device {
     pub(super) fn new() -> Result<Arc<Self>> {
         let dxgi_factory: IDXGIFactory6 =
@@ -132,8 +135,22 @@ impl Device {
         }
         // Never silently replace GPU rendering with Microsoft's software
         // adapter. An explicit VN_ADAPTER remains useful for WARP fixtures.
+        //
+        // A machine that lists no hardware adapter at all (a VM without a GPU,
+        // a basic-display RDP host) has nothing to replace, and the caller
+        // panics without a device, so it gets the software adapter and a
+        // warning. Not once this process has drawn on hardware: during a
+        // driver update only the software adapter is listed for a few seconds,
+        // and the device-loss recovery retries until the GPU is back.
         if !explicit_match {
-            candidates.retain(|(_, _, software, _)| !software);
+            let hardware_listed = candidates.iter().any(|(_, _, software, _)| !software);
+            if hardware_listed || HAD_HARDWARE.load(std::sync::atomic::Ordering::Relaxed) {
+                candidates.retain(|(_, _, software, _)| !software);
+            } else if !candidates.is_empty() {
+                log::warn!(
+                    "No hardware D3D12 adapter is listed; rendering with the software adapter"
+                );
+            }
         }
         // Keep the system's adapter order. Adapter 0 drives the primary display
         // and follows the user's per-app Windows graphics preference; on hybrid
@@ -142,7 +159,7 @@ impl Device {
         // copy every Present across adapters when the panel hangs off the iGPU).
         candidates.sort_by_key(|(_, _, software, _)| *software);
         let mut last_error = None;
-        for (adapter, name, _, _) in candidates {
+        for (adapter, name, software, _) in candidates {
             let mut device: Option<ID3D12Device> = None;
             if let Err(error) =
                 unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device) }
@@ -153,6 +170,9 @@ impl Device {
             }
             let device = device.context("D3D12CreateDevice returned no device")?;
             log::info!("Using native D3D12 GPU: {name}");
+            if !software {
+                HAD_HARDWARE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             return Self::from_native(device, adapter, dxgi_factory);
         }
         if let Some(error) = last_error {
@@ -298,6 +318,13 @@ impl Device {
         // outside the submission mutex: an owner can release its own Device.
         self.retirement.retire(retired);
         result
+    }
+
+    /// Whether a submission reached the queue without its completion being
+    /// signalled, or never completed. Commands the GPU may still be reading
+    /// have no fence to wait on then, and every later submission is refused.
+    pub(super) fn submission_failed(&self) -> bool {
+        self.retirement.submissions.lock().failure.is_some()
     }
 
     pub(super) fn command_stats(&self) -> CommandStats {
