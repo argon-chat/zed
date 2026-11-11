@@ -3036,6 +3036,19 @@ impl Window {
             }))
     }
 
+    /// Registers a callback to be invoked when the window is activated or
+    /// deactivated, without an entity to update (vue-native fork).
+    pub fn observe_window_activation(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        self.activation_observers
+            .insert(Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }))
+    }
+
     /// Registers a callback to be invoked when the window appearance changes.
     pub fn observe_window_appearance(
         &self,
