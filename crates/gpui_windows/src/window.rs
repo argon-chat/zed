@@ -1198,6 +1198,10 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
+        self.state.renderer.borrow().vn_composition_underlay()
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
     }

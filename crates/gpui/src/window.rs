@@ -3261,6 +3261,13 @@ impl Window {
         self.platform_window.inner_window_bounds()
     }
 
+    /// vue-native: Windows' composition device and the container visual drawn
+    /// UNDER this window's surface (see `PlatformWindow::vn_composition_underlay`):
+    /// owned COM pointers, released by the caller.
+    pub fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
+        self.platform_window.vn_composition_underlay()
+    }
+
     /// Encode the window's native restorable state into an opaque blob.
     /// Returns `None` on platforms without native state restoration or if encoding fails.
     pub fn native_window_state(&self) -> Option<Vec<u8>> {
@@ -6255,6 +6262,45 @@ impl Window {
             backdrop_blur_radius: px(spec.backdrop_blur_radius()).scale(scale_factor),
             scale: scale_factor,
             flags: spec.flags,
+        });
+    }
+
+    /// vue-native: makes `bounds` (rounded by `corner_radii`) transparent in
+    /// this window's surface, erasing what was painted there so far; what is
+    /// painted after it draws over the hole as usual. The window has to
+    /// present with alpha for anything to show through (on Windows,
+    /// DirectComposition: `Window::vn_composition_underlay`).
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn vn_paint_punch(&mut self, bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        if opacity <= 0. {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        // No `transformation` field, as for the effects: a rotated box is not
+        // punched rather than punched somewhere else.
+        let Some((draw_bounds, k)) =
+            crate::scene::axis_aligned_through(self.snap_bounds(bounds), self.element_transform)
+        else {
+            return;
+        };
+        self.next_frame.scene.insert_primitive(EffectQuad {
+            order: 0,
+            effect_id: crate::effect_id::PUNCH,
+            bounds: draw_bounds,
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor * k),
+            params0: [0.; 4],
+            params1: [0.; 4],
+            opacity,
+            time: 0.,
+            bleed: ScaledPixels(0.),
+            backdrop_blur_radius: ScaledPixels(0.),
+            scale: scale_factor,
+            flags: 0,
         });
     }
 

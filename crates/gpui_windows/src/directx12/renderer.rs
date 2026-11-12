@@ -481,9 +481,23 @@ impl Drop for StateChanges {
         }
     }
 }
+/// The window's composition tree:
+///
+/// ```text
+/// root
+/// ├─ underlay   (vue-native: empty; a host adds visuals drawn UNDER the app)
+/// └─ visual     (the swap chain, premultiplied alpha)
+/// ```
+///
+/// vue-native: `underlay` is where an `<iframe>`'s webview is composited
+/// (crates/vn-webview). The app paints transparent over the iframe's box, so
+/// the webview shows through there and everything the app paints later in
+/// paint order — a menu, a tooltip — stays above it.
 struct Composition {
-    _device: IDCompositionDevice,
+    device: IDCompositionDevice,
     _target: IDCompositionTarget,
+    _root: IDCompositionVisual,
+    underlay: IDCompositionVisual,
     _visual: IDCompositionVisual,
 }
 impl Composition {
@@ -491,15 +505,21 @@ impl Composition {
         let device: IDCompositionDevice =
             unsafe { DCompositionCreateDevice(None::<&IDXGIDevice>)? };
         let target = unsafe { device.CreateTargetForHwnd(hwnd, false)? };
+        let root = unsafe { device.CreateVisual()? };
+        let underlay = unsafe { device.CreateVisual()? };
         let visual = unsafe { device.CreateVisual()? };
         unsafe {
             visual.SetContent(swap_chain)?;
-            target.SetRoot(&visual)?;
+            root.AddVisual(&underlay, false, None::<&IDCompositionVisual>)?;
+            root.AddVisual(&visual, true, &underlay)?;
+            target.SetRoot(&root)?;
             device.Commit()?;
         }
         Ok(Self {
-            _device: device,
+            device,
             _target: target,
+            _root: root,
+            underlay,
             _visual: visual,
         })
     }
@@ -557,6 +577,18 @@ pub(crate) struct DirectXRenderer {
     uploads_failed: bool,
 }
 impl DirectXRenderer {
+    /// vue-native: the composition device and the container drawn under the
+    /// app's surface, each as an owned COM pointer (the caller releases them).
+    /// `None` without DirectComposition. A lost device rebuilds the tree, so
+    /// the pair changes: a host compares the pointers and re-attaches.
+    pub(crate) fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
+        let composition = self.composition.as_ref()?;
+        Some((
+            composition.device.clone().into_raw() as usize,
+            composition.underlay.clone().into_raw() as usize,
+        ))
+    }
+
     pub(crate) fn new(
         hwnd: HWND,
         devices: &DirectXDevices,

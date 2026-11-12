@@ -67,6 +67,89 @@ struct PipelineKey {
 enum PipelineKind {
     Primitive(ShaderModule),
     DynamicEffect(usize),
+    /// vue-native: `gpui::effect_id::PUNCH` — erases its quad (see [`PUNCH_FRAGMENT`]).
+    Punch,
+}
+
+/// vue-native: the fragment stage of the punch. It shares the effects' vertex
+/// stage and instance buffer and writes only a coverage; the pipeline's blend
+/// ([`Blend::DestinationOut`]) multiplies what is in the target by one minus
+/// it, so the quad's rounded rect, inside its content mask, becomes
+/// transparent. The structs repeat `effects.hlsl`'s (the stride must match).
+const PUNCH_FRAGMENT: &str = r#"
+struct Bounds { float2 origin; float2 size; };
+struct Corners { float top_left; float top_right; float bottom_right; float bottom_left; };
+struct EffectQuad {
+    uint order;
+    uint effect_id;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners content_mask_radii;
+    Corners corner_radii;
+    float4 params0;
+    float4 params1;
+    float opacity;
+    float time;
+    float bleed;
+    float backdrop_blur_radius;
+    float scale;
+    uint flags;
+};
+StructuredBuffer<EffectQuad> effect_quads: register(t1);
+
+float rounded_distance(float2 position, Bounds bounds, Corners radii) {
+    float2 half_size = bounds.size * 0.5;
+    float2 center = bounds.origin + half_size;
+    float2 p = position - center;
+    float radius = p.x < 0.0
+        ? (p.y < 0.0 ? radii.top_left : radii.bottom_left)
+        : (p.y < 0.0 ? radii.top_right : radii.bottom_right);
+    radius = min(radius, min(half_size.x, half_size.y));
+    float2 q = abs(p) - half_size + radius;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+float4 punch_fragment(nointerpolation uint effect_quad_id: TEXCOORD0, float4 position: SV_Position) : SV_Target {
+    EffectQuad quad = effect_quads[effect_quad_id];
+    float inside = saturate(0.5 - rounded_distance(position.xy, quad.bounds, quad.corner_radii));
+    float unmasked = saturate(0.5 - rounded_distance(position.xy, quad.content_mask, quad.content_mask_radii));
+    return float4(0.0, 0.0, 0.0, inside * unmasked * quad.opacity);
+}
+"#;
+
+/// vue-native: compiles [`PUNCH_FRAGMENT`]. At first use, like an app's own
+/// effect: it is needed only by a window that shows an `<iframe>`.
+fn compile_punch() -> Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::{
+        Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+        ID3DInclude,
+    };
+    use windows::core::s;
+    let mut bytecode = None;
+    let mut diagnostic = None;
+    let result = unsafe {
+        D3DCompile(
+            PUNCH_FRAGMENT.as_ptr().cast(),
+            PUNCH_FRAGMENT.len(),
+            s!("gpui-d3d12-punch"),
+            None,
+            None::<&ID3DInclude>,
+            s!("punch_fragment"),
+            s!("ps_5_1"),
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0,
+            &mut bytecode,
+            Some(&mut diagnostic),
+        )
+    };
+    if let Err(error) = result {
+        bail!(
+            "Compiling the D3D12 punch shader: {error}; {}",
+            diagnostic.as_ref().map(blob_message).unwrap_or_default()
+        );
+    }
+    let bytecode = bytecode.context("D3DCompile returned no bytecode")?;
+    Ok(bytes(&bytecode).to_vec())
 }
 
 pub(super) struct Pipelines {
@@ -164,7 +247,9 @@ impl Pipelines {
         sample_count: u32,
     ) -> Result<(ID3D12PipelineState, bool)> {
         let backdrop = self.needs_backdrop(index)?;
-        let kind = if let Some(effect) = EffectShader::ALL.get(index as usize) {
+        let kind = if index == gpui::effect_id::PUNCH {
+            PipelineKind::Punch
+        } else if let Some(effect) = EffectShader::ALL.get(index as usize) {
             PipelineKind::Primitive(ShaderModule::Effect(*effect))
         } else {
             PipelineKind::DynamicEffect(index as usize - EffectShader::ALL.len())
@@ -180,6 +265,9 @@ impl Pipelines {
     }
 
     pub fn needs_backdrop(&self, index: u32) -> Result<bool> {
+        if index == gpui::effect_id::PUNCH {
+            return Ok(false);
+        }
         if let Some(effect) = EffectShader::ALL.get(index as usize) {
             return Ok(effect.needs_backdrop());
         }
@@ -220,6 +308,11 @@ impl Pipelines {
                     module_blend(module),
                 )
             }
+            PipelineKind::Punch => (
+                Cow::Borrowed(embedded::effect_vertex()),
+                Cow::Owned(compile_punch()?),
+                Blend::DestinationOut,
+            ),
             PipelineKind::DynamicEffect(index) => {
                 let effect = self
                     .dynamic_effects
@@ -375,6 +468,8 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
 
 #[derive(Clone, Copy)]
 enum Blend {
+    /// vue-native: the target times one minus the source's alpha — an eraser.
+    DestinationOut,
     Straight,
     Premultiplied,
     Replace,
@@ -401,6 +496,7 @@ fn blend_description(blend: Blend) -> D3D12_BLEND_DESC {
     target.BlendEnable = (!matches!(blend, Blend::Replace)).into();
     target.LogicOpEnable = false.into();
     target.SrcBlend = match blend {
+        Blend::DestinationOut => D3D12_BLEND_ZERO,
         Blend::Straight => D3D12_BLEND_SRC_ALPHA,
         Blend::Subpixel => D3D12_BLEND_SRC1_COLOR,
         _ => D3D12_BLEND_ONE,
@@ -411,7 +507,11 @@ fn blend_description(blend: Blend) -> D3D12_BLEND_DESC {
         D3D12_BLEND_INV_SRC_ALPHA
     };
     target.BlendOp = D3D12_BLEND_OP_ADD;
-    target.SrcBlendAlpha = D3D12_BLEND_ONE;
+    target.SrcBlendAlpha = if matches!(blend, Blend::DestinationOut) {
+        D3D12_BLEND_ZERO
+    } else {
+        D3D12_BLEND_ONE
+    };
     target.DestBlendAlpha = if matches!(blend, Blend::Subpixel) {
         D3D12_BLEND_ZERO
     } else {

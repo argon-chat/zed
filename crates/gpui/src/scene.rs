@@ -1371,6 +1371,12 @@ pub mod effect_id {
     pub const GLOW: u32 = 2;
     /// How many built-in effects exist.
     pub const COUNT: u32 = 3;
+    /// vue-native: not an effect a stylesheet can name. An [`super::EffectQuad`]
+    /// with this id ERASES what was painted under it — its rounded rect, cut
+    /// by its content mask, becomes transparent — so a surface composited
+    /// under the window (an `<iframe>`'s webview) shows through there. See
+    /// `Window::vn_paint_punch`. A renderer without it draws nothing.
+    pub const PUNCH: u32 = u32::MAX - 1;
     /// The id an [`super::EffectSpec`] carries when CSS said `--shading: none`.
     /// A refinement has no way to spell "explicitly nothing", so — exactly as
     /// `backdrop-filter: none` maps to a 0px radius — clearing is a *value*.

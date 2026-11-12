@@ -1425,6 +1425,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
 
+    /// vue-native: Windows' composition device and the container visual drawn
+    /// UNDER the app's surface, as owned `IDCompositionDevice` /
+    /// `IDCompositionVisual` pointers the caller releases. `None` where the
+    /// window does not present through DirectComposition.
+    fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {
         self.window_bounds()
