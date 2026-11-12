@@ -257,6 +257,19 @@ impl TaffyLayoutEngine {
         Ok(edges)
     }
 
+    /// vue-native fork: `id` is laid out as a root, so it has no parent.
+    ///
+    /// A retained node keeps the Taffy parent it had last frame until that
+    /// parent is requested again with other children, or freed, and an
+    /// unrequested one is only freed when the frame ends. A node that was a
+    /// child and is a root this frame would be placed at the stale parent's
+    /// origin by [`Self::layout_bounds`].
+    pub(crate) fn detach_root(&mut self, id: LayoutId) {
+        if let Some(parent) = self.taffy.parent(id.0) {
+            self.taffy.remove_child(parent, id.0).expect(EXPECT_MESSAGE);
+        }
+    }
+
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
     pub fn compute_layout(
         &mut self,
@@ -275,6 +288,10 @@ impl TaffyLayoutEngine {
         //     println!("N{} --> N{}", u64::from(a), u64::from(b));
         // }
         //
+
+        if self.retention.enabled {
+            self.detach_root(id);
+        }
 
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;

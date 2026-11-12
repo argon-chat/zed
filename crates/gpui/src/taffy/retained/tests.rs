@@ -54,6 +54,33 @@ fn transient_removal_dirties_auto_parent_before_child_equality_can_hide_it() {
     );
 }
 
+/// A retained node whose parent was not requested this frame is a root now:
+/// the parent is only freed when the frame ends, and until then it would
+/// place the node at its own, last frame's, origin.
+#[test]
+fn a_child_that_became_a_root_forgets_the_parent_that_was_not_requested() {
+    let mut engine = TaffyLayoutEngine::new();
+    engine.enable_retention();
+    let spacer = request_layout(&mut engine, Some(scope("spacer")), fixed(40., 10.), &[]);
+    let child = request_layout(&mut engine, Some(scope("child")), fixed(30., 10.), &[]);
+    let parent = request_layout(&mut engine, Some(scope("parent")), Default::default(), &[child]);
+    let root = request_layout(
+        &mut engine,
+        Some(scope("root")),
+        Default::default(),
+        &[spacer, parent],
+    );
+    assert_eq!(compute(&mut engine, root), 70.);
+    assert_eq!(engine.layout_bounds(child, 1.).origin.x, px(40.));
+    engine.clear();
+
+    let child_again = request_layout(&mut engine, Some(scope("child")), fixed(30., 10.), &[]);
+    assert_eq!(child_again, child);
+    engine.detach_root(child_again);
+    assert_eq!(compute(&mut engine, child_again), 30.);
+    assert_eq!(engine.layout_bounds(child_again, 1.).origin.x, px(0.));
+}
+
 #[test]
 fn reused_nodes_reconcile_full_style_child_order_and_reparenting() {
     let mut engine = TaffyLayoutEngine::new();
