@@ -1313,13 +1313,23 @@ impl Style {
                 let mut max = bounds.bottom_right();
                 let border_box = bounds;
 
-                if self
-                    .border_color
-                    .is_some_and(|color| !color.is_transparent())
-                {
+                // vue-native fork: side by side, since each side can have its
+                // own colour (`vn_border_colors`). Only the shared colour was
+                // asked, so a box whose borders were all coloured per side
+                // clipped to its border box and its content painted over them.
+                let painted = self
+                    .vn_resolved_border_colors()
+                    .map(|color| !color.is_transparent());
+                if painted.left {
                     min.x += self.border_widths.left.to_pixels(rem_size);
+                }
+                if painted.right {
                     max.x -= self.border_widths.right.to_pixels(rem_size);
+                }
+                if painted.top {
                     min.y += self.border_widths.top.to_pixels(rem_size);
+                }
+                if painted.bottom {
                     max.y -= self.border_widths.bottom.to_pixels(rem_size);
                 }
 
@@ -3286,6 +3296,20 @@ mod vn_border_color_tests {
         assert_eq!(colors.top, Hsla::blue());
         assert_eq!(colors.right, Hsla::red());
         assert!(colors.left.is_transparent());
+    }
+
+    /// A border coloured side by side, with no shared colour, still takes its
+    /// width off the box its overflow is clipped to.
+    #[test]
+    fn overflow_is_clipped_inside_borders_coloured_per_side() {
+        let mut style = Style::default();
+        style.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden };
+        style.border_widths = Edges::all(px(4.).into());
+        style.vn_border_colors.top = Some(Hsla::blue());
+        style.vn_border_colors.left = Some(Hsla::red());
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.)));
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.bounds, Bounds::from_corners(point(px(4.), px(4.)), point(px(100.), px(100.))));
     }
 
     #[test]

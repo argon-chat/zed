@@ -1947,7 +1947,10 @@ impl TransformationMatrix {
     pub fn inverse(&self) -> Option<TransformationMatrix> {
         let [[a, b], [c, d]] = self.rotation_scale;
         let det = a * d - b * c;
-        if det.abs() < f32::EPSILON {
+        // Zero, not "small": `scale(0.0003)` has a determinant under
+        // `f32::EPSILON` and an inverse all the same, and an element part way
+        // into a scale-in could not be hit.
+        if det == 0.0 || !det.is_finite() || !(1.0 / det).is_finite() {
             return None;
         }
         let inv = [[d / det, -b / det], [-c / det, a / det]];
@@ -2061,6 +2064,16 @@ mod vn_axis_aligned_tests {
             axis_aligned_through(rect(1., 2., 3., 4.), TransformationMatrix::unit()),
             Some((rect(1., 2., 3., 4.), 1.0))
         );
+    }
+
+    /// A very small scale still has an inverse; only a flat one has none.
+    #[test]
+    fn a_tiny_scale_is_still_invertible() {
+        let tiny = TransformationMatrix { rotation_scale: [[0.0003, 0.0], [0.0, 0.0003]], translation: [5.0, 7.0] };
+        let back = tiny.inverse().expect("an inverse");
+        assert!((back.rotation_scale[0][0] - 1.0 / 0.0003).abs() < 1.0);
+        let flat = TransformationMatrix { rotation_scale: [[1.0, 0.0], [0.0, 0.0]], translation: [0.0, 0.0] };
+        assert!(flat.inverse().is_none());
     }
 
     /// A path has no transformation field, so its vertices and its bounds
