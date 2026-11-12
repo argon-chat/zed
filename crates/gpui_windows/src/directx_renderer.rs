@@ -799,15 +799,17 @@ impl DirectXRenderer {
             // pipeline owns its own buffer, so upload to the ones this frame
             // actually uses and no further: a window with one frost panel must
             // not pay to upload the array three times.
-            let mut used = 0u64;
+            // One flag per pipeline, not a `u64` of them: the table is as long
+            // as the app's effect manifest, and `1 << id` past 63 overflowed.
+            let mut used = vec![false; self.pipelines.effect_pipelines.len()];
             for quad in &scene.effect_quads {
-                if quad.effect_id < 64 {
-                    used |= 1 << quad.effect_id;
+                if let Some(slot) = used.get_mut(quad.effect_id as usize) {
+                    *slot = true;
                 }
             }
             for (id, pipeline) in self.pipelines.effect_pipelines.iter_mut().enumerate() {
                 let Some(pipeline) = pipeline else { continue };
-                if used & (1 << id) == 0 {
+                if !used.get(id).copied().unwrap_or(false) {
                     continue;
                 }
                 pipeline.update_buffer(
