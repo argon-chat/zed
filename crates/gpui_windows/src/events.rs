@@ -306,8 +306,11 @@ impl WindowsWindowInner {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
         // A frame dropped by the no-wait mode may have left stale content on
-        // screen; the vsync thread re-invalidates every window each vsync, so
-        // the next normal draw catches it up — nothing to do here.
+        // screen. The renderer reports a dropped frame as drawn, so the window
+        // is no longer dirty and the vsync thread's invalidation alone draws
+        // nothing: a resize that ended on a dropped frame kept its stretched
+        // content until something else changed. Force the next draw.
+        self.state.force_render_pending.set(true);
         None
     }
 
