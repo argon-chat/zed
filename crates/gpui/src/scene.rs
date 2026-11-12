@@ -2062,6 +2062,25 @@ mod vn_axis_aligned_tests {
             Some((rect(1., 2., 3., 4.), 1.0))
         );
     }
+
+    /// A path has no transformation field, so its vertices and its bounds
+    /// move: a chevron in a translated dialog is drawn where the dialog is.
+    #[test]
+    fn a_transform_moves_a_paths_vertices_and_bounds() {
+        let mut path = Path::new(point(Pixels(0.), Pixels(0.)));
+        path.line_to(point(Pixels(10.), Pixels(0.)));
+        path.line_to(point(Pixels(10.), Pixels(20.)));
+        let mut path = path.scale(2.0);
+        assert_eq!(path.bounds, rect(0., 0., 20., 40.));
+        let before: Vec<_> = path.vertices.iter().map(|vertex| vertex.xy_position).collect();
+        let moved =
+            TransformationMatrix::unit().translate(point(ScaledPixels(300.), ScaledPixels(-120.)));
+        path.transform(moved);
+        assert_eq!(path.bounds, rect(300., -120., 20., 40.));
+        for (was, vertex) in before.iter().zip(&path.vertices) {
+            assert_eq!(vertex.xy_position, point(was.x + ScaledPixels(300.), was.y - ScaledPixels(120.)));
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -2292,6 +2311,44 @@ where
     #[expect(missing_docs)]
     pub fn clipped_bounds(&self) -> Bounds<T> {
         self.bounds.intersect(&self.content_mask.bounds)
+    }
+}
+
+impl Path<ScaledPixels> {
+    /// vue-native fork: maps the path through `matrix`, in the device space
+    /// both are expressed in. A path has no transformation of its own to hand
+    /// the renderer, unlike a quad or a sprite, so its vertices move instead;
+    /// the map is affine, which keeps every triangle and its curve
+    /// coordinates. The bounds become the moved vertices' box.
+    pub(crate) fn transform(&mut self, matrix: TransformationMatrix) {
+        let map = |position: Point<ScaledPixels>| {
+            let moved = matrix.apply(Point::new(Pixels(position.x.0), Pixels(position.y.0)));
+            Point::new(ScaledPixels(moved.x.0), ScaledPixels(moved.y.0))
+        };
+        self.start = map(self.start);
+        self.current = map(self.current);
+        let mut corners: Option<(Point<ScaledPixels>, Point<ScaledPixels>)> = None;
+        for vertex in &mut self.vertices {
+            let position = map(vertex.xy_position);
+            vertex.xy_position = position;
+            corners = Some(match corners {
+                None => (position, position),
+                Some((low, high)) => (
+                    Point::new(
+                        ScaledPixels(low.x.0.min(position.x.0)),
+                        ScaledPixels(low.y.0.min(position.y.0)),
+                    ),
+                    Point::new(
+                        ScaledPixels(high.x.0.max(position.x.0)),
+                        ScaledPixels(high.y.0.max(position.y.0)),
+                    ),
+                ),
+            });
+        }
+        self.bounds = match corners {
+            Some((low, high)) => Bounds::from_corners(low, high),
+            None => transformed_bounds(self.bounds, matrix),
+        };
     }
 }
 

@@ -6270,9 +6270,15 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        let mut path = path.scale(scale_factor);
+        // vue-native fork: every other primitive carries `element_transform`;
+        // a path painted under one (a `<select>`'s chevron in a dialog centred
+        // with `translate(-50%, -50%)`) stayed at its layout position, and was
+        // culled against a content mask that is already in window space.
+        if !self.element_transform.is_unit() {
+            path.transform(self.element_transform);
+        }
+        self.next_frame.scene.insert_primitive(path);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
