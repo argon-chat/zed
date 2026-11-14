@@ -230,7 +230,7 @@ struct RendererTimings {
 }
 impl RendererTimings {
     fn from_environment() -> Option<Self> {
-        std::env::var_os("VN_DX12_TIMINGS")
+        std::env::var_os("SK_DX12_TIMINGS")
             .filter(|value| value.to_str() == Some("1"))
             .map(|_| Self {
                 started: Instant::now(),

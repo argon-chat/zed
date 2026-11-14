@@ -344,7 +344,7 @@ fn get_adapter(
     // exists to avoid (research/reports/m11/video.md §5, R1).
     //
     // Preference, in order:
-    //   * `VN_ADAPTER=<substring>` — case-insensitive match on the adapter
+    //   * `SK_ADAPTER=<substring>` — case-insensitive match on the adapter
     //     description. An explicit ask always wins, and says so if it misses.
     //   * not flagged `DXGI_ADAPTER_FLAG_SOFTWARE` (WARP).
     //   * most `DedicatedVideoMemory`.
@@ -359,7 +359,7 @@ fn get_adapter(
             if c.software { ", software" } else { "" }
         );
     }
-    let wanted = std::env::var("VN_ADAPTER").unwrap_or_default().to_lowercase();
+    let wanted = std::env::var("SK_ADAPTER").unwrap_or_default().to_lowercase();
     if !wanted.trim().is_empty() {
         let wanted = wanted.trim();
         if candidates
@@ -367,10 +367,10 @@ fn get_adapter(
             .any(|c| c.name.to_lowercase().contains(wanted))
         {
             candidates.retain(|c| c.name.to_lowercase().contains(wanted));
-            log::info!("VN_ADAPTER={wanted:?} selected {}", candidates[0].name);
+            log::info!("SK_ADAPTER={wanted:?} selected {}", candidates[0].name);
         } else {
             log::warn!(
-                "VN_ADAPTER={wanted:?} matches no adapter on this machine; falling back to \
+                "SK_ADAPTER={wanted:?} matches no adapter on this machine; falling back to \
                  automatic selection."
             );
         }

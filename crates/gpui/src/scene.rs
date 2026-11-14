@@ -1357,10 +1357,10 @@ impl From<BackdropBlurRect> for Primitive {
 ///
 /// gpui deliberately does not know what these effects *do* — the shader
 /// sources, the CSS parameter schemas and the defaults all live in
-/// `crates/vn-effects`, which is above gpui in the dependency graph. What lives
+/// `crates/sk-effects`, which is above gpui in the dependency graph. What lives
 /// here is only the numbering, because three separate places have to agree on
 /// it: this enum, the pipeline table in `gpui_windows`, and the registry in
-/// `vn-effects`.
+/// `sk-effects`.
 pub mod effect_id {
     /// `frost(strength, radius?, tint?)` — blurred backdrop + crystalline
     /// grain + rim highlight. Reads the backdrop.
@@ -1685,7 +1685,7 @@ impl EffectSpec {
 ///
 /// Keep the field order in sync with `struct EffectQuad` in
 /// `gpui_windows/src/effects.hlsl` and with `struct VnEffectQuad` in the
-/// generated wrapper (`packages/vue-native/shaders.ts`).
+/// generated wrapper (`scripts/shaders.ts`).
 /// 32 words / 128 bytes. (vue-native fork: the content mask's corner radii
 /// took the four words of padding that closed it.)
 #[derive(Debug, Copy, Clone, Default)]

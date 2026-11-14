@@ -120,7 +120,7 @@ struct DirectXRenderPipelines {
     /// One entry per built-in effect, indexed by `EffectQuad::effect_id`.
     ///
     /// `None` when that effect's pipeline could not be built — a missing or
-    /// broken `crates/vn-effects/generated/*.hlsl`, or a GPU below D3D feature
+    /// broken `crates/sk-effects/generated/*.hlsl`, or a GPU below D3D feature
     /// level 11. A broken effect must degrade to "this element renders without
     /// its shading", never to a dead window, so this is fallible per entry and
     /// the whole renderer still comes up.
@@ -1720,8 +1720,8 @@ impl DirectXRenderPipelines {
 
 /// Builds the `--shading` pipeline table: the built-in effects first, in
 /// `gpui::effect_id` order, then whatever the running app contributed through
-/// `$VN_EFFECTS_DIR`. The index into this table IS the `EffectQuad::effect_id`
-/// the CSS layer wrote, and `crates/vn-effects` numbers app effects from the
+/// `$SK_EFFECTS_DIR`. The index into this table IS the `EffectQuad::effect_id`
+/// the CSS layer wrote, and `crates/sk-effects` numbers app effects from the
 /// same manifest in the same order, which is what keeps the two in step
 /// without either one knowing about the other.
 ///
@@ -1972,7 +1972,7 @@ impl<T> PipelineState<T> {
 
     /// The half of [`Self::new`] that does not care where the bytecode came
     /// from. An app-supplied `--shading` effect has no `ShaderModule` — its
-    /// fragment stage is HLSL compiled at startup from `$VN_EFFECTS_DIR` — so
+    /// fragment stage is HLSL compiled at startup from `$SK_EFFECTS_DIR` — so
     /// it enters here instead.
     fn from_shaders(
         device: &ID3D11Device,
@@ -2849,13 +2849,13 @@ pub(crate) mod shader_resources {
         /// A `--shading` effect. Its two halves come from two different files:
         /// the shared engine vertex stage from `src/effects.hlsl`, the
         /// per-effect fragment stage from the checked-in slangc output under
-        /// `crates/vn-effects/generated/`.
+        /// `crates/sk-effects/generated/`.
         Effect(EffectShader),
     }
 
     /// The built-in effects, in `gpui::effect_id` order. That numbering is the
     /// contract between this table, `gpui::effect_id` and the CSS registry in
-    /// `crates/vn-effects` — all three have to agree.
+    /// `crates/sk-effects` — all three have to agree.
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum EffectShader {
         Frost,
@@ -2887,9 +2887,9 @@ pub(crate) mod shader_resources {
         /// decides its blend state (replace vs source-over) and whether the
         /// renderer has to break the pass for it.
         ///
-        /// Duplicated from the `vn-effects` registry rather than shared,
+        /// Duplicated from the `sk-effects` registry rather than shared,
         /// because gpui sits below it in the dependency graph. The two are
-        /// tied together by `crates/vn-effects/generated/effects.json`, whose
+        /// tied together by `crates/sk-effects/generated/effects.json`, whose
         /// `backdrop` field comes from slangc's reflection of the `[VnBackdrop]`
         /// / `[VnBackdropRadius]` attributes on the effect struct. An APP effect
         /// reads that field at runtime instead — see `dynamic_effects`.
@@ -2911,15 +2911,15 @@ pub(crate) mod shader_resources {
     /// decision 3 / docs/SHADERS.md §2.3), which is what gives an effect author
     /// a real file to hot-reload and what keeps `cargo build` free of any
     /// dependency on slangc. That puts it outside this crate, hence the walk
-    /// back up to the workspace root; `VN_EFFECTS_GENERATED_DIR` overrides it
+    /// back up to the workspace root; `SK_EFFECTS_GENERATED_DIR` overrides it
     /// for anyone consuming this gpui fork from a different layout.
     #[cfg(debug_assertions)]
     pub(super) fn effects_generated_dir() -> std::path::PathBuf {
-        if let Ok(dir) = std::env::var("VN_EFFECTS_GENERATED_DIR") {
+        if let Ok(dir) = std::env::var("SK_EFFECTS_GENERATED_DIR") {
             return std::path::PathBuf::from(dir);
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../crates/vn-effects/generated")
+            .join("../../../../crates/sk-effects/generated")
     }
 
     // -----------------------------------------------------------------------
@@ -2929,10 +2929,10 @@ pub(crate) mod shader_resources {
     // An app's `--shading` effects are not part of the Rust build, so nothing
     // could have pre-compiled them: `bun shaders.ts --app <app> --out <dir>`
     // leaves HLSL plus an `effects.json` schema in <dir>, the host is run with
-    // VN_EFFECTS_DIR=<dir>, and the fragment stage is compiled here at renderer
+    // SK_EFFECTS_DIR=<dir>, and the fragment stage is compiled here at renderer
     // construction — in release as well as debug.
     //
-    // `crates/vn-effects` reads the SAME manifest for the CSS schema and
+    // `crates/sk-effects` reads the SAME manifest for the CSS schema and
     // numbers the effects the same way (after the built-ins, in manifest
     // order), which is what keeps `EffectQuad::effect_id` and this pipeline
     // table in agreement without either side importing the other.
@@ -2968,9 +2968,9 @@ pub(crate) mod shader_resources {
     /// they do not recognise rather than half-reading it.
     const DYNAMIC_MANIFEST_SCHEMA: u32 = 4;
 
-    pub(crate) const EFFECTS_DIR_ENV: &str = "VN_EFFECTS_DIR";
+    pub(crate) const EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
 
-    /// Reads `$VN_EFFECTS_DIR/effects.json`. Absent variable, absent file and
+    /// Reads `$SK_EFFECTS_DIR/effects.json`. Absent variable, absent file and
     /// unreadable file all mean "this app has no effects of its own" — the
     /// built-ins are unaffected either way.
     pub(crate) fn dynamic_effects() -> Vec<DynamicEffect> {

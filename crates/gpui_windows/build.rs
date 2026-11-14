@@ -8,7 +8,7 @@ fn main() {
     // Native D3D12 builds SM5.1 bytecode in both profiles. The source directory
     // remains available for reference-compilation tests and legacy effects.
     let effects_generated = effects_generated_dir();
-    println!("cargo:rerun-if-env-changed=VN_EFFECTS_GENERATED_DIR");
+    println!("cargo:rerun-if-env-changed=SK_EFFECTS_GENERATED_DIR");
     println!(
         "cargo:rustc-env=GPUI_D3D12_EFFECTS_HLSL_DIR={}",
         effects_generated.display()
@@ -38,9 +38,9 @@ fn main() {
 
 fn effects_generated_dir() -> std::path::PathBuf {
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let generated = match std::env::var("VN_EFFECTS_GENERATED_DIR") {
+    let generated = match std::env::var("SK_EFFECTS_GENERATED_DIR") {
         Ok(directory) => std::path::PathBuf::from(directory),
-        Err(_) => manifest_dir.join("../../../../crates/vn-effects/generated"),
+        Err(_) => manifest_dir.join("../../../../crates/sk-effects/generated"),
     };
     // include_str! resolves relative names beside its Rust source, whereas
     // fxc runs from CARGO_MANIFEST_DIR. Make the shared contract absolute.
@@ -114,7 +114,7 @@ mod shader_compilation {
     ///   engine-owned HLSL shared by every effect (`src/effects.hlsl`) —
     ///   `SV_ClipDistance` cannot be authored in Slang, see that file. The
     ///   fragment stage is the checked-in slangc output living next to its
-    ///   `.slang` source under `crates/vn-effects/generated/`, which is what
+    ///   `.slang` source under `crates/sk-effects/generated/`, which is what
     ///   keeps `cargo build` free of any dependency on slangc.
     #[cfg(not(debug_assertions))]
     fn compile_effect_shaders(out_dir: &str, fxc_path: &str, rust_binding_path: &str) {
@@ -140,8 +140,8 @@ mod shader_compilation {
             println!("cargo:rerun-if-changed={}", source.display());
             if !source.exists() {
                 println!(
-                    "cargo::error=missing generated effect shader {} — run `bun shaders.ts` in \
-                     packages/vue-native, or point VN_EFFECTS_GENERATED_DIR at the directory",
+                    "cargo::error=missing generated effect shader {} — run `bun run shaders` at the \
+                     SDK root, or point SK_EFFECTS_GENERATED_DIR at the directory",
                     source.display()
                 );
                 process::exit(1);

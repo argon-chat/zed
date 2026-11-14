@@ -8,7 +8,7 @@
 **  Dual-Kawase pyramid, per-group re-snapshot, replace blend).
 **
 **  WHY THIS FILE EXISTS AT ALL — i.e. why the vertex stage is not authored in
-**  Slang like everything else under crates/vn-effects/shaders:
+**  Slang like everything else under crates/sk-effects/shaders:
 **
 **    gpui clips every primitive with `float4 clip_distance : SV_ClipDistance`.
 **    Slang rejects that outright:
@@ -66,7 +66,7 @@ struct Corners {
 
 // Keep in sync with Rust `EffectQuad` (crates/gpui/src/scene.rs) and with
 // `struct VnEffectQuad` in the generated fragment wrapper
-// (packages/vue-native/shaders.ts). 32 words / 128 bytes.
+// (scripts/shaders.ts). 32 words / 128 bytes.
 //
 // The whole struct is declared even though the vertex stage reads only three
 // fields: D3D11 validates a StructuredBuffer's declared stride against the

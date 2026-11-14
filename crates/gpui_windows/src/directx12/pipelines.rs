@@ -191,7 +191,7 @@ impl Pipelines {
             cache: Vec::new(),
             warmed: Arc::default(),
             dynamic_effects: shader_resources::dynamic_effects(),
-            timings: std::env::var_os("VN_DX12_TIMINGS").is_some_and(|value| value == "1"),
+            timings: std::env::var_os("SK_DX12_TIMINGS").is_some_and(|value| value == "1"),
         })
     }
 

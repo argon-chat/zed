@@ -99,7 +99,7 @@ impl Device {
     pub(super) fn new() -> Result<Arc<Self>> {
         let dxgi_factory: IDXGIFactory6 =
             unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
-        let wanted = std::env::var("VN_ADAPTER")
+        let wanted = std::env::var("SK_ADAPTER")
             .unwrap_or_default()
             .trim()
             .to_lowercase();
@@ -129,12 +129,12 @@ impl Device {
                 candidates.retain(|(_, name, _, _)| name.to_lowercase().contains(&wanted));
             } else {
                 log::warn!(
-                    "VN_ADAPTER={wanted:?} matches no D3D12 adapter; using automatic selection"
+                    "SK_ADAPTER={wanted:?} matches no D3D12 adapter; using automatic selection"
                 );
             }
         }
         // Never silently replace GPU rendering with Microsoft's software
-        // adapter. An explicit VN_ADAPTER remains useful for WARP fixtures.
+        // adapter. An explicit SK_ADAPTER remains useful for WARP fixtures.
         //
         // A machine that lists no hardware adapter at all (a VM without a GPU,
         // a basic-display RDP host) has nothing to replace, and the caller
