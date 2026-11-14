@@ -1198,6 +1198,7 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    #[cfg(feature = "native-dx12")]
     fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
         self.state.renderer.borrow().vn_composition_underlay()
     }
