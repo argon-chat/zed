@@ -365,6 +365,44 @@ pub(crate) fn draw_in_progress() -> bool {
     CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
 
+/// vue-native fork: how a window's frame request went, for an embedder's frame meter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The window was drawn and presented.
+    Drew,
+    /// Next-frame callbacks ran (or a present), with nothing to redraw.
+    NoDraw,
+    /// Held back by the frame-rate limit: an inactive window, low power or thermal state.
+    Throttled,
+}
+
+/// One frame request: `started..ended` is the time it took on this thread.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameWork {
+    /// The window whose frame this was.
+    pub window_id: WindowId,
+    /// When the request began.
+    pub started: Instant,
+    /// When it finished, presented or not.
+    pub ended: Instant,
+    /// What the request did.
+    pub outcome: FrameOutcome,
+}
+
+static FRAME_OBSERVER: std::sync::OnceLock<fn(FrameWork)> = std::sync::OnceLock::new();
+
+/// vue-native fork: `observer` hears about every frame request that did work or was throttled.
+/// The first call wins.
+pub fn observe_frames(observer: fn(FrameWork)) {
+    let _ = FRAME_OBSERVER.set(observer);
+}
+
+fn report_frame(window_id: WindowId, started: Instant, outcome: FrameOutcome) {
+    if let Some(observer) = FRAME_OBSERVER.get() {
+        observer(FrameWork { window_id, started, ended: Instant::now(), outcome });
+    }
+}
+
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
 #[inline(always)]
@@ -2378,6 +2416,7 @@ impl Window {
                             profiler::journal::FrameSkipReason::ThermalFrameRateLimit
                         },
                     );
+                    report_frame(handle.window_id(), now, FrameOutcome::Throttled);
                     return;
                 }
 
@@ -2468,6 +2507,11 @@ impl Window {
                         Instant::now(),
                         profiler::journal::FrameSkipReason::NoRenderNeeded,
                     );
+                }
+                if should_draw {
+                    report_frame(handle.window_id(), now, FrameOutcome::Drew);
+                } else if has_next_frame_callbacks || needs_present {
+                    report_frame(handle.window_id(), now, FrameOutcome::NoDraw);
                 }
             }
         }));
