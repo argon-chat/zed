@@ -1,4 +1,5 @@
 mod backdrop;
+mod vn_effect;
 mod vn_layer;
 
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
@@ -198,6 +199,7 @@ struct GroupDraw<'a> {
     scene: &'a Scene,
     instances: &'a InstanceBindings,
     layers: Option<&'a InstanceBinding>,
+    effects: &'a vn_effect::VnEffectFrame,
 }
 
 struct WgpuBindGroupLayouts {
@@ -1574,8 +1576,9 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
+        let effects = self.prepare_vn_effects(scene);
         let instance_bindings = self
-            .write_instances(scene, &mut instance_offset)
+            .write_instances(scene, effects.effect_quads(scene), &mut instance_offset)
             .with_context(|| {
                 format!(
                     "scene too large: {} paths, {} shadows, {} quads, {} backdrop blur rects, {} effect quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -1605,6 +1608,7 @@ impl WgpuRendererCore {
             scene,
             instances: &instance_bindings,
             layers: layers.as_ref(),
+            effects: &effects,
         };
         self.draw_group(
             &draw,
@@ -1616,6 +1620,7 @@ impl WgpuRendererCore {
             &mut instance_offset,
         )?;
         self.finish_vn_layers();
+        self.finish_vn_effects();
         self.finish_frame_target(&mut encoder, &frame);
 
         let submission = self
@@ -1793,6 +1798,7 @@ impl WgpuRendererCore {
     fn write_instances(
         &mut self,
         scene: &Scene,
+        effect_quads: &[gpui::EffectQuad],
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
         Ok(InstanceBindings {
@@ -1814,7 +1820,7 @@ impl WgpuRendererCore {
             effect_quads: self.write_instance_binding(
                 "effect_quads_bind_group",
                 instance_offset,
-                &scene.effect_quads,
+                effect_quads,
             )?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",

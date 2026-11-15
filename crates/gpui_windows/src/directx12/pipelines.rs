@@ -13,7 +13,9 @@ use anyhow::{Context as _, Result, bail, ensure};
 use windows::Win32::Graphics::{
     Direct3D::ID3DBlob,
     Direct3D12::*,
-    Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
+    Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    },
 };
 #[cfg(test)]
 use windows::{
@@ -32,6 +34,11 @@ pub(super) const ROOT_INSTANCES: u32 = 2;
 pub(super) const ROOT_CLIP_SEGMENTS: u32 = 3;
 pub(super) const ROOT_TEXT_BACKGROUNDS: u32 = 4;
 pub(super) const ROOT_TEXTURES: u32 = 5;
+/// The descriptors in a [`ROOT_TEXTURES`] table: t0, t2, and an effect
+/// layer's content and history at t7 and t8.
+pub(super) const TABLE_TEXTURES: usize = 4;
+/// `[SkHistory]` state textures.
+pub(super) const HISTORY_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 #[cfg(test)]
 const ALPHA_CORRECTION: &str = include_str!("../alpha_correction.hlsl");
@@ -70,6 +77,10 @@ enum PipelineKind {
     AppEffect(u64),
     /// vue-native: `gpui::effect_id::PUNCH` — erases its quad (see [`PUNCH_FRAGMENT`]).
     Punch,
+    /// vue-native: `gpui::effect_id::CONTENT` — an effect layer's content as it is.
+    Content,
+    /// vue-native: an app effect's `[SkHistory]` step, blending off.
+    AppHistory(u64),
 }
 
 /// vue-native: an app effect's fragment stage, compiled when the app's effects
@@ -79,6 +90,7 @@ struct AppFragment {
     id: u64,
     bytecode: Vec<u8>,
     needs_backdrop: bool,
+    history: bool,
 }
 
 /// vue-native: the fragment stage of the punch. It shares the effects' vertex
@@ -126,24 +138,44 @@ float4 punch_fragment(nointerpolation uint effect_quad_id: TEXCOORD0, float4 pos
 }
 "#;
 
+/// vue-native: the fragment stage of `gpui::effect_id::CONTENT`, in the
+/// effects' vertex source.
+const CONTENT_FRAGMENT: &str = concat!(
+    "#define SK_CONTENT_FRAGMENT\n",
+    include_str!("../effects.hlsl")
+);
+
 /// vue-native: compiles [`PUNCH_FRAGMENT`]. At first use, like an app's own
 /// effect: it is needed only by a window that shows an `<iframe>`.
 fn compile_punch() -> Result<Vec<u8>> {
+    compile_fragment(PUNCH_FRAGMENT, c"gpui-d3d12-punch", c"punch_fragment")
+}
+
+/// vue-native: compiles [`CONTENT_FRAGMENT`], at the first effect layer.
+fn compile_content() -> Result<Vec<u8>> {
+    compile_fragment(CONTENT_FRAGMENT, c"gpui-d3d12-content", c"content_fragment")
+}
+
+fn compile_fragment(
+    source: &str,
+    name: &std::ffi::CStr,
+    entry: &std::ffi::CStr,
+) -> Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::{
         Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
         ID3DInclude,
     };
-    use windows::core::s;
+    use windows::core::{PCSTR, s};
     let mut bytecode = None;
     let mut diagnostic = None;
     let result = unsafe {
         D3DCompile(
-            PUNCH_FRAGMENT.as_ptr().cast(),
-            PUNCH_FRAGMENT.len(),
-            s!("gpui-d3d12-punch"),
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR(name.as_ptr().cast()),
             None,
             None::<&ID3DInclude>,
-            s!("punch_fragment"),
+            PCSTR(entry.as_ptr().cast()),
             s!("ps_5_1"),
             D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
             0,
@@ -153,7 +185,8 @@ fn compile_punch() -> Result<Vec<u8>> {
     };
     if let Err(error) = result {
         bail!(
-            "Compiling the D3D12 punch shader: {error}; {}",
+            "Compiling the D3D12 shader {}: {error}; {}",
+            entry.to_string_lossy(),
             diagnostic.as_ref().map(blob_message).unwrap_or_default()
         );
     }
@@ -263,6 +296,8 @@ impl Pipelines {
     ) -> Result<Option<(ID3D12PipelineState, bool)>> {
         let (kind, backdrop) = if index == gpui::effect_id::PUNCH {
             (PipelineKind::Punch, false)
+        } else if index == gpui::effect_id::CONTENT {
+            (PipelineKind::Content, false)
         } else if let Some(effect) = EffectShader::ALL.get(index as usize) {
             (
                 PipelineKind::Primitive(ShaderModule::Effect(*effect)),
@@ -287,6 +322,28 @@ impl Pipelines {
             samples: sample_count,
         })?;
         Ok(Some((state, backdrop)))
+    }
+
+    /// The `[SkHistory]` step of app effect `index`, drawn into a
+    /// [`HISTORY_FORMAT`] texture; None for an effect without history. Valid
+    /// after [`Self::effect`] synced the app's effects this frame.
+    pub fn history(&mut self, index: u32) -> Result<Option<ID3D12PipelineState>> {
+        let Some(app_index) = (index as usize).checked_sub(EffectShader::ALL.len()) else {
+            return Ok(None);
+        };
+        let Some(fragment) = self.app_effects.get(app_index) else {
+            return Ok(None);
+        };
+        if !fragment.history {
+            return Ok(None);
+        }
+        let kind = PipelineKind::AppHistory(fragment.id);
+        self.get(PipelineKey {
+            kind,
+            format: HISTORY_FORMAT,
+            samples: 1,
+        })
+        .map(Some)
     }
 
     /// Catches up with `gpui::reload_app_effects`. Each changed effect is
@@ -330,10 +387,30 @@ impl Pipelines {
                 },
                 state,
             });
+            if effect.history {
+                let state = create_pipeline(
+                    device,
+                    root_signature,
+                    embedded::effect_vertex(),
+                    &bytecode,
+                    HISTORY_FORMAT,
+                    1,
+                    Blend::Replace,
+                )?;
+                cache.push(CachedPipeline {
+                    key: PipelineKey {
+                        kind: PipelineKind::AppHistory(id),
+                        format: HISTORY_FORMAT,
+                        samples: 1,
+                    },
+                    state,
+                });
+            }
             Ok(AppFragment {
                 id,
                 bytecode,
                 needs_backdrop: effect.needs_backdrop,
+                history: effect.history,
             })
         });
         if synced {
@@ -342,7 +419,7 @@ impl Pipelines {
                 .map(|fragment| fragment.id)
                 .collect();
             cache.retain(|cached| match cached.key.kind {
-                PipelineKind::AppEffect(id) => live.contains(&id),
+                PipelineKind::AppEffect(id) | PipelineKind::AppHistory(id) => live.contains(&id),
                 _ => true,
             });
         }
@@ -384,16 +461,25 @@ impl Pipelines {
                 Cow::Owned(compile_punch()?),
                 Blend::DestinationOut,
             ),
-            PipelineKind::AppEffect(id) => {
+            PipelineKind::Content => (
+                Cow::Borrowed(embedded::effect_vertex()),
+                Cow::Owned(compile_content()?),
+                Blend::Premultiplied,
+            ),
+            PipelineKind::AppEffect(id) | PipelineKind::AppHistory(id) => {
                 let fragment = self
                     .app_effects
                     .pipelines()
                     .find(|fragment| fragment.id == id)
                     .context("D3D12 app effect was replaced")?;
+                let blend = match key.kind {
+                    PipelineKind::AppHistory(_) => Blend::Replace,
+                    _ => app_effect_blend(fragment.needs_backdrop),
+                };
                 (
                     Cow::Borrowed(embedded::effect_vertex()),
                     Cow::Borrowed(fragment.bytecode.as_slice()),
-                    app_effect_blend(fragment.needs_backdrop),
+                    blend,
                 )
             }
         };
@@ -440,6 +526,13 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
             BaseShaderRegister: 2,
             RegisterSpace: 0,
             OffsetInDescriptorsFromTableStart: 1,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 2,
+            BaseShaderRegister: 7,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 2,
         },
     ];
     let descriptor = |kind, register| D3D12_ROOT_PARAMETER {

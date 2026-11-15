@@ -63,6 +63,12 @@ pub struct Scene {
     /// shape. After [`Scene::finish`] every vector above holds the root group
     /// first and then each isolated group's, in [`Scene::vn_group_ranges`].
     pub vn_layers: Vec<VnLayer>,
+    /// vue-native fork: beside each of [`Scene::vn_layers`], the effects that
+    /// composite it instead of its clip shape.
+    pub vn_layer_effects: Vec<Option<VnEffectLayer>>,
+    /// vue-native fork: the quads every [`VnEffectLayer`] draws, in no group's
+    /// order (a layer names its run).
+    pub vn_effect_draws: Vec<VnEffectDraw>,
     /// vue-native fork: every isolated layer's clip edges, `[x0, y0, x1, y1]`
     /// in device pixels; a [`VnLayer`] names its run.
     pub vn_clip_segments: Vec<[f32; 4]>,
@@ -158,6 +164,42 @@ pub struct VnLayer {
     pub content_mask: ContentMask<ScaledPixels>,
 }
 
+/// vue-native fork: one `--shading` quad of a [`VnEffectLayer`], with the key
+/// of its history (0 for none).
+#[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)]
+pub struct VnEffectDraw {
+    pub quad: EffectQuad,
+    pub history: u64,
+}
+
+/// vue-native fork: a [`VnLayer`] composited by its [`Scene::vn_effect_draws`]
+/// in order, each reading the layer's group (none when it is 0) as content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct VnEffectLayer {
+    pub start: u32,
+    pub count: u32,
+}
+
+impl VnEffectLayer {
+    /// The indices of its draws in [`Scene::vn_effect_draws`].
+    pub fn draws(&self) -> Range<usize> {
+        self.start as usize..(self.start + self.count) as usize
+    }
+}
+
+/// vue-native fork: what [`Scene::vn_push_effect`] opens: the quads that
+/// composite what is painted until the matching [`Scene::vn_pop_isolation`].
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct VnEffectPaint {
+    pub draws: Vec<VnEffectDraw>,
+    /// Whether the draws read what is painted inside; without, nothing is.
+    pub content: bool,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
 /// vue-native fork: what the renderer iterates for one group: runs of
 /// primitives as before, and runs of [`VnLayer`] composites.
 #[derive(Debug)]
@@ -202,6 +244,7 @@ struct VnGroupLists {
     polychrome_sprites: Vec<PolychromeSprite>,
     surfaces: Vec<PaintSurface>,
     vn_layers: Vec<VnLayer>,
+    vn_layer_effects: Vec<Option<VnEffectLayer>>,
 }
 
 impl VnGroupLists {
@@ -239,7 +282,16 @@ impl VnGroupLists {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
-        self.vn_layers.sort_by_key(|layer| layer.order);
+        if self.vn_layer_effects.iter().any(Option::is_some) {
+            let mut layers: Vec<_> = mem::take(&mut self.vn_layers)
+                .into_iter()
+                .zip(mem::take(&mut self.vn_layer_effects))
+                .collect();
+            layers.sort_by_key(|(layer, _)| layer.order);
+            (self.vn_layers, self.vn_layer_effects) = layers.into_iter().unzip();
+        } else {
+            self.vn_layers.sort_by_key(|layer| layer.order);
+        }
     }
 }
 
@@ -248,12 +300,14 @@ enum VnIsolationIdentity {
     Matrix(u64),
     Text(u64),
     Clip(usize),
+    Effect(usize),
 }
 
 struct VnOpenGroup {
     /// The lists of the group around this one.
     saved: VnGroupLists,
     isolation: VnIsolation,
+    effect: Option<VnEffectPaint>,
     existing_group: Option<usize>,
     shared_key: Option<(bool, u64, usize)>,
     context: usize,
@@ -284,6 +338,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.vn_layers.clear();
+        self.vn_layer_effects.clear();
+        self.vn_effect_draws.clear();
         self.vn_clip_segments.clear();
         self.vn_text_backgrounds.clear();
         self.vn_open.clear();
@@ -309,6 +365,7 @@ impl Scene {
         mem::swap(&mut self.polychrome_sprites, &mut lists.polychrome_sprites);
         mem::swap(&mut self.surfaces, &mut lists.surfaces);
         mem::swap(&mut self.vn_layers, &mut lists.vn_layers);
+        mem::swap(&mut self.vn_layer_effects, &mut lists.vn_layer_effects);
     }
 
     /// vue-native fork: opens an isolated layer. Every primitive inserted
@@ -335,7 +392,47 @@ impl Scene {
             let mut source = mem::take(&mut self.vn_groups[index]);
             self.vn_swap_lists(&mut source);
         }
-        self.vn_open.push(VnOpenGroup { saved, isolation, existing_group, shared_key, context });
+        self.vn_open.push(VnOpenGroup {
+            saved,
+            isolation,
+            effect: None,
+            existing_group,
+            shared_key,
+            context,
+        });
+    }
+
+    /// vue-native fork: opens the group `effect`'s draws read as their content;
+    /// the matching [`Scene::vn_pop_isolation`] inserts them as one [`VnEffectLayer`].
+    pub fn vn_push_effect(&mut self, effect: VnEffectPaint) {
+        self.paint_operations
+            .push(PaintOperation::VnStartEffect(effect.clone()));
+        let mut saved = VnGroupLists::default();
+        self.vn_swap_lists(&mut saved);
+        let next_context = self.vn_contexts.len() + 1;
+        let parent_context = self.vn_open.last().map_or(0, |group| group.context);
+        let context = *self
+            .vn_contexts
+            .entry((parent_context, VnIsolationIdentity::Effect(next_context)))
+            .or_insert(next_context);
+        let isolation = VnIsolation {
+            geometry: std::sync::Arc::new(crate::VnClipGeometry {
+                fill_rule: crate::VnFillRule::NonZero,
+                segments: Vec::new(),
+                bounds: effect.content_mask.bounds,
+            }),
+            color_matrix: None,
+            text_paint: None,
+            content_mask: effect.content_mask,
+        };
+        self.vn_open.push(VnOpenGroup {
+            saved,
+            isolation,
+            effect: Some(effect),
+            existing_group: None,
+            shared_key: None,
+            context,
+        });
     }
 
     /// vue-native fork: whether an isolated layer is open.
@@ -356,6 +453,10 @@ impl Scene {
         };
         let mut group = open.saved;
         self.vn_swap_lists(&mut group);
+        if let Some(effect) = open.effect {
+            self.vn_close_effect(group, effect);
+            return;
+        }
         if let Some(index) = open.existing_group {
             // Its composite was inserted on the first paint. Appending source
             // pixels here must neither filter them alone nor composite twice.
@@ -416,6 +517,66 @@ impl Scene {
             bounds,
             content_mask: mask,
         });
+        self.vn_layer_effects.push(None);
+    }
+
+    fn vn_close_effect(&mut self, mut group: VnGroupLists, effect: VnEffectPaint) {
+        let mask = effect.content_mask;
+        let Some(reach) = effect
+            .draws
+            .iter()
+            .map(|draw| draw.quad.bounds)
+            .reduce(|union, bounds| union.union(&bounds))
+        else {
+            return;
+        };
+        let bounds = Bounds::from_corners(
+            point(
+                ScaledPixels(reach.origin.x.0.floor()),
+                ScaledPixels(reach.origin.y.0.floor()),
+            ),
+            point(
+                ScaledPixels((reach.origin.x.0 + reach.size.width.0).ceil()),
+                ScaledPixels((reach.origin.y.0 + reach.size.height.0).ceil()),
+            ),
+        )
+        .intersect(&mask.bounds);
+        if bounds.is_empty() {
+            return;
+        }
+        let group_index = if effect.content && !group.is_empty() {
+            group.primitive_bounds = BoundsTree::default();
+            group.layer_stack = Vec::new();
+            self.vn_groups.push(group);
+            self.vn_groups.len() as u32
+        } else {
+            0
+        };
+        let snapshots = effect.draws.iter().any(|draw| draw.quad.needs_backdrop());
+        let order = self.order_for(snapshots, bounds);
+        let start = self.vn_effect_draws.len() as u32;
+        self.vn_effect_draws
+            .extend(effect.draws.iter().map(|draw| VnEffectDraw {
+                quad: EffectQuad { order, ..draw.quad },
+                history: draw.history,
+            }));
+        self.vn_layers.push(VnLayer {
+            order,
+            group: group_index,
+            bounds,
+            content_mask: mask,
+            ..Default::default()
+        });
+        self.vn_layer_effects.push(Some(VnEffectLayer {
+            start,
+            count: effect.draws.len() as u32,
+        }));
+    }
+
+    /// vue-native fork: the [`VnEffectLayer`] that composites
+    /// [`Scene::vn_layers`]`[index]`, if effects do.
+    pub fn vn_effect_layer(&self, index: usize) -> Option<VnEffectLayer> {
+        self.vn_layer_effects.get(index).copied().flatten()
     }
 
     /// vue-native fork: appends a closed group to the scene's vectors.
@@ -425,6 +586,7 @@ impl Scene {
             into.extend(from);
             start..into.len()
         }
+        append(&mut self.vn_layer_effects, group.vn_layer_effects);
         VnGroupRanges {
             shadows: append(&mut self.shadows, group.shadows),
             quads: append(&mut self.quads, group.quads),
@@ -487,7 +649,9 @@ impl Scene {
                         continue;
                     }
                     for layer in &self.vn_layers[range] {
-                        self.vn_flatten_into(layer.group as usize, depth + 1, out);
+                        if layer.group != 0 {
+                            self.vn_flatten_into(layer.group as usize, depth + 1, out);
+                        }
                     }
                 }
             }
@@ -592,6 +756,7 @@ impl Scene {
                 PaintOperation::VnStartIsolation(isolation) => {
                     self.vn_push_isolation(isolation.clone())
                 }
+                PaintOperation::VnStartEffect(effect) => self.vn_push_effect(effect.clone()),
                 PaintOperation::VnEndIsolation => self.vn_pop_isolation(),
             }
         }
@@ -678,6 +843,14 @@ impl Scene {
             Primitive::EffectQuad(effect_quad) => effect_quad.needs_backdrop(),
             _ => false,
         };
+        self.order_for(snapshots_backdrop, clipped_bounds)
+    }
+
+    fn order_for(
+        &mut self,
+        snapshots_backdrop: bool,
+        clipped_bounds: Bounds<ScaledPixels>,
+    ) -> DrawOrder {
         if !snapshots_backdrop {
             return self
                 .layer_stack
@@ -742,6 +915,8 @@ pub(crate) enum PaintOperation {
     EndLayer,
     /// vue-native fork: [`Scene::vn_push_isolation`].
     VnStartIsolation(VnIsolation),
+    /// vue-native fork: [`Scene::vn_push_effect`].
+    VnStartEffect(VnEffectPaint),
     /// vue-native fork: [`Scene::vn_pop_isolation`].
     VnEndIsolation,
 }
@@ -1378,6 +1553,11 @@ pub mod effect_id {
     /// under the window (an `<iframe>`'s webview) shows through there. See
     /// `Window::vn_paint_punch`. A renderer without it draws nothing.
     pub const PUNCH: u32 = u32::MAX - 1;
+    /// vue-native: not an effect a stylesheet can name. Draws the content an
+    /// [`super::VnEffectLayer`] reads as it is, at the quad's opacity: what
+    /// shows of the element while its `[SkContent]` effect fades in or out,
+    /// or when the effect cannot be drawn.
+    pub const CONTENT: u32 = u32::MAX - 2;
     /// The id an [`super::EffectSpec`] carries when CSS said `--shading: none`.
     /// A refinement has no way to spell "explicitly nothing", so — exactly as
     /// `backdrop-filter: none` maps to a 0px radius — clearing is a *value*.
@@ -1388,6 +1568,20 @@ pub mod effect_id {
 /// renderer must snapshot the render target, run the blur pyramid, bind t0/t2
 /// and draw with blending disabled.
 pub const EFFECT_FLAG_NEEDS_BACKDROP: u32 = 1;
+
+/// Bit 1 of [`EffectQuad::flags`]: the effect reads its element's painted
+/// subtree (`[SkContent]`), so the element paints into an isolated group the
+/// effect samples at t7 and composites in its place.
+pub const EFFECT_FLAG_NEEDS_CONTENT: u32 = 2;
+
+/// Bit 2 of [`EffectQuad::flags`]: the effect keeps its own state from frame
+/// to frame (`[SkHistory]`), at t8. A renderer clears it on a quad it has no
+/// history for, which then reads zeros.
+pub const EFFECT_FLAG_HISTORY: u32 = 4;
+
+/// Bit 3 of [`EffectQuad::flags`], set by the renderer only: this draw writes
+/// the next history state instead of the element's pixels.
+pub const EFFECT_FLAG_HISTORY_PASS: u32 = 8;
 
 /// CSS `transform`, as the cascade computed it, carried on [`crate::Style`]
 /// and turned into a [`TransformationMatrix`] at paint time by
@@ -1781,6 +1975,31 @@ impl EffectQuad {
     /// its draw ordering and whether the renderer has to break the pass.
     pub fn needs_backdrop(&self) -> bool {
         self.flags & EFFECT_FLAG_NEEDS_BACKDROP != 0
+    }
+
+    /// Whether this quad reads its element's content ([`EFFECT_FLAG_NEEDS_CONTENT`]).
+    pub fn needs_content(&self) -> bool {
+        self.flags & EFFECT_FLAG_NEEDS_CONTENT != 0
+    }
+
+    /// Whether this quad reads and steps a history ([`EFFECT_FLAG_HISTORY`]).
+    pub fn has_history(&self) -> bool {
+        self.flags & EFFECT_FLAG_HISTORY != 0
+    }
+
+    /// The device-pixel size of this quad's history texture.
+    pub fn history_size(&self) -> (u32, u32) {
+        let side = |value: f32| (value.round().max(1.)) as u32;
+        (
+            side(self.bounds.size.width.0),
+            side(self.bounds.size.height.0),
+        )
+    }
+
+    /// The copy a renderer draws into the history target to step it.
+    pub fn history_pass(mut self) -> Self {
+        self.flags = (self.flags & !EFFECT_FLAG_NEEDS_BACKDROP) | EFFECT_FLAG_HISTORY_PASS;
+        self
     }
 
     /// The clamped number of Dual-Kawase pyramid levels this quad's backdrop

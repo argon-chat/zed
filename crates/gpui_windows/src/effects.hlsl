@@ -120,8 +120,41 @@ EffectVertexOutput effect_vertex(uint vertex_id: SV_VertexID, uint instance_id: 
     float2 position = unit_vertex * effect_quad.bounds.size + effect_quad.bounds.origin;
 
     EffectVertexOutput output;
+    // `gpui::EFFECT_FLAG_HISTORY_PASS`: a history step covers its whole
+    // target, the quad's own texels.
+    if ((effect_quad.flags & 8u) != 0u) {
+        output.position = float4(unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+        output.effect_quad_id = effect_quad_id;
+        output.clip_distance = float4(1.0, 1.0, 1.0, 1.0);
+        return output;
+    }
     output.position = effect_to_device_position(position);
     output.effect_quad_id = effect_quad_id;
     output.clip_distance = effect_distance_from_clip_rect(position, effect_quad.content_mask);
     return output;
 }
+
+#ifdef SK_CONTENT_FRAGMENT
+Texture2D<float4> sk_content: register(t7);
+SamplerState clamp_sampler: register(s1);
+
+float content_mask_distance(float2 position, Bounds bounds, Corners radii) {
+    float2 half_size = bounds.size * 0.5;
+    float2 p = position - (bounds.origin + half_size);
+    float radius = p.x < 0.0
+        ? (p.y < 0.0 ? radii.top_left : radii.bottom_left)
+        : (p.y < 0.0 ? radii.top_right : radii.bottom_right);
+    radius = min(radius, min(half_size.x, half_size.y));
+    float2 q = abs(p) - half_size + radius;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+// `gpui::effect_id::CONTENT`: an effect layer's content as it is, at the
+// quad's opacity, cut by its content mask's rounded corners.
+float4 content_fragment(nointerpolation uint effect_quad_id: TEXCOORD0, float4 position: SV_Position): SV_Target {
+    EffectQuad quad = effect_quads[effect_quad_id];
+    float unmasked = saturate(0.5 - content_mask_distance(position.xy, quad.content_mask, quad.content_mask_radii));
+    float4 content = sk_content.SampleLevel(clamp_sampler, position.xy / global_viewport_size, 0.0);
+    return content * (quad.opacity * unmasked);
+}
+#endif

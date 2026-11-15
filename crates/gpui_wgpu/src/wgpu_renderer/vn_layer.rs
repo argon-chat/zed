@@ -13,7 +13,7 @@ use gpui::{Scene, VnLayer, VnTextBackground};
 use std::mem::size_of;
 
 /// Deeper groups draw inline, unclipped by their shape, as on DirectX.
-const MAX_DEPTH: usize = 8;
+pub(super) const MAX_DEPTH: usize = 8;
 
 /// Frames the layer targets may sit unused before release.
 const TARGET_RELEASE_FRAMES: u32 = 90;
@@ -116,6 +116,17 @@ impl WgpuRendererCore {
         frame: &FrameTarget,
         instance_offset: &mut u64,
     ) -> Result<()> {
+        if let Some(effect) = draw.scene.vn_effect_layer(index) {
+            return self.draw_vn_effect_layer(
+                draw,
+                index,
+                effect,
+                depth,
+                encoder,
+                frame,
+                instance_offset,
+            );
+        }
         let layer = draw.scene.vn_layers[index];
         let group = layer.group as usize;
         let Some(layers) = draw.layers else {
@@ -196,7 +207,7 @@ impl WgpuRendererCore {
 
     /// The target for `depth`, the frame's size; a backdrop drawn inside the
     /// group copies from it, so the group is its Backdrop Root.
-    fn vn_layer_target(&mut self, depth: usize, frame: &FrameTarget) -> FrameTarget {
+    pub(super) fn vn_layer_target(&mut self, depth: usize, frame: &FrameTarget) -> FrameTarget {
         let (width, height) = (frame.texture.width(), frame.texture.height());
         let state = &mut self.resources.vn_layers;
         if state.targets.first().is_some_and(|target| {

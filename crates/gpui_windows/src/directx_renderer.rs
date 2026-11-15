@@ -74,6 +74,36 @@ pub(crate) struct DirectXRenderer {
     /// vue-native fork: the target the batches draw into while an isolated
     /// layer's group draws (`draw_vn_layer`); `None` is the swap chain's.
     vn_target: Option<VnLayerTarget>,
+
+    /// vue-native fork: the `[SkHistory]` states, and this frame's effect
+    /// layer draws (`prepare_vn_effects`).
+    vn_histories: VnEffectHistories<HistoryTexture>,
+    vn_effects: VnEffectFrame,
+}
+
+/// vue-native fork: one `[SkHistory]` texture, RGBA 16-bit float.
+#[derive(Clone)]
+struct HistoryTexture {
+    _texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
+    srv: Option<ID3D11ShaderResourceView>,
+    viewport: D3D11_VIEWPORT,
+}
+
+/// vue-native fork: one frame's effect quads as uploaded: the scene's own,
+/// then one per `Scene::vn_effect_draws` entry, then the history steps.
+/// Empty when the scene has no effect layer.
+#[derive(Default)]
+struct VnEffectFrame {
+    quads: Vec<EffectQuad>,
+    histories: Vec<Option<DrawHistory>>,
+}
+
+struct DrawHistory {
+    read: HistoryTexture,
+    /// The texture this frame's step writes and the step's quad.
+    step: Option<(HistoryTexture, u32)>,
+    fresh: bool,
 }
 
 /// Direct3D objects
@@ -126,7 +156,9 @@ struct DirectXRenderPipelines {
     /// the whole renderer still comes up.
     effect_pipelines: Vec<Option<PipelineState<EffectQuad>>>,
     /// The app's own effects, `effect_id::COUNT` on.
-    app_effect_pipelines: AppEffectPipelines<PipelineState<EffectQuad>>,
+    app_effect_pipelines: AppEffectPipelines<AppEffectPipeline>,
+    /// `effect_id::CONTENT`, compiled the first time an effect layer draws.
+    content_pipeline: Option<Option<PipelineState<EffectQuad>>>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -138,6 +170,12 @@ struct DirectXRenderPipelines {
     vn_layer_pipeline: PipelineState<VnLayer>,
     vn_clip_segments: VnStructuredBuffer,
     vn_text_backgrounds: VnStructuredBuffer,
+}
+
+struct AppEffectPipeline {
+    shade: PipelineState<EffectQuad>,
+    /// `[SkHistory]`: the step, into a history texture with blending off.
+    history: Option<PipelineState<EffectQuad>>,
 }
 
 struct DirectXGlobalElements {
@@ -280,6 +318,8 @@ impl DirectXRenderer {
             skip_draws: false,
             present_no_wait: false,
             vn_target: None,
+            vn_histories: VnEffectHistories::default(),
+            vn_effects: VnEffectFrame::default(),
         })
     }
 
@@ -423,6 +463,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.vn_histories.clear();
         self.skip_draws = true;
         Ok(())
     }
@@ -458,6 +499,7 @@ impl DirectXRenderer {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
+        self.prepare_vn_effects(scene)?;
         self.upload_scene_buffers(scene)?;
 
         // vue-native fork: the root group, and through its composites every
@@ -465,6 +507,7 @@ impl DirectXRenderer {
         self.vn_target = None;
         let result = self.draw_vn_group(scene, 0, 0);
         self.vn_target = None;
+        self.vn_histories.finish_frame();
         result
     }
 
@@ -549,6 +592,9 @@ impl DirectXRenderer {
     /// content mask (`vn_layer_fragment`). A filter on the element's own
     /// painting would run on that target here, before the composite.
     fn draw_vn_layer(&mut self, scene: &Scene, index: usize, depth: usize) -> Result<()> {
+        if let Some(effect) = scene.vn_effect_layer(index) {
+            return self.draw_vn_effect_layer(scene, index, effect, depth);
+        }
         let layer = scene.vn_layers[index];
         if depth >= MAX_VN_LAYER_DEPTH {
             effects_advisory(&format!(
@@ -557,41 +603,9 @@ impl DirectXRenderer {
             ));
             return self.draw_vn_group(scene, layer.group as usize, depth);
         }
-        let target = self.vn_layer_target(depth)?;
-        let parent = self.vn_target.replace(target.clone());
-        {
-            let devices = self.devices.as_ref().context("devices missing")?;
-            unsafe {
-                unbind_shader_resources(&devices.device_context);
-                devices.device_context.ClearRenderTargetView(
-                    target.rtv.as_ref().context("missing layer render target view")?,
-                    &[0.0; 4],
-                );
-                devices
-                    .device_context
-                    .OMSetRenderTargets(Some(slice::from_ref(&target.rtv)), None);
-                if let Some(resources) = self.resources.as_ref() {
-                    devices
-                        .device_context
-                        .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
-                }
-            }
-        }
-        let drawn = self.draw_vn_group(scene, layer.group as usize, depth + 1);
-        self.vn_target = parent;
-        drawn?;
-
+        let target = self.draw_vn_group_offscreen(scene, layer.group as usize, depth)?;
+        self.bind_current_target()?;
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        unsafe {
-            unbind_shader_resources(&devices.device_context);
-            devices
-                .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
-            devices
-                .device_context
-                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
-        }
         let layer_texture = slice::from_ref(&target.srv);
         let segments = slice::from_ref(&self.pipelines.vn_clip_segments.view);
         let text_backgrounds = slice::from_ref(&self.pipelines.vn_text_backgrounds.view);
@@ -624,6 +638,221 @@ impl DirectXRenderer {
                 .push(create_vn_layer_target(&devices.device, self.width, self.height)?);
         }
         Ok(resources.vn_layer_targets[depth].clone())
+    }
+
+    /// vue-native fork: renders `group` (an element's subtree) into the
+    /// window-sized target of `depth`, cleared to transparent, and returns it;
+    /// what draws inside sees that target as its Backdrop Root. The current
+    /// target is left unbound.
+    fn draw_vn_group_offscreen(
+        &mut self,
+        scene: &Scene,
+        group: usize,
+        depth: usize,
+    ) -> Result<VnLayerTarget> {
+        let target = self.vn_layer_target(depth)?;
+        let parent = self.vn_target.replace(target.clone());
+        {
+            let devices = self.devices.as_ref().context("devices missing")?;
+            unsafe {
+                unbind_shader_resources(&devices.device_context);
+                devices.device_context.ClearRenderTargetView(
+                    target.rtv.as_ref().context("missing layer render target view")?,
+                    &[0.0; 4],
+                );
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&target.rtv)), None);
+                if let Some(resources) = self.resources.as_ref() {
+                    devices
+                        .device_context
+                        .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+                }
+            }
+        }
+        let drawn = self.draw_vn_group(scene, group, depth + 1);
+        self.vn_target = parent;
+        drawn?;
+        Ok(target)
+    }
+
+    /// vue-native fork: binds [`Self::target_view`] at the window's viewport,
+    /// with no texture left bound.
+    fn bind_current_target(&self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        unsafe {
+            unbind_shader_resources(&devices.device_context);
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(self.target_view()?)), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+        }
+        Ok(())
+    }
+
+    /// vue-native fork: this frame's effect layer quads and history steps
+    /// (`VnEffectFrame`).
+    fn prepare_vn_effects(&mut self, scene: &Scene) -> Result<()> {
+        let frame = &mut self.vn_effects;
+        frame.quads.clear();
+        frame.histories.clear();
+        if scene.vn_effect_draws.is_empty() || self.pipelines.effect_pipelines.is_empty() {
+            return Ok(());
+        }
+        let device = &self.devices.as_ref().context("devices missing")?.device;
+        self.pipelines.ensure_content_pipeline(device);
+        let first_step = scene.effect_quads.len() + scene.vn_effect_draws.len();
+        frame.quads.extend_from_slice(&scene.effect_quads);
+        let mut steps = Vec::new();
+        for draw in &scene.vn_effect_draws {
+            let mut quad = draw.quad;
+            let history =
+                if quad.has_history() && self.pipelines.history_effect(quad.effect_id).is_some() {
+                    self.vn_histories.prepare(
+                        draw.history,
+                        quad.history_size(),
+                        quad.time,
+                        |width, height| create_history_texture(device, width, height).log_err(),
+                    )
+                } else {
+                    None
+                };
+            if history.is_none() {
+                quad.flags &= !EFFECT_FLAG_HISTORY;
+            }
+            frame.quads.push(quad);
+            frame.histories.push(history.map(|history| DrawHistory {
+                read: history.read,
+                step: history.write.map(|write| {
+                    steps.push(quad.history_pass());
+                    (write, (first_step + steps.len() - 1) as u32)
+                }),
+                fresh: history.fresh,
+            }));
+        }
+        frame.quads.extend(steps);
+        Ok(())
+    }
+
+    /// vue-native fork: an effect layer. The group (when the effects read it)
+    /// draws offscreen; each history steps; then each effect draws over the
+    /// current target with the group at t7 and its history at t8.
+    fn draw_vn_effect_layer(
+        &mut self,
+        scene: &Scene,
+        index: usize,
+        effect: VnEffectLayer,
+        depth: usize,
+    ) -> Result<()> {
+        let group = scene.vn_layers[index].group as usize;
+        if self.vn_effects.quads.is_empty() || depth >= MAX_VN_LAYER_DEPTH {
+            if depth >= MAX_VN_LAYER_DEPTH {
+                effects_advisory(&format!(
+                    "`[SkContent]` effects nested more than {MAX_VN_LAYER_DEPTH} deep are not \
+                     drawn below that depth — the element paints unshaded"
+                ));
+            }
+            return match group {
+                0 => Ok(()),
+                group => self.draw_vn_group(scene, group, depth),
+            };
+        }
+        let content = match group {
+            0 => None,
+            group => self.draw_vn_group_offscreen(scene, group, depth)?.srv,
+        };
+        self.bind_current_target()?;
+
+        let base = scene.effect_quads.len();
+        for draw in effect.draws() {
+            let quad = self.vn_effects.quads[base + draw];
+            let history = self.vn_effects.histories[draw]
+                .as_ref()
+                .map(|history| (history.read.clone(), history.step.clone(), history.fresh));
+            let history_srv = history.as_ref().and_then(|(read, _, _)| read.srv.clone());
+            let layer = [
+                (7, slice::from_ref(&content)),
+                (8, slice::from_ref(&history_srv)),
+            ];
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let batch_params = self
+                .globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?;
+
+            if let Some((read, step, fresh)) = &history {
+                if *fresh && let Some(rtv) = &read.rtv {
+                    unsafe { devices.device_context.ClearRenderTargetView(rtv, &[0.0; 4]) };
+                }
+                if let Some((write, step)) = step
+                    && let Some(pipeline) = self.pipelines.history_effect(quad.effect_id)
+                {
+                    unsafe {
+                        unbind_shader_resources(&devices.device_context);
+                        devices
+                            .device_context
+                            .OMSetRenderTargets(Some(slice::from_ref(&write.rtv)), None);
+                        devices
+                            .device_context
+                            .RSSetViewports(Some(slice::from_ref(&write.viewport)));
+                    }
+                    pipeline.draw_range_with_texture_resources(
+                        &devices.device_context,
+                        None,
+                        &layer,
+                        batch_params,
+                        &self.samplers(),
+                        *step,
+                        1,
+                    )?;
+                    self.bind_current_target()?;
+                }
+            }
+
+            let instance = (base + draw) as u32;
+            // An effect whose pipeline did not build leaves its share to the
+            // content as it is.
+            let effect_id = match self.pipelines.effect(quad.effect_id) {
+                Some(_) => quad.effect_id,
+                None if quad.needs_content() => effect_id::CONTENT,
+                None => continue,
+            };
+            if quad.needs_backdrop() && effect_id == quad.effect_id {
+                self.ensure_backdrop_blur_resources()?;
+                let kernel_levels = quad.effective_kernel_levels() as usize;
+                self.copy_backdrop_blur_snapshot()?;
+                if kernel_levels > 0 {
+                    self.build_backdrop_blur_texture(kernel_levels)?;
+                }
+                self.composite_effect_quads(
+                    effect_id,
+                    instance as usize,
+                    1,
+                    kernel_levels,
+                    [&content, &history_srv],
+                )?;
+                continue;
+            }
+            let Some(pipeline) = self.pipelines.effect(effect_id) else {
+                continue;
+            };
+            let devices = self.devices.as_ref().context("devices missing")?;
+            pipeline.draw_range_with_texture_resources(
+                &devices.device_context,
+                None,
+                &layer,
+                batch_params,
+                &self.samplers(),
+                instance,
+                1,
+            )?;
+            unsafe { unbind_shader_resources(&devices.device_context) };
+        }
+        Ok(())
     }
 
     /// vue-native fork: the view the batches draw into now — an isolated
@@ -797,29 +1026,38 @@ impl DirectXRenderer {
             )?;
         }
 
-        if !scene.effect_quads.is_empty() {
+        // vue-native fork: with effect layers, the scene's quads and theirs.
+        let effect_quads = if self.vn_effects.quads.is_empty() {
+            &scene.effect_quads
+        } else {
+            &self.vn_effects.quads
+        };
+        if !effect_quads.is_empty() {
             // Every effect draws out of the SAME instance array — the batch
             // iterator only splits the *draw* on `effect_id`, and the vertex
             // shader indexes with `batch_start_index + SV_InstanceID`. Each
             // pipeline owns its own buffer, so upload to the ones this frame
             // actually uses and no further: a window with one frost panel must
             // not pay to upload the array three times.
-            let mut used: Vec<u32> = scene
-                .effect_quads
-                .iter()
-                .map(|quad| quad.effect_id)
-                .collect();
+            let mut used: Vec<u32> = effect_quads.iter().map(|quad| quad.effect_id).collect();
+            // The content pipeline also stands in for an effect that did not build.
+            if !self.vn_effects.quads.is_empty() {
+                used.push(effect_id::CONTENT);
+            }
             used.sort_unstable();
             used.dedup();
             for id in used {
+                if let Some(pipeline) = self.pipelines.history_effect_mut(id) {
+                    pipeline.update_buffer(
+                        &devices.device,
+                        &devices.device_context,
+                        effect_quads,
+                    )?;
+                }
                 let Some(pipeline) = self.pipelines.effect_mut(id) else {
                     continue;
                 };
-                pipeline.update_buffer(
-                    &devices.device,
-                    &devices.device_context,
-                    &scene.effect_quads,
-                )?;
+                pipeline.update_buffer(&devices.device, &devices.device_context, effect_quads)?;
             }
         }
 
@@ -1036,6 +1274,7 @@ impl DirectXRenderer {
                 start + group_start,
                 group_end - group_start,
                 kernel_levels,
+                [&None, &None],
             )?;
             group_start = group_end;
         }
@@ -1045,13 +1284,15 @@ impl DirectXRenderer {
 
     /// Binds the processed backdrop at t0 and the untouched snapshot at t2 —
     /// the same register contract the blur composite uses, which is exactly why
-    /// a Slang effect module drops into it with no renderer changes.
+    /// a Slang effect module drops into it with no renderer changes — and an
+    /// effect layer's content and history at t7 and t8.
     fn composite_effect_quads(
         &self,
         effect_id: u32,
         start: usize,
         len: usize,
         kernel_levels: usize,
+        [content, history]: [&Option<ID3D11ShaderResourceView>; 2],
     ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
@@ -1066,7 +1307,12 @@ impl DirectXRenderer {
         };
         let backdrop_texture = slice::from_ref(backdrop_texture);
         let original_texture = slice::from_ref(&blur_resources.snapshot_srv);
-        let fragment_textures = [(0, backdrop_texture), (2, original_texture)];
+        let fragment_textures = [
+            (0, backdrop_texture),
+            (2, original_texture),
+            (7, slice::from_ref(content)),
+            (8, slice::from_ref(history)),
+        ];
 
         unsafe {
             unbind_shader_resources(&devices.device_context);
@@ -1700,6 +1946,7 @@ impl DirectXRenderPipelines {
             blur_rect_pipeline,
             effect_pipelines,
             app_effect_pipelines: AppEffectPipelines::default(),
+            content_pipeline: None,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1726,18 +1973,136 @@ impl DirectXRenderPipelines {
 
     /// The pipeline `EffectQuad::effect_id` names: a built-in, then the app's.
     fn effect(&self, effect_id: u32) -> Option<&PipelineState<EffectQuad>> {
+        if effect_id == effect_id::CONTENT {
+            return self.content_pipeline.as_ref()?.as_ref();
+        }
         match effect_id.checked_sub(effect_id::COUNT) {
             None => self.effect_pipelines.get(effect_id as usize)?.as_ref(),
-            Some(index) => self.app_effect_pipelines.get(index as usize),
+            Some(index) => Some(&self.app_effect_pipelines.get(index as usize)?.shade),
         }
     }
 
     fn effect_mut(&mut self, effect_id: u32) -> Option<&mut PipelineState<EffectQuad>> {
+        if effect_id == effect_id::CONTENT {
+            return self.content_pipeline.as_mut()?.as_mut();
+        }
         match effect_id.checked_sub(effect_id::COUNT) {
             None => self.effect_pipelines.get_mut(effect_id as usize)?.as_mut(),
-            Some(index) => self.app_effect_pipelines.get_mut(index as usize),
+            Some(index) => Some(&mut self.app_effect_pipelines.get_mut(index as usize)?.shade),
         }
     }
+
+    /// The `[SkHistory]` step of app effect `effect_id`.
+    fn history_effect(&self, effect_id: u32) -> Option<&PipelineState<EffectQuad>> {
+        let index = effect_id.checked_sub(effect_id::COUNT)?;
+        self.app_effect_pipelines
+            .get(index as usize)?
+            .history
+            .as_ref()
+    }
+
+    fn history_effect_mut(&mut self, effect_id: u32) -> Option<&mut PipelineState<EffectQuad>> {
+        let index = effect_id.checked_sub(effect_id::COUNT)?;
+        self.app_effect_pipelines
+            .get_mut(index as usize)?
+            .history
+            .as_mut()
+    }
+
+    fn ensure_content_pipeline(&mut self, device: &ID3D11Device) {
+        if self.content_pipeline.is_none() {
+            self.content_pipeline = Some(
+                content_pipeline(device)
+                    .inspect_err(|error| {
+                        effects_advisory(&format!(
+                            "elements with an `[SkContent]` effect cannot cross-fade it — the \
+                             content pipeline failed to build: {error:#}"
+                        ))
+                    })
+                    .ok(),
+            );
+        }
+    }
+}
+
+/// vue-native fork: `effect_id::CONTENT`, an effect layer's content as it is.
+fn content_pipeline(device: &ID3D11Device) -> Result<PipelineState<EffectQuad>> {
+    let source = concat!(
+        "#define SK_CONTENT_FRAGMENT\n",
+        include_str!("effects.hlsl")
+    );
+    let vertex = RawShaderBytes::new(
+        ShaderModule::Effect(EffectShader::ALL[0]),
+        ShaderTarget::Vertex,
+    )?;
+    let fragment_blob = shader_resources::compile_hlsl_source(
+        source,
+        "effects.hlsl",
+        "content_fragment\0",
+        "ps_5_0\0",
+    )?;
+    // SAFETY: the blob owns this buffer and outlives the borrow.
+    let fragment = unsafe {
+        slice::from_raw_parts(
+            fragment_blob.GetBufferPointer() as *const u8,
+            fragment_blob.GetBufferSize(),
+        )
+    };
+    PipelineState::from_shaders(
+        device,
+        "effect_content_pipeline",
+        vertex.as_bytes(),
+        fragment,
+        8,
+        create_blend_state_for_path_sprite(device)?,
+    )
+}
+
+/// vue-native fork: an `[SkHistory]` texture, cleared before its first use.
+fn create_history_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<HistoryTexture> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.context("creating an effect history texture")?
+    };
+    let mut srv = None;
+    let mut rtv = None;
+    unsafe {
+        device.CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+        device.CreateRenderTargetView(&texture, None, Some(&mut rtv))?;
+    }
+    Ok(HistoryTexture {
+        _texture: texture,
+        rtv,
+        srv,
+        viewport: D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        },
+    })
 }
 
 fn effect_blend_state(device: &ID3D11Device, needs_backdrop: bool) -> Result<ID3D11BlendState> {
@@ -1758,7 +2123,7 @@ fn effect_blend_state(device: &ID3D11Device, needs_backdrop: bool) -> Result<ID3
 fn app_effect_pipeline(
     device: &ID3D11Device,
     effect: &gpui::AppEffect,
-) -> Result<PipelineState<EffectQuad>> {
+) -> Result<AppEffectPipeline> {
     let (file, source) = effect.hlsl.get("HLSL")?;
     let blend = effect_blend_state(device, effect.needs_backdrop)?;
     let vertex = RawShaderBytes::new(
@@ -1775,14 +2140,28 @@ fn app_effect_pipeline(
             fragment_blob.GetBufferSize(),
         )
     };
-    PipelineState::from_shaders(
+    let shade = PipelineState::from_shaders(
         device,
         "app_effect_pipeline",
         vertex.as_bytes(),
         fragment,
         8,
         blend,
-    )
+    )?;
+    let history = effect
+        .history
+        .then(|| {
+            PipelineState::from_shaders(
+                device,
+                "app_effect_history_pipeline",
+                vertex.as_bytes(),
+                fragment,
+                8,
+                create_blend_state_for_replace(device)?,
+            )
+        })
+        .transpose()?;
+    Ok(AppEffectPipeline { shade, history })
 }
 
 /// The built-in `--shading` pipelines in `gpui::effect_id` order; the index IS
@@ -2808,6 +3187,8 @@ unsafe fn unbind_shader_resources(device_context: &ID3D11DeviceContext) {
     unsafe {
         device_context.VSSetShaderResources(0, Some(&empty));
         device_context.PSSetShaderResources(0, Some(&empty));
+        // vue-native fork: an effect layer's content and history.
+        device_context.PSSetShaderResources(7, Some(&empty[..2]));
     }
 }
 
@@ -3417,5 +3798,293 @@ mod app_effect_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_effect_vertex_stage_and_the_content_fragment_compile() -> anyhow::Result<()> {
+        let source = concat!(
+            "#define SK_CONTENT_FRAGMENT\n",
+            include_str!("effects.hlsl")
+        );
+        for (vertex, fragment) in [("vs_5_0\0", "ps_5_0\0"), ("vs_5_1\0", "ps_5_1\0")] {
+            compile_hlsl_source(source, "effects.hlsl", "effect_vertex\0", vertex)?;
+            compile_hlsl_source(source, "effects.hlsl", "content_fragment\0", fragment)?;
+        }
+        Ok(())
+    }
+}
+
+/// vue-native fork: effect layers drawn by D3D11 (and, through the fixtures,
+/// by D3D12): the same effects as gpui_wgpu's tests.
+#[cfg(test)]
+pub(crate) mod effect_layer_tests {
+    use anyhow::Result;
+    use gpui::*;
+
+    /// `swap` shows its content with the channels rotated (green turns blue);
+    /// `count` shows the red of its history, and each step adds 0.25 to it.
+    const LAYER_EFFECTS_HLSL: &str = r#"
+        cbuffer GlobalParams: register(b0) {
+            float4 gamma_ratios;
+            float2 viewport_size;
+            float2 contrast;
+            uint4 pad;
+        };
+        struct Quad {
+            uint order;
+            uint effect_id;
+            float4 bounds;
+            float4 content_mask;
+            float4 content_mask_radii;
+            float4 corner_radii;
+            float params[32];
+            float opacity;
+            float time;
+            float bleed;
+            float backdrop_blur_radius;
+            float scale;
+            uint flags;
+        };
+        StructuredBuffer<Quad> quads: register(t1);
+        Texture2D<float4> content: register(t7);
+        Texture2D<float4> history: register(t8);
+        SamplerState clamp_sampler: register(s1);
+
+        float4 effect_fragment(nointerpolation uint id: TEXCOORD0, float4 position: SV_Position): SV_Target {
+            Quad quad = quads[id];
+            bool step = (quad.flags & 8u) != 0u;
+            float2 origin = quad.bounds.xy;
+            float2 p = step ? origin + position.xy : position.xy;
+            float4 last = float4(0.0, 0.0, 0.0, 0.0);
+            if ((quad.flags & 4u) != 0u) {
+                last = history.Load(int3(int2(p - origin), 0));
+            }
+            if (step) {
+                return last + float4(0.25, 0.0, 0.0, 0.0);
+            }
+            if ((quad.flags & 4u) != 0u) {
+                return float4(last.r, 0.0, 0.0, 1.0) * quad.opacity;
+            }
+            float4 shown = content.SampleLevel(clamp_sampler, p / viewport_size, 0.0);
+            return float4(shown.b, shown.r, shown.g, shown.a) * quad.opacity;
+        }
+    "#;
+
+    /// Installs `swap` as app effect 0 and `count` as app effect 1.
+    pub(crate) fn install_layer_effects() -> Result<()> {
+        reload_app_effects(
+            AppEffects::new(
+                "test",
+                r#"{"schema": 9, "effects": [
+                    {"name": "swap", "backdrop": false, "hlsl": "fx.hlsl"},
+                    {"name": "count", "backdrop": false, "history": true, "hlsl": "fx.hlsl"}
+                ]}"#,
+                [("fx.hlsl".to_string(), LAYER_EFFECTS_HLSL.to_string())],
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
+        Ok(())
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    pub(crate) fn layer_effect(
+        effect_id: u32,
+        area: Bounds<ScaledPixels>,
+        opacity: f32,
+        flags: u32,
+    ) -> EffectQuad {
+        EffectQuad {
+            effect_id,
+            bounds: area,
+            content_mask: ContentMask {
+                bounds: rect(0., 0., 64., 64.),
+                ..Default::default()
+            },
+            opacity,
+            scale: 1.,
+            flags,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(feature = "native-dx12"))]
+    mod d3d11 {
+        use super::*;
+        use crate::directx_renderer::*;
+        use std::sync::Arc;
+
+        /// A renderer drawing into a composition swap chain no window shows.
+        fn offscreen(width: u32, height: u32) -> Result<DirectXRenderer> {
+            let devices = DirectXRendererDevices::new(&crate::DirectXDevices::new()?, true)?;
+            let resources = DirectXResources::new(
+                &devices,
+                width,
+                height,
+                crate::HWND(std::ptr::null_mut()),
+                false,
+            )?;
+            Ok(DirectXRenderer {
+                hwnd: crate::HWND(std::ptr::null_mut()),
+                atlas: Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context)),
+                globals: DirectXGlobalElements::new(&devices.device)?,
+                pipelines: DirectXRenderPipelines::new(&devices.device)?,
+                devices: Some(devices),
+                resources: Some(resources),
+                direct_composition: None,
+                font_info: DirectXRenderer::get_font_info(),
+                width,
+                height,
+                skip_draws: false,
+                present_no_wait: false,
+                vn_target: None,
+                vn_histories: VnEffectHistories::default(),
+                vn_effects: VnEffectFrame::default(),
+            })
+        }
+
+        fn mask() -> ContentMask<ScaledPixels> {
+            ContentMask {
+                bounds: rect(0., 0., 64., 64.),
+                ..Default::default()
+            }
+        }
+
+        fn quad(area: Bounds<ScaledPixels>, color: Rgba) -> Quad {
+            Quad {
+                bounds: area,
+                background: color.into(),
+                content_mask: mask(),
+                ..Default::default()
+            }
+        }
+
+        fn close(actual: [u8; 4], expected: [u8; 4], what: &str) {
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(expected) <= 2),
+                "{what}: {actual:?}, expected {expected:?}"
+            );
+        }
+
+        #[::core::prelude::v1::test]
+        #[ignore = "requires a D3D11 adapter; run explicitly for renderer qualification"]
+        fn d3d11_content_effect_draws_its_element_in_its_place_and_cross_fades_with_it()
+        -> Result<()> {
+            install_layer_effects()?;
+            let scene = |draws: Vec<VnEffectDraw>| {
+                let mut scene = Scene::default();
+                scene.insert_primitive(quad(rect(0., 0., 64., 64.), rgb(0x000000)));
+                scene.vn_push_effect(VnEffectPaint {
+                    draws,
+                    content: true,
+                    content_mask: mask(),
+                });
+                scene.insert_primitive(quad(rect(16., 16., 32., 32.), rgb(0x00ff00)));
+                scene.insert_primitive(quad(rect(0., 0., 8., 8.), rgb(0xffffff)));
+                scene.vn_pop_isolation();
+                scene.finish();
+                scene
+            };
+            let swap = |opacity| VnEffectDraw {
+                quad: layer_effect(
+                    effect_id::COUNT,
+                    rect(16., 16., 32., 32.),
+                    opacity,
+                    EFFECT_FLAG_NEEDS_CONTENT,
+                ),
+                history: 0,
+            };
+            let mut renderer = offscreen(64, 64)?;
+            let transparent = WindowBackgroundAppearance::Transparent;
+            let image = renderer.render_to_image(&scene(vec![swap(1.)]), transparent)?;
+            assert_eq!(
+                image.get_pixel(32, 32).0,
+                [0, 0, 255, 255],
+                "the shaded box"
+            );
+            assert_eq!(
+                image.get_pixel(4, 4).0,
+                [0, 0, 0, 255],
+                "content outside the quad does not show"
+            );
+
+            let plain = VnEffectDraw {
+                quad: layer_effect(
+                    effect_id::CONTENT,
+                    rect(0., 0., 64., 64.),
+                    0.5,
+                    EFFECT_FLAG_NEEDS_CONTENT,
+                ),
+                history: 0,
+            };
+            let image = renderer.render_to_image(&scene(vec![plain, swap(0.5)]), transparent)?;
+            close(
+                image.get_pixel(32, 32).0,
+                [0, 64, 128, 255],
+                "the shaded half over the plain half",
+            );
+            close(
+                image.get_pixel(4, 4).0,
+                [128, 128, 128, 255],
+                "the plain half shows all of the content",
+            );
+            Ok(())
+        }
+
+        #[::core::prelude::v1::test]
+        #[ignore = "requires a D3D11 adapter; run explicitly for renderer qualification"]
+        fn d3d11_history_steps_at_most_at_the_step_rate_and_starts_over() -> Result<()> {
+            install_layer_effects()?;
+            let scene = |area: Bounds<ScaledPixels>, time: f32| {
+                let mut scene = Scene::default();
+                scene.insert_primitive(quad(rect(0., 0., 64., 64.), rgb(0x000000)));
+                scene.vn_push_effect(VnEffectPaint {
+                    draws: vec![VnEffectDraw {
+                        quad: EffectQuad {
+                            time,
+                            ..layer_effect(effect_id::COUNT + 1, area, 1., EFFECT_FLAG_HISTORY)
+                        },
+                        history: 7,
+                    }],
+                    content: false,
+                    content_mask: mask(),
+                });
+                scene.vn_pop_isolation();
+                scene.finish();
+                scene
+            };
+            let mut renderer = offscreen(64, 64)?;
+            let mut shows = |scene: Scene, red: u8, what: &str| -> Result<()> {
+                let image =
+                    renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                assert_eq!(image.get_pixel(8, 8).0, [0, 0, 0, 255], "outside the quad");
+                close(image.get_pixel(32, 32).0, [red, 0, 0, 255], what);
+                Ok(())
+            };
+            let area = rect(16., 16., 32., 32.);
+            shows(scene(area, 0.), 0, "starts at zero")?;
+            shows(scene(area, 1.), 64, "one step")?;
+            shows(scene(area, 1.001), 128, "two")?;
+            shows(scene(area, 1.002), 128, "too soon for a third")?;
+            shows(
+                scene(rect(16., 16., 30., 32.), 2.),
+                0,
+                "a new size starts over",
+            )?;
+            renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+            assert!(
+                renderer.vn_histories.is_empty(),
+                "a frame without it frees it"
+            );
+            Ok(())
+        }
     }
 }

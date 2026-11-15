@@ -3,8 +3,8 @@ use super::{
     atlas::{Atlas, AtlasTexture},
     device::{CommandStats, Device, KeepAlive, TextureLocation, transition},
     pipelines::{
-        Pipelines, ROOT_BATCH, ROOT_CLIP_SEGMENTS, ROOT_GLOBALS, ROOT_INSTANCES,
-        ROOT_TEXT_BACKGROUNDS, ROOT_TEXTURES,
+        HISTORY_FORMAT, Pipelines, ROOT_BATCH, ROOT_CLIP_SEGMENTS, ROOT_GLOBALS, ROOT_INSTANCES,
+        ROOT_TEXT_BACKGROUNDS, ROOT_TEXTURES, TABLE_TEXTURES,
     },
 };
 use crate::directx_renderer::{FontInfo, shader_resources::ShaderModule};
@@ -358,6 +358,7 @@ struct PathSprite {
 struct Target {
     resource: ID3D12Resource,
     rtv_heap: ID3D12DescriptorHeap,
+    format: DXGI_FORMAT,
     width: u32,
     height: u32,
     state: Mutex<D3D12_RESOURCE_STATES>,
@@ -366,6 +367,17 @@ impl Target {
     fn from_resource(
         device: &Device,
         resource: ID3D12Resource,
+        width: u32,
+        height: u32,
+        samples: u32,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Result<Arc<Self>> {
+        Self::from_resource_in(device, resource, FORMAT, width, height, samples, state)
+    }
+    fn from_resource_in(
+        device: &Device,
+        resource: ID3D12Resource,
+        format: DXGI_FORMAT,
         width: u32,
         height: u32,
         samples: u32,
@@ -382,7 +394,7 @@ impl Target {
                 })?
         };
         let descriptor = D3D12_RENDER_TARGET_VIEW_DESC {
-            Format: FORMAT,
+            Format: format,
             ViewDimension: if samples == 1 {
                 D3D12_RTV_DIMENSION_TEXTURE2D
             } else {
@@ -405,23 +417,34 @@ impl Target {
         Ok(Arc::new(Self {
             resource,
             rtv_heap,
+            format,
             width,
             height,
             state: Mutex::new(state),
         }))
     }
     fn new(device: &Device, width: u32, height: u32, samples: u32) -> Result<Arc<Self>> {
+        Self::new_in(device, FORMAT, width, height, samples)
+    }
+    fn new_in(
+        device: &Device,
+        format: DXGI_FORMAT,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> Result<Arc<Self>> {
         let resource = device.create_texture_multisampled(
             width,
             height,
-            FORMAT,
+            format,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             D3D12_RESOURCE_STATE_COMMON,
             samples,
         )?;
-        Self::from_resource(
+        Self::from_resource_in(
             device,
             resource,
+            format,
             width,
             height,
             samples,
@@ -448,7 +471,7 @@ impl Target {
     fn sampled(&self) -> AtlasTexture {
         AtlasTexture {
             resource: self.resource.clone(),
-            format: FORMAT,
+            format: self.format,
             width: self.width,
             height: self.height,
         }
@@ -575,7 +598,26 @@ pub(crate) struct DirectXRenderer {
     timings: Option<RendererTimings>,
     uploads: [UploadPool; BUFFERS],
     uploads_failed: bool,
+    /// vue-native: the `[SkHistory]` states.
+    histories: VnEffectHistories<Arc<Target>>,
 }
+
+/// vue-native: one frame's effect quads as uploaded: the scene's own, then one
+/// per `Scene::vn_effect_draws` entry, then the history steps. Empty when the
+/// scene has no effect layer.
+#[derive(Default)]
+struct VnEffectFrame {
+    quads: Vec<EffectQuad>,
+    histories: Vec<Option<DrawHistory>>,
+}
+
+struct DrawHistory {
+    read: Arc<Target>,
+    /// The texture this frame's step writes and the step's quad.
+    step: Option<(Arc<Target>, u32)>,
+    fresh: bool,
+}
+
 impl DirectXRenderer {
     /// vue-native: the composition device and the container drawn under the
     /// app's surface, each as an owned COM pointer (the caller releases them).
@@ -665,6 +707,7 @@ impl DirectXRenderer {
             timings: RendererTimings::from_environment(),
             uploads: std::array::from_fn(|_| UploadPool::default()),
             uploads_failed: false,
+            histories: VnEffectHistories::default(),
         })
     }
     fn buffers(
@@ -940,6 +983,7 @@ impl DirectXRenderer {
                     scene
                         .effect_quads
                         .iter()
+                        .chain(scene.vn_effect_draws.iter().map(|draw| &draw.quad))
                         .map(EffectQuad::effective_kernel_levels),
                 )
                 .max()
@@ -947,6 +991,7 @@ impl DirectXRenderer {
         } else {
             0
         };
+        let effects = self.prepare_vn_effects(scene)?;
         // The snapshot counts as one more level below the pyramid.
         let mut held = usize::from(self.snapshot.is_some()) + self.blur.len();
         let needed = if needs_backdrop { backdrop_levels + 1 } else { 0 };
@@ -977,7 +1022,12 @@ impl DirectXRenderer {
                 padding: [0; 3],
             }],
         )?;
-        let data = SceneBuffers::new(&gpu, &retained, uploads, scene)?;
+        let effect_quads = if effects.quads.is_empty() {
+            &scene.effect_quads
+        } else {
+            &effects.quads
+        };
+        let data = SceneBuffers::new(&gpu, &retained, uploads, scene, effect_quads)?;
         let upload_time = upload_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
@@ -1056,6 +1106,7 @@ impl DirectXRenderer {
                 bound: BoundState::default(),
                 clip: full_rect(self.width, self.height),
                 reads_backdrop: needs_backdrop,
+                effects: &effects,
             };
             encoding.bind_target(&target)?;
             let clear = if appearance == WindowBackgroundAppearance::Opaque {
@@ -1078,6 +1129,7 @@ impl DirectXRenderer {
         let submit_time = submit_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
+        self.histories.finish_frame();
         if result.is_ok() {
             changes.commit();
             if let Some(timings) = self.timings.as_mut() {
@@ -1134,12 +1186,16 @@ impl DirectXRenderer {
         }
         let mut needs_backdrop = !scene.backdrop_blur_rects.is_empty();
         let mut effects = HashSet::new();
-        for effect in &scene.effect_quads {
+        let layer_quads = scene.vn_effect_draws.iter().map(|draw| &draw.quad);
+        for effect in scene.effect_quads.iter().chain(layer_quads) {
             if effects.insert(effect.effect_id)
                 && let Some((_, backdrop)) = self.pipelines.effect(effect.effect_id, FORMAT, 1)?
             {
                 needs_backdrop |= backdrop;
             }
+        }
+        if !scene.vn_effect_draws.is_empty() {
+            self.pipelines.effect(effect_id::CONTENT, FORMAT, 1)?;
         }
         if needs_backdrop {
             self.pipelines
@@ -1148,6 +1204,53 @@ impl DirectXRenderer {
                 .pipeline(ShaderModule::BlurUpsample, FORMAT, 1)?;
         }
         Ok(needs_backdrop)
+    }
+    /// The frame's effect layer quads and history steps ([`VnEffectFrame`]),
+    /// after [`Self::prepare_pipelines`].
+    fn prepare_vn_effects(&mut self, scene: &Scene) -> Result<VnEffectFrame> {
+        let mut frame = VnEffectFrame::default();
+        if scene.vn_effect_draws.is_empty() {
+            return Ok(frame);
+        }
+        let first_step = scene.effect_quads.len() + scene.vn_effect_draws.len();
+        frame.quads.reserve(first_step);
+        frame.quads.extend_from_slice(&scene.effect_quads);
+        let mut steps = Vec::new();
+        for draw in &scene.vn_effect_draws {
+            let mut quad = draw.quad;
+            let history = if quad.has_history() && self.pipelines.history(quad.effect_id)?.is_some()
+            {
+                let gpu = &self.gpu;
+                self.histories.prepare(
+                    draw.history,
+                    quad.history_size(),
+                    quad.time,
+                    |width, height| {
+                        Target::new_in(gpu, HISTORY_FORMAT, width, height, 1)
+                            .inspect_err(|error| {
+                                log::error!("Creating a D3D12 effect history failed: {error:#}")
+                            })
+                            .ok()
+                    },
+                )
+            } else {
+                None
+            };
+            if history.is_none() {
+                quad.flags &= !EFFECT_FLAG_HISTORY;
+            }
+            frame.quads.push(quad);
+            frame.histories.push(history.map(|history| DrawHistory {
+                read: history.read,
+                step: history.write.map(|write| {
+                    steps.push(quad.history_pass());
+                    (write, (first_step + steps.len() - 1) as u32)
+                }),
+                fresh: history.fresh,
+            }));
+        }
+        frame.quads.extend(steps);
+        Ok(frame)
     }
     pub(crate) fn render_to_image(
         &mut self,
@@ -1364,6 +1467,10 @@ fn layer_depth(scene: &Scene, group: usize, depth: usize) -> Result<usize> {
                     .vn_layers
                     .get(index)
                     .context("D3D12 layer index is out of range")?;
+                // An effect layer that does not read its content draws no group.
+                if layer.group == 0 {
+                    continue;
+                }
                 required = required.max(layer_depth(scene, layer.group as usize, depth + 1)?);
             }
         }
@@ -1424,6 +1531,7 @@ impl SceneBuffers {
         retained: &Retained,
         uploads: &mut UploadPool,
         scene: &Scene,
+        effect_quads: &[EffectQuad],
     ) -> Result<Self> {
         let dummy = upload(gpu, retained, uploads, &[0u32; 64])?;
         Ok(Self {
@@ -1437,7 +1545,7 @@ impl SceneBuffers {
                 uploads,
                 &scene.backdrop_blur_rects,
             )?,
-            effects: upload_or_dummy(gpu, retained, dummy, uploads, &scene.effect_quads)?,
+            effects: upload_or_dummy(gpu, retained, dummy, uploads, effect_quads)?,
             underlines: upload_or_dummy(gpu, retained, dummy, uploads, &scene.underlines)?,
             mono: upload_or_dummy(gpu, retained, dummy, uploads, &scene.monochrome_sprites)?,
             subpixel: upload_or_dummy(gpu, retained, dummy, uploads, &scene.subpixel_sprites)?,
@@ -1464,8 +1572,8 @@ struct Descriptors {
     // Tables already written to the current page, keyed by the raw resource
     // pointers (0 for a null view). A view only names a resource; its pixels
     // are read when the GPU executes, so one table serves every batch that
-    // samples the same pair. Cleared with the page that holds them.
-    tables: HashMap<(usize, usize), D3D12_GPU_DESCRIPTOR_HANDLE>,
+    // samples the same textures. Cleared with the page that holds them.
+    tables: HashMap<[usize; TABLE_TEXTURES], D3D12_GPU_DESCRIPTOR_HANDLE>,
 }
 impl Descriptors {
     fn new(gpu: Arc<Device>, retained: Retained) -> Self {
@@ -1479,25 +1587,23 @@ impl Descriptors {
             tables: HashMap::new(),
         }
     }
-    /// Returns the table for this texture pair and whether the bound heap
-    /// changed, which invalidates the descriptor table bound before it.
+    /// Returns the table for these textures (t0, t2, t7, t8) and whether the
+    /// bound heap changed, which invalidates the descriptor table bound before it.
     fn textures(
         &mut self,
         list: &ID3D12GraphicsCommandList,
-        first: Option<&AtlasTexture>,
-        second: Option<&AtlasTexture>,
+        textures: [Option<&AtlasTexture>; TABLE_TEXTURES],
         uploads: &mut UploadPool,
         work: &mut RenderWork,
     ) -> Result<(D3D12_GPU_DESCRIPTOR_HANDLE, bool)> {
-        let key = (
-            first.map_or(0, |texture| texture.resource.as_raw() as usize),
-            second.map_or(0, |texture| texture.resource.as_raw() as usize),
-        );
+        let key =
+            textures.map(|texture| texture.map_or(0, |texture| texture.resource.as_raw() as usize));
         if let Some(table) = self.tables.get(&key) {
             return Ok((*table, false));
         }
+        let table_size = TABLE_TEXTURES as u32;
         let mut heap_changed = false;
-        if self.used + 2 > DESCRIPTORS_PER_PAGE {
+        if self.used + table_size > DESCRIPTORS_PER_PAGE {
             let heap = if let Some(heap) = uploads.descriptor_pages.get(self.next_page) {
                 work.descriptor_pages_reused += 1;
                 heap.clone()
@@ -1533,7 +1639,7 @@ impl Descriptors {
         let stride = self.stride;
         let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart() };
-        for (offset, texture) in [first, second].into_iter().enumerate() {
+        for (offset, texture) in textures.into_iter().enumerate() {
             let descriptor = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: texture.map_or(FORMAT, |texture| texture.format),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1563,7 +1669,7 @@ impl Descriptors {
         let table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: gpu.ptr + u64::from(self.used * stride),
         };
-        self.used += 2;
+        self.used += table_size;
         self.tables.insert(key, table);
         Ok((table, heap_changed))
     }
@@ -1611,6 +1717,7 @@ struct Encoding<'a> {
     /// the screen: the whole window, narrowed by each enclosing layer.
     clip: RECT,
     reads_backdrop: bool,
+    effects: &'a VnEffectFrame,
 }
 impl Encoding<'_> {
     /// Binds a window-sized target, scissored to the current clip.
@@ -1684,12 +1791,30 @@ impl Encoding<'_> {
         first: Option<&AtlasTexture>,
         second: Option<&AtlasTexture>,
     ) -> Result<()> {
+        self.draw_pipeline_textures(
+            pipeline,
+            buffer,
+            start,
+            count,
+            vertices,
+            [first, second, None, None],
+        )
+    }
+    fn draw_pipeline_textures(
+        &mut self,
+        pipeline: &ID3D12PipelineState,
+        buffer: GpuAddress,
+        start: u32,
+        count: u32,
+        vertices: u32,
+        textures: [Option<&AtlasTexture>; TABLE_TEXTURES],
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
         let (table, heap_changed) = self
             .descriptors
-            .textures(self.list, first, second, self.uploads, self.work)?;
+            .textures(self.list, textures, self.uploads, self.work)?;
         if heap_changed {
             self.bound.table = 0;
         }
@@ -1758,6 +1883,9 @@ impl Encoding<'_> {
             .vn_layers
             .get(index)
             .context("D3D12 layer index is out of range")?;
+        if let Some(effect) = self.scene.vn_effect_layer(index) {
+            return self.effect_layer(layer.group as usize, effect, depth);
+        }
         ensure!(
             depth < MAX_LAYER_DEPTH,
             "D3D12 isolated layer nesting exceeds {MAX_LAYER_DEPTH}"
@@ -1775,29 +1903,7 @@ impl Encoding<'_> {
         if is_empty(&clip) {
             return Ok(());
         }
-        while self.layers.len() <= depth {
-            self.layers
-                .push(Target::new(self.gpu, self.width, self.height, 1)?);
-        }
-        let target = self
-            .layers
-            .get(depth)
-            .context("D3D12 isolated layer missing")?
-            .clone();
-        let parent = self.target.clone();
-        self.target = target.clone();
-        self.clip = clip;
-        self.bind_target(&target)?;
-        unsafe {
-            self.list
-                .ClearRenderTargetView(target.rtv(), &[0.0; 4], Some(&[clip]));
-        }
-        let drawn = self.group(layer.group as usize, depth + 1);
-        self.clip = parent_clip;
-        drawn?;
-        self.target = parent.clone();
-        self.bind_target(&parent)?;
-        target.to(self.list, SHADER_READ, self.changes);
+        let target = self.draw_group_offscreen(layer.group as usize, depth, clip)?;
         let texture = target.sampled();
         let buffer = self.data.layers;
         self.draw(
@@ -1810,6 +1916,133 @@ impl Encoding<'_> {
             None,
             1,
         )
+    }
+    /// Renders `group` (an element's subtree) into the window-sized target
+    /// of `depth`, cleared to transparent within `clip` (window pixels) and
+    /// drawn only there, and returns it ready to sample; what draws inside
+    /// sees that target as its Backdrop Root. The current target is bound
+    /// again afterwards.
+    fn draw_group_offscreen(
+        &mut self,
+        group: usize,
+        depth: usize,
+        clip: RECT,
+    ) -> Result<Arc<Target>> {
+        ensure!(
+            depth < MAX_LAYER_DEPTH,
+            "D3D12 isolated layer nesting exceeds {MAX_LAYER_DEPTH}"
+        );
+        while self.layers.len() <= depth {
+            self.layers
+                .push(Target::new(self.gpu, self.width, self.height, 1)?);
+        }
+        let target = self
+            .layers
+            .get(depth)
+            .context("D3D12 isolated layer missing")?
+            .clone();
+        let parent = self.target.clone();
+        let parent_clip = self.clip;
+        self.target = target.clone();
+        self.clip = clip;
+        self.bind_target(&target)?;
+        unsafe {
+            self.list
+                .ClearRenderTargetView(target.rtv(), &[0.0; 4], Some(&[clip]));
+        }
+        let drawn = self.group(group, depth + 1);
+        self.clip = parent_clip;
+        self.target = parent.clone();
+        drawn?;
+        self.bind_target(&parent)?;
+        target.to(self.list, SHADER_READ, self.changes);
+        Ok(target)
+    }
+    /// An effect layer: the group (when its effects read it) offscreen, each
+    /// history's step, then each effect over the current target with the
+    /// group at t7 and its history at t8.
+    fn effect_layer(&mut self, group: usize, effect: VnEffectLayer, depth: usize) -> Result<()> {
+        let effects = self.effects;
+        let content = match group {
+            0 => None,
+            // An effect may sample its content anywhere in the window.
+            group => Some(
+                self.draw_group_offscreen(group, depth, self.clip)?
+                    .sampled(),
+            ),
+        };
+        let parent = self.target.clone();
+        let buffer = self.data.effects;
+        let base = self.scene.effect_quads.len();
+        for draw in effect.draws() {
+            let quad = *effects
+                .quads
+                .get(base + draw)
+                .context("D3D12 effect layer quad is out of range")?;
+            let history = effects.histories.get(draw).and_then(Option::as_ref);
+            let history_texture = history.map(|history| history.read.sampled());
+            if let Some(history) = history {
+                if history.fresh {
+                    history
+                        .read
+                        .to(self.list, D3D12_RESOURCE_STATE_RENDER_TARGET, self.changes);
+                    retain(&self.retained, history.read.clone());
+                    unsafe {
+                        self.list
+                            .ClearRenderTargetView(history.read.rtv(), &[0.0; 4], None);
+                    }
+                }
+                history.read.to(self.list, SHADER_READ, self.changes);
+                if let Some((write, step)) = &history.step
+                    && let Some(pipeline) = self.pipelines.history(quad.effect_id)?
+                {
+                    self.bind_target_rect(write, full_rect(write.width, write.height))?;
+                    self.draw_pipeline_textures(
+                        &pipeline,
+                        buffer,
+                        *step,
+                        1,
+                        4,
+                        [None, None, content.as_ref(), history_texture.as_ref()],
+                    )?;
+                    write.to(self.list, SHADER_READ, self.changes);
+                    self.bind_target(&parent)?;
+                }
+            }
+            // An effect whose pipeline did not build leaves its share to the
+            // content as it is.
+            let found = match self.pipelines.effect(quad.effect_id, FORMAT, 1)? {
+                Some(found) => Some(found),
+                None if quad.needs_content() => {
+                    self.pipelines.effect(effect_id::CONTENT, FORMAT, 1)?
+                }
+                None => None,
+            };
+            let Some((pipeline, backdrop)) = found else {
+                continue;
+            };
+            let (blurred, original) = if backdrop {
+                let levels = quad.effective_kernel_levels() as usize;
+                let (blurred, original) = self.backdrop(levels, None)?;
+                (Some(blurred), Some(original))
+            } else {
+                (None, None)
+            };
+            self.draw_pipeline_textures(
+                &pipeline,
+                buffer,
+                (base + draw) as u32,
+                1,
+                4,
+                [
+                    blurred.as_ref(),
+                    original.as_ref(),
+                    content.as_ref(),
+                    history_texture.as_ref(),
+                ],
+            )?;
+        }
+        Ok(())
     }
     fn batch(&mut self, batch: PrimitiveBatch) -> Result<()> {
         match batch {
@@ -2256,8 +2489,8 @@ mod tests {
         let _release_gate = ReleaseGate(gate.clone());
         let mut uploads = UploadPool::default();
         uploads.begin(gpu.completed_value(), 0)?;
-        // Distinct pairs need distinct tables; one more pair than fits a page.
-        let textures = (0..(DESCRIPTORS_PER_PAGE / 2 + 1))
+        // Distinct textures need distinct tables; one more table than fits a page.
+        let textures = (0..(DESCRIPTORS_PER_PAGE / TABLE_TEXTURES as u32 + 1))
             .map(|_| {
                 Ok(AtlasTexture {
                     resource: gpu.create_texture_multisampled(
@@ -2282,13 +2515,21 @@ mod tests {
             |list| {
                 let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
                 let (repeated, _) =
-                    descriptors.textures(list, None, None, &mut uploads, &mut first)?;
+                    descriptors.textures(list, [None; TABLE_TEXTURES], &mut uploads, &mut first)?;
                 let (again, heap_changed) =
-                    descriptors.textures(list, None, None, &mut uploads, &mut first)?;
-                assert_eq!(repeated.ptr, again.ptr, "a repeated pair must reuse its table");
+                    descriptors.textures(list, [None; TABLE_TEXTURES], &mut uploads, &mut first)?;
+                assert_eq!(
+                    repeated.ptr, again.ptr,
+                    "repeated textures must reuse their table"
+                );
                 assert!(!heap_changed);
                 for texture in &textures {
-                    descriptors.textures(list, Some(texture), None, &mut uploads, &mut first)?;
+                    descriptors.textures(
+                        list,
+                        [Some(texture), None, None, None],
+                        &mut uploads,
+                        &mut first,
+                    )?;
                 }
                 Ok(())
             },
@@ -2308,9 +2549,14 @@ mod tests {
         let mut second = RenderWork::default();
         let fence = gpu.submit(vec![retained.clone() as KeepAlive], |list| {
             let mut descriptors = Descriptors::new(gpu.clone(), retained.clone());
-            descriptors.textures(list, None, None, &mut uploads, &mut second)?;
+            descriptors.textures(list, [None; TABLE_TEXTURES], &mut uploads, &mut second)?;
             for texture in &textures {
-                descriptors.textures(list, Some(texture), None, &mut uploads, &mut second)?;
+                descriptors.textures(
+                    list,
+                    [Some(texture), None, None, None],
+                    &mut uploads,
+                    &mut second,
+                )?;
             }
             Ok(())
         })?;
@@ -2355,6 +2601,7 @@ mod tests {
             timings: None,
             uploads: std::array::from_fn(|_| UploadPool::default()),
             uploads_failed: false,
+            histories: VnEffectHistories::default(),
         })
     }
 
@@ -2727,7 +2974,7 @@ mod tests {
             reload_app_effects(
                 AppEffects::new(
                     "test",
-                    r#"{"schema": 8, "effects": [
+                    r#"{"schema": 9, "effects": [
                         {"name": "tint", "backdrop": false, "hlsl": "tint.hlsl"}
                     ]}"#,
                     [("tint.hlsl".to_string(), hlsl.to_string())],
@@ -2770,6 +3017,123 @@ mod tests {
             [0, 255, 0, 255],
             "a replacement that does not compile keeps the last good pipeline"
         );
+        Ok(())
+    }
+
+    use crate::directx_renderer::effect_layer_tests::{install_layer_effects, layer_effect};
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_content_effect_draws_its_element_in_its_place_and_cross_fades_with_it() -> Result<()>
+    {
+        install_layer_effects()?;
+        let content_mask = mask(64., 64.);
+        let scene = |draws: Vec<VnEffectDraw>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., 64., 64.), rgb(0x000000), content_mask));
+            scene.vn_push_effect(VnEffectPaint {
+                draws,
+                content: true,
+                content_mask,
+            });
+            scene.insert_primitive(quad(
+                bounds(16., 16., 32., 32.),
+                rgb(0x00ff00),
+                content_mask,
+            ));
+            scene.insert_primitive(quad(bounds(0., 0., 8., 8.), rgb(0xffffff), content_mask));
+            scene.vn_pop_isolation();
+            scene.finish();
+            scene
+        };
+        let swap = |opacity| VnEffectDraw {
+            quad: layer_effect(
+                effect_id::COUNT,
+                bounds(16., 16., 32., 32.),
+                opacity,
+                EFFECT_FLAG_NEEDS_CONTENT,
+            ),
+            history: 0,
+        };
+        let mut renderer = offscreen(64, 64)?;
+        let image = renderer.render_to_image(
+            &scene(vec![swap(1.)]),
+            WindowBackgroundAppearance::Transparent,
+        )?;
+        assert_eq!(
+            image.get_pixel(32, 32).0,
+            [0, 0, 255, 255],
+            "the shaded box"
+        );
+        assert_eq!(
+            image.get_pixel(4, 4).0,
+            [0, 0, 0, 255],
+            "content outside the quad does not show"
+        );
+
+        let plain = VnEffectDraw {
+            quad: layer_effect(
+                effect_id::CONTENT,
+                bounds(0., 0., 64., 64.),
+                0.5,
+                EFFECT_FLAG_NEEDS_CONTENT,
+            ),
+            history: 0,
+        };
+        let image = renderer.render_to_image(
+            &scene(vec![plain, swap(0.5)]),
+            WindowBackgroundAppearance::Transparent,
+        )?;
+        let shaded = image.get_pixel(32, 32).0;
+        close_channel(shaded[1], 64);
+        close_channel(shaded[2], 128);
+        let corner = image.get_pixel(4, 4).0;
+        close_channel(corner[0], 128);
+        close_channel(corner[3], 255);
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_history_steps_at_most_at_the_step_rate_and_starts_over() -> Result<()> {
+        install_layer_effects()?;
+        let content_mask = mask(64., 64.);
+        let scene = |rect: Bounds<ScaledPixels>, time: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., 64., 64.), rgb(0x000000), content_mask));
+            scene.vn_push_effect(VnEffectPaint {
+                draws: vec![VnEffectDraw {
+                    quad: EffectQuad {
+                        time,
+                        ..layer_effect(effect_id::COUNT + 1, rect, 1., EFFECT_FLAG_HISTORY)
+                    },
+                    history: 7,
+                }],
+                content: false,
+                content_mask,
+            });
+            scene.vn_pop_isolation();
+            scene.finish();
+            scene
+        };
+        let mut renderer = offscreen(64, 64)?;
+        let mut shows = |scene: Scene, red: u8| -> Result<()> {
+            let image =
+                renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+            assert_eq!(image.get_pixel(8, 8).0, [0, 0, 0, 255], "outside the quad");
+            let center = image.get_pixel(32, 32).0;
+            close_channel(center[0], red);
+            close_channel(center[3], 255);
+            Ok(())
+        };
+        let rect = bounds(16., 16., 32., 32.);
+        shows(scene(rect, 0.), 0)?;
+        shows(scene(rect, 1.), 64)?;
+        shows(scene(rect, 1.001), 128)?;
+        shows(scene(rect, 1.002), 128)?;
+        shows(scene(bounds(16., 16., 30., 32.), 2.), 0)?;
+        renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
+        assert!(renderer.histories.is_empty(), "a frame without it frees it");
         Ok(())
     }
 

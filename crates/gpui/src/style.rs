@@ -1631,12 +1631,13 @@ impl Style {
         let transformation = self.transform_matrix(bounds, window.scale_factor());
         let clip = self.vn_clip_mask(bounds, window.rem_size());
         let outline = self.vn_clip_outline(bounds, window.rem_size());
+        let element = window.vn_take_effect_element();
         if !transformation.is_unit() {
             return window.with_element_transform(transformation, |window| {
                 window.with_content_mask(clip, |window| {
                     window.vn_with_clip_shape(outline.as_ref(), |window| {
                         window.vn_with_color_matrix(self.vn_color_matrix, |window| {
-                            self.paint_untransformed(bounds, window, cx, continuation)
+                            self.paint_shaded(bounds, element, window, cx, continuation)
                         })
                     })
                 })
@@ -1645,18 +1646,140 @@ impl Style {
         window.with_content_mask(clip, |window| {
             window.vn_with_clip_shape(outline.as_ref(), |window| {
                 window.vn_with_color_matrix(self.vn_color_matrix, |window| {
-                    self.paint_untransformed(bounds, window, cx, continuation)
+                    self.paint_shaded(bounds, element, window, cx, continuation)
                 })
             })
         })
     }
 
+    /// The `--shading` effects this style paints, the outgoing one of a
+    /// cross-fade first, each with its share of the element's opacity.
+    fn vn_effects(&self, cx: &App) -> [Option<(EffectSpec, f32)>; 2] {
+        // An effect whose output moves with `time` (an animated grain) keeps
+        // asking for the next frame. That is decorative motion, so it honours
+        // `App::reduce_motion` here — clearing the flag stops the repaint
+        // request, which freezes the effect on its current frame rather than
+        // removing it. Same behaviour vn-css's animator gives transitions.
+        let reduce_motion = cx.reduce_motion();
+        let layer = |mut spec: EffectSpec, weight: f32| {
+            (spec.is_some() && !self.vn_mask_ring && weight > 0.).then(|| {
+                spec.animated &= !reduce_motion;
+                if reduce_motion {
+                    spec.clock_mask = 0;
+                }
+                (spec, weight)
+            })
+        };
+        let progress = self
+            .vn_effect_fade
+            .map_or(1., |fade| fade.progress.clamp(0., 1.));
+        [
+            self.vn_effect_fade
+                .and_then(|fade| layer(fade.from, 1. - progress)),
+            self.vn_effect.and_then(|spec| layer(spec, progress)),
+        ]
+    }
+
+    /// An effect that reads the element's content (`[SkContent]`) takes
+    /// everything the element paints, its subtree included, into a group it
+    /// composites in its place; the element's own backdrop filter and
+    /// backdrop effects read the page, so they paint before it.
+    fn paint_shaded(
+        &self,
+        bounds: Bounds<Pixels>,
+        element: u64,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let effects = self.vn_effects(cx);
+        let content = effects
+            .iter()
+            .flatten()
+            .any(|(spec, _)| spec.flags & crate::EFFECT_FLAG_NEEDS_CONTENT != 0);
+        if !content {
+            return self.paint_untransformed(
+                bounds,
+                window,
+                cx,
+                continuation,
+                &effects,
+                element,
+                false,
+            );
+        }
+        let corner_radii = self.corner_radii_for(bounds.size, window.rem_size());
+        self.paint_backdrop(bounds, corner_radii, window, &effects, element);
+        let shaded: Vec<_> = effects.iter().flatten().copied().collect();
+        window.vn_with_effect_content(bounds, corner_radii, &shaded, element, |window| {
+            self.paint_untransformed(bounds, window, cx, continuation, &effects, element, true)
+        })
+    }
+
+    /// CSS paints the filtered backdrop underneath the element's own
+    /// background, so the blur goes in between the drop shadows and the
+    /// background quad. The tint stays transparent — `background-color` is
+    /// the quad below.
+    ///
+    /// A BACKDROP effect (`frost`) replaces the pixels behind the element and
+    /// so paints exactly where `backdrop-filter` does. It also *has* to: it
+    /// draws with blending disabled and owns every pixel of its quad, so
+    /// painting it later would erase the background quad.
+    fn paint_backdrop(
+        &self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        window: &mut Window,
+        effects: &[Option<(EffectSpec, f32)>; 2],
+        element: u64,
+    ) {
+        if let Some(radius) = self.backdrop_blur
+            && radius > crate::px(0.)
+            && !self.vn_mask_ring
+        {
+            window.paint_backdrop_blur_rect(
+                bounds,
+                corner_radii,
+                crate::BackdropBlurEffect::new(radius),
+            );
+        }
+        Self::paint_effects(bounds, corner_radii, window, effects, element, true);
+    }
+
+    /// The effects of one kind that do not read the element's content: the
+    /// backdrop ones, or the source-over ones (`noise`, `glow`), which paint
+    /// over the background but under the content — the only slot where film
+    /// grain is visible on an opaque panel and where a glow's inner rim
+    /// survives.
+    fn paint_effects(
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        window: &mut Window,
+        effects: &[Option<(EffectSpec, f32)>; 2],
+        element: u64,
+        backdrop: bool,
+    ) {
+        for (spec, weight) in effects.iter().flatten() {
+            if spec.flags & crate::EFFECT_FLAG_NEEDS_CONTENT == 0
+                && (spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0) == backdrop
+            {
+                window.with_element_opacity((*weight < 1.).then_some(*weight), |window| {
+                    window.vn_paint_effect(bounds, corner_radii, *spec, element)
+                });
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn paint_untransformed(
         &self,
         bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
+        effects: &[Option<(EffectSpec, f32)>; 2],
+        element: u64,
+        in_content: bool,
     ) {
         #[cfg(debug_assertions)]
         if self.debug_below {
@@ -1696,73 +1819,14 @@ impl Style {
             }
         }
 
-        // CSS paints the filtered backdrop underneath the element's own
-        // background, so the blur goes in between the drop shadows and the
-        // background quad. The tint stays transparent — `background-color` is
-        // the quad below.
-        if let Some(radius) = self.backdrop_blur
-            && radius > crate::px(0.)
-            && !ring
-        {
-            window.paint_backdrop_blur_rect(
-                bounds,
-                corner_radii,
-                crate::BackdropBlurEffect::new(radius),
-            );
+        if !in_content {
+            self.paint_backdrop(bounds, corner_radii, window, effects, element);
         }
-
-        // `--shading` splits on whether the effect consumes the backdrop:
-        //
-        // * a BACKDROP effect (`frost`) replaces the pixels behind the element
-        //   and so paints exactly where `backdrop-filter` does — under the
-        //   element's own background. It also *has* to: it draws with blending
-        //   disabled and owns every pixel of its quad, so painting it later
-        //   would erase the background quad.
-        // * a non-backdrop effect (`noise`, `glow`) is an ordinary source-over
-        //   layer and paints over the background but under the content, which
-        //   is the only slot where film grain is visible on an opaque panel
-        //   and where a glow's inner rim survives.
-        //
-        // An effect whose output moves with `time` (an animated grain) keeps
-        // asking for the next frame. That is decorative motion, so it honours
-        // `App::reduce_motion` here — clearing the flag stops the repaint
-        // request, which freezes the effect on its current frame rather than
-        // removing it. Same behaviour vn-css's animator gives transitions.
-        // A cross-fade between two effects paints the outgoing one first, each
-        // at its share of the element's opacity.
-        let reduce_motion = cx.reduce_motion();
-        let layer = |mut spec: EffectSpec, weight: f32| {
-            (spec.is_some() && !ring && weight > 0.).then(|| {
-                spec.animated &= !reduce_motion;
-                if reduce_motion {
-                    spec.clock_mask = 0;
-                }
-                (spec, weight)
-            })
-        };
-        let progress = self
-            .vn_effect_fade
-            .map_or(1., |fade| fade.progress.clamp(0., 1.));
-        let effects = [
-            self.vn_effect_fade
-                .and_then(|fade| layer(fade.from, 1. - progress)),
-            self.vn_effect.and_then(|spec| layer(spec, progress)),
-        ];
-        let paint_effects = |window: &mut Window, backdrop: bool| {
-            for (spec, weight) in effects.iter().flatten() {
-                if (spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0) == backdrop {
-                    window.with_element_opacity((*weight < 1.).then_some(*weight), |window| {
-                        window.paint_effect_quad(bounds, corner_radii, *spec)
-                    });
-                }
-            }
-        };
         // The background quads: the whole box, or only the ring.
         let fill = |background: Background| match ring_widths {
             Some(widths) => (background.ring(), widths),
             None => (background, Edges::default()),
         };
-        paint_effects(window, true);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -1806,7 +1870,7 @@ impl Style {
             window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
         }
 
-        paint_effects(window, false);
+        Self::paint_effects(bounds, corner_radii, window, effects, element, false);
 
         continuation(window, cx);
 

@@ -2808,6 +2808,7 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
+                window.vn_set_effect_element(global_id);
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style_for_bounds(bounds, window), |window| {

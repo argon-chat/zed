@@ -58,7 +58,7 @@ impl BackdropState {
         }
     }
 
-    fn ready(&self) -> Option<&WgpuBackdrop> {
+    pub(super) fn ready(&self) -> Option<&WgpuBackdrop> {
         match self {
             BackdropState::Ready(backdrop) => Some(backdrop),
             BackdropState::Unbuilt | BackdropState::Unavailable => None,
@@ -75,28 +75,41 @@ pub(super) struct WgpuBackdrop {
     /// numbering when one failed to build.
     effects: Vec<Option<wgpu::RenderPipeline>>,
     /// The app's own, `effect_id::COUNT` on.
-    app_effects: gpui::AppEffectPipelines<wgpu::RenderPipeline>,
+    app_effects: gpui::AppEffectPipelines<AppEffectPipeline>,
     effect_layout: wgpu::PipelineLayout,
     effect_vertex: wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     textures_layout: wgpu::BindGroupLayout,
     effect_globals_buffer: wgpu::Buffer,
-    effect_globals_bind_group: wgpu::BindGroup,
+    pub(super) effect_globals_bind_group: wgpu::BindGroup,
     clamp_sampler: wgpu::Sampler,
+    placeholder: TargetTexture,
     /// Group 2 of an effect that does not read the backdrop: its shader still
     /// declares the textures.
     placeholder_textures: wgpu::BindGroup,
     /// `gpui::effect_id::PUNCH`.
     punch: Option<wgpu::RenderPipeline>,
+    /// `gpui::effect_id::CONTENT`.
+    content: Option<wgpu::RenderPipeline>,
+    pub(super) histories: gpui::VnEffectHistories<TargetTexture>,
     targets: Option<BackdropTargets>,
     /// Consecutive frames that held more scratch targets than they needed.
     idle_frames: u32,
+}
+
+struct AppEffectPipeline {
+    shade: wgpu::RenderPipeline,
+    /// `[SkHistory]`: the step, into a history texture with blending off.
+    history: Option<wgpu::RenderPipeline>,
 }
 
 /// Frames the scratch targets may sit unused before release, as on D3D12:
 /// recreating one is a window-sized allocation, so short gaps keep them.
 const SCRATCH_RELEASE_FRAMES: u32 = 90;
 
+pub(super) const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+#[derive(Clone)]
 pub(super) struct TargetTexture {
     pub(super) texture: wgpu::Texture,
     pub(super) view: wgpu::TextureView,
@@ -150,8 +163,9 @@ impl WgpuRendererCore {
         target: &wgpu::Texture,
         target_view: &wgpu::TextureView,
     ) -> FrameTarget {
-        let has_primitives =
-            !scene.backdrop_blur_rects.is_empty() || !scene.effect_quads.is_empty();
+        let has_primitives = !scene.backdrop_blur_rects.is_empty()
+            || !scene.effect_quads.is_empty()
+            || !scene.vn_effect_draws.is_empty();
         let backdrop = has_primitives && self.ensure_backdrop();
         let mut frame = FrameTarget {
             texture: target.clone(),
@@ -159,20 +173,21 @@ impl WgpuRendererCore {
             copy_to: None,
             backdrop,
         };
-        let snapshots = !scene.backdrop_blur_rects.is_empty()
-            || scene.effect_quads.iter().any(EffectQuad::needs_backdrop);
+        let effect_quads = || {
+            scene
+                .effect_quads
+                .iter()
+                .chain(scene.vn_effect_draws.iter().map(|draw| &draw.quad))
+        };
+        let snapshots =
+            !scene.backdrop_blur_rects.is_empty() || effect_quads().any(EffectQuad::needs_backdrop);
         if let BackdropState::Ready(state) = &mut self.resources.backdrop {
             state.sync_app_effects(&self.resources.device);
             let kernel_levels = scene
                 .backdrop_blur_rects
                 .iter()
                 .map(BackdropBlurRect::effective_kernel_levels)
-                .chain(
-                    scene
-                        .effect_quads
-                        .iter()
-                        .map(EffectQuad::effective_kernel_levels),
-                )
+                .chain(effect_quads().map(EffectQuad::effective_kernel_levels))
                 .max()
                 .unwrap_or(0) as usize;
             state.trim_targets(if backdrop && snapshots {
@@ -260,7 +275,7 @@ impl WgpuRendererCore {
         pass.draw(0..4, 0..1);
     }
 
-    fn ensure_backdrop(&mut self) -> bool {
+    pub(super) fn ensure_backdrop(&mut self) -> bool {
         if self.uses_webgl_instance_data {
             effects_advisory(
                 "`backdrop-filter` and `--shading` need storage buffers, which WebGL2 lacks; \
@@ -322,7 +337,8 @@ impl WgpuRendererCore {
             let region = (!tests::FULL_WINDOW_BACKDROP.get()).then_some(region);
             #[cfg(not(test))]
             let region = Some(region);
-            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels, region)?;
+            let textures =
+                self.snapshot_backdrop(encoder, frame, kernel_levels, region, [None, None])?;
             let state = self
                 .resources
                 .backdrop
@@ -405,7 +421,8 @@ impl WgpuRendererCore {
         }) {
             let kernel_levels = effect_quads[group.start].effective_kernel_levels() as usize;
             // An effect may sample its backdrop anywhere, as on D3D12.
-            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels, None)?;
+            let textures =
+                self.snapshot_backdrop(encoder, frame, kernel_levels, None, [None, None])?;
             let state = self
                 .resources
                 .backdrop
@@ -425,13 +442,15 @@ impl WgpuRendererCore {
     /// Copies what the frame holds so far and blurs it `kernel_levels` deep,
     /// within `region` (frame pixels, the kernel's reach included) or the
     /// whole frame. Returns group 2 for the composite: the processed backdrop,
-    /// the clamping sampler and the untouched snapshot.
+    /// the clamping sampler, the untouched snapshot and `layer`, an effect
+    /// layer's content and history.
     fn snapshot_backdrop(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameTarget,
         kernel_levels: usize,
         region: Option<PixelRect>,
+        layer: [Option<&wgpu::TextureView>; 2],
     ) -> Result<wgpu::BindGroup> {
         let kernel_levels = kernel_levels.min(BLUR_TEXTURE_LEVELS);
         let resources = &mut self.resources;
@@ -550,26 +569,22 @@ impl WgpuRendererCore {
             &levels[0].view
         };
 
-        Ok(resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("backdrop_textures"),
-                layout: &state.textures_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(blurred),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&state.clamp_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&targets.snapshot.view),
-                    },
-                ],
-            }))
+        Ok(state.effect_textures(
+            &resources.device,
+            [Some(blurred), Some(&targets.snapshot.view)],
+            layer,
+        ))
+    }
+
+    /// The backdrop of an effect layer's effect, which may sample it anywhere.
+    pub(super) fn snapshot_layer_backdrop(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameTarget,
+        kernel_levels: usize,
+        layer: [Option<&wgpu::TextureView>; 2],
+    ) -> Result<wgpu::BindGroup> {
+        self.snapshot_backdrop(encoder, frame, kernel_levels, None, layer)
     }
 
     fn source_bind_group(
@@ -732,6 +747,8 @@ impl WgpuBackdrop {
                     count: None,
                 },
                 texture_entry(2),
+                texture_entry(7),
+                texture_entry(8),
             ],
         });
         let effect_globals_size = std::mem::size_of::<EffectGlobals>() as u64;
@@ -779,24 +796,12 @@ impl WgpuBackdrop {
             1,
             wgpu::TextureUsages::TEXTURE_BINDING,
         );
-        let placeholder_textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("backdrop_placeholder_textures"),
-            layout: &textures_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&placeholder.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&clamp_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&placeholder.view),
-                },
-            ],
-        });
+        let placeholder_textures = textures_bind_group(
+            device,
+            &textures_layout,
+            &clamp_sampler,
+            [&placeholder.view; 4],
+        );
 
         let pass_layout = pipeline_layout(device, "backdrop_pass_layout", &[&layouts.texture]);
         let blur_rect_layout = pipeline_layout(
@@ -863,6 +868,24 @@ impl WgpuBackdrop {
             ));
         })
         .ok();
+        let content = capture_validation(device, || {
+            render_pipeline(
+                device,
+                "effect_content",
+                &effect_layout,
+                (&effect_vertex, "vs_effect"),
+                (&effect_vertex, "fs_content"),
+                format,
+                Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            )
+        })
+        .inspect_err(|error| {
+            effects_advisory(&format!(
+                "elements with an `[SkContent]` effect cannot cross-fade it — the content \
+                 pipeline failed to build: {error:#}"
+            ));
+        })
+        .ok();
 
         let mut backdrop = Self {
             blur_downsample,
@@ -878,8 +901,11 @@ impl WgpuBackdrop {
             effect_globals_buffer,
             effect_globals_bind_group,
             clamp_sampler,
+            placeholder,
             placeholder_textures,
             punch,
+            content,
+            histories: Default::default(),
             targets: None,
             idle_frames: 0,
         };
@@ -887,11 +913,11 @@ impl WgpuBackdrop {
         Ok(backdrop)
     }
 
-    fn sync_app_effects(&mut self, device: &wgpu::Device) {
+    pub(super) fn sync_app_effects(&mut self, device: &wgpu::Device) {
         let (layout, vertex, format) = (&self.effect_layout, &self.effect_vertex, self.format);
         self.app_effects.sync(|effect| {
             let (_, wgsl) = effect.wgsl.get("WGSL")?;
-            effect_pipeline(
+            let shade = effect_pipeline(
                 device,
                 layout,
                 vertex,
@@ -899,8 +925,51 @@ impl WgpuBackdrop {
                 wgsl,
                 format,
                 effect.needs_backdrop,
-            )
+            )?;
+            let history = effect
+                .history
+                .then(|| {
+                    effect_pipeline(
+                        device,
+                        layout,
+                        vertex,
+                        &format!("{}_history", effect.name),
+                        wgsl,
+                        HISTORY_FORMAT,
+                        true,
+                    )
+                })
+                .transpose()?;
+            Ok(AppEffectPipeline { shade, history })
         });
+    }
+
+    /// Group 2 of an effect: the backdrop as blurred and as snapshotted, then
+    /// an effect layer's content and history; a placeholder for each absent.
+    pub(super) fn effect_textures(
+        &self,
+        device: &wgpu::Device,
+        backdrop: [Option<&wgpu::TextureView>; 2],
+        layer: [Option<&wgpu::TextureView>; 2],
+    ) -> wgpu::BindGroup {
+        let placeholder = &self.placeholder.view;
+        textures_bind_group(
+            device,
+            &self.textures_layout,
+            &self.clamp_sampler,
+            [
+                backdrop[0].unwrap_or(placeholder),
+                backdrop[1].unwrap_or(placeholder),
+                layer[0].unwrap_or(placeholder),
+                layer[1].unwrap_or(placeholder),
+            ],
+        )
+    }
+
+    /// The `[SkHistory]` step of app effect `effect_id`.
+    pub(super) fn history_effect(&self, effect_id: u32) -> Option<&wgpu::RenderPipeline> {
+        let index = effect_id.checked_sub(effect_id::COUNT)?;
+        self.app_effects.get(index as usize)?.history.as_ref()
     }
 
     /// `needed` counts the snapshot as one more level below the pyramid.
@@ -925,11 +994,17 @@ impl WgpuBackdrop {
         }
     }
 
-    fn effect(&self, effect_id: u32) -> Option<&wgpu::RenderPipeline> {
+    pub(super) fn effect(&self, effect_id: u32) -> Option<&wgpu::RenderPipeline> {
         match effect_id {
             effect_id::PUNCH => self.punch.as_ref(),
+            effect_id::CONTENT => self.content.as_ref(),
             id if id < effect_id::COUNT => self.effects.get(id as usize)?.as_ref(),
-            id => self.app_effects.get((id - effect_id::COUNT) as usize),
+            id => Some(
+                &self
+                    .app_effects
+                    .get((id - effect_id::COUNT) as usize)?
+                    .shade,
+            ),
         }
     }
 
@@ -1012,6 +1087,32 @@ fn build_builtin_effect_pipelines(
         });
     }
     pipelines
+}
+
+fn textures_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    [blurred, snapshot, content, history]: [&wgpu::TextureView; 4],
+) -> wgpu::BindGroup {
+    let texture = |binding, view| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    };
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("effect_textures"),
+        layout,
+        entries: &[
+            texture(0, blurred),
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            texture(2, snapshot),
+            texture(7, content),
+            texture(8, history),
+        ],
+    })
 }
 
 /// D3D12's `Blend::DestinationOut`: the target times one minus the source's
@@ -1185,7 +1286,7 @@ pub(super) fn effects_advisory(message: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
 
@@ -1344,7 +1445,11 @@ mod tests {
                 .map(|binding| (binding.group, binding.binding))
                 .collect();
             bindings.sort_unstable();
-            assert_eq!(bindings, [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2)], "{name}");
+            assert_eq!(
+                bindings,
+                [(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (2, 7), (2, 8)],
+                "{name}"
+            );
             assert!(
                 fragment
                     .entry_points
@@ -1382,7 +1487,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    mod gpu {
+    pub(in crate::wgpu_renderer) mod gpu {
         use super::*;
         use crate::WgpuHeadlessRenderer;
         use gpui::{
@@ -2060,13 +2165,14 @@ mod tests {
         }
 
         /// The app's effects are process-wide; tests that install them take turns.
-        static APP_EFFECTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        pub(in crate::wgpu_renderer) static APP_EFFECTS: parking_lot::Mutex<()> =
+            parking_lot::Mutex::new(());
 
         fn install_app_effect(wgsl: &str) -> Result<()> {
             gpui::reload_app_effects(
                 gpui::AppEffects::new(
                     "test",
-                    r#"{"schema": 8, "effects": [
+                    r#"{"schema": 9, "effects": [
                         {"name": "tint", "backdrop": false, "wgsl": "tint.wgsl"}
                     ]}"#,
                     [("tint.wgsl".to_string(), wgsl.to_string())],
@@ -2177,7 +2283,7 @@ mod tests {
                     effect.name
                 );
                 assert!(
-                    (8..56).any(|x| pixel(&image, x, 32) != [0, 0, 0, 255]),
+                    effect.content || (8..56).any(|x| pixel(&image, x, 32) != [0, 0, 0, 255]),
                     "{} must draw",
                     effect.name
                 );

@@ -1763,6 +1763,14 @@ vertex EffectVertexOutput effect_vertex(
     constant Size_DevicePixels *viewport_size
     [[buffer(BackdropInputIndex_ViewportSize)]]) {
   EffectQuad quad = effect_quads[effect_quad_id];
+  // `gpui::EFFECT_FLAG_HISTORY_PASS`: a history step covers its whole
+  // target, the quad's own texels.
+  if ((quad.flags & 8u) != 0u) {
+    float2 unit_vertex = strip_unit_vertex(vertex_id);
+    return EffectVertexOutput{
+        float4(unit_vertex * float2(2., -2.) + float2(-1., 1.), 0., 1.),
+        effect_quad_id};
+  }
   float4 position =
       to_device_position(strip_unit_vertex(vertex_id),
                          clip_to_mask(quad.bounds, quad.content_mask.bounds),
@@ -1793,6 +1801,24 @@ fragment float4 punch_fragment(
                                                  quad.content_mask.bounds,
                                                  quad.content_mask.corner_radii));
   return float4(0., 0., 0., inside * unmasked * quad.opacity);
+}
+
+// `gpui::effect_id::CONTENT`: an effect layer's content as it is, at the
+// quad's opacity, cut by its content mask's rounded corners.
+fragment float4 content_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant EffectQuad *effect_quads [[buffer(BackdropInputIndex_Instances)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]],
+    texture2d<float> content [[texture(BackdropTextureIndex_Content)]]) {
+  EffectQuad quad = effect_quads[input.effect_quad_id];
+  float unmasked = saturate(0.5 - punch_distance(input.position.xy,
+                                                 quad.content_mask.bounds,
+                                                 quad.content_mask.corner_radii));
+  float2 uv = input.position.xy /
+              float2(viewport_size->width, viewport_size->height);
+  return content.sample(backdrop_clamp_sampler, uv, level(0.)) *
+         (quad.opacity * unmasked);
 }
 
 // vue-native: the composite of one isolated layer (`gpui::VnLayer`), a port of

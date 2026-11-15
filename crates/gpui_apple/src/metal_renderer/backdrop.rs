@@ -62,9 +62,12 @@ struct EffectGlobals {
 
 const _: () = assert!(mem::size_of::<EffectGlobals>() == 48);
 
-type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
-type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
-type Encoder = Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>;
+pub(super) type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
+pub(super) type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+pub(super) type Encoder = Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>;
+
+/// `[SkHistory]` state textures.
+pub(super) const HISTORY_FORMAT: MTLPixelFormat = MTLPixelFormat::RGBA16Float;
 
 #[derive(Default)]
 pub(super) enum BackdropState {
@@ -76,7 +79,7 @@ pub(super) enum BackdropState {
 }
 
 impl BackdropState {
-    fn ready(&self) -> Option<&MetalBackdrop> {
+    pub(super) fn ready(&self) -> Option<&MetalBackdrop> {
         match self {
             BackdropState::Ready(backdrop) => Some(backdrop),
             BackdropState::Unbuilt | BackdropState::Unavailable => None,
@@ -93,17 +96,26 @@ pub(super) struct MetalBackdrop {
     /// numbering when one failed to build.
     effects: Vec<Option<Pipeline>>,
     /// The app's own, `effect_id::COUNT` on.
-    app_effects: gpui::AppEffectPipelines<Pipeline>,
+    app_effects: gpui::AppEffectPipelines<AppEffectPipeline>,
     effect_vertex: Retained<ProtocolObject<dyn MTLFunction>>,
     /// `gpui::effect_id::PUNCH`.
     punch: Option<Pipeline>,
+    /// `gpui::effect_id::CONTENT`.
+    content: Option<Pipeline>,
     clamp_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     /// Bound for an effect that does not read the backdrop: its shader still
     /// declares the textures.
     placeholder: Texture,
+    pub(super) histories: gpui::VnEffectHistories<Texture>,
     targets: Option<BackdropTargets>,
     /// Consecutive frames that held more scratch targets than they needed.
     idle_frames: u32,
+}
+
+struct AppEffectPipeline {
+    shade: Pipeline,
+    /// `[SkHistory]`: the step, into a history texture with blending off.
+    history: Option<Pipeline>,
 }
 
 /// Sized to the frame.
@@ -147,7 +159,7 @@ pub(super) enum EffectPass {
 
 /// What a backdrop composite samples: the processed backdrop and the
 /// untouched snapshot.
-struct BackdropTextures {
+pub(super) struct BackdropTextures {
     processed: Texture,
     original: Texture,
 }
@@ -158,28 +170,30 @@ impl MetalRenderer {
         scene: &Scene,
         target: &ProtocolObject<dyn MTLTexture>,
     ) -> FrameTarget {
-        let has_primitives =
-            !scene.backdrop_blur_rects.is_empty() || !scene.effect_quads.is_empty();
+        let has_primitives = !scene.backdrop_blur_rects.is_empty()
+            || !scene.effect_quads.is_empty()
+            || !scene.vn_effect_draws.is_empty();
         let backdrop = has_primitives && self.ensure_backdrop();
         let mut frame = FrameTarget {
             texture: target.retain(),
             copy_to: None,
             backdrop,
         };
-        let snapshots = !scene.backdrop_blur_rects.is_empty()
-            || scene.effect_quads.iter().any(EffectQuad::needs_backdrop);
+        let effect_quads = || {
+            scene
+                .effect_quads
+                .iter()
+                .chain(scene.vn_effect_draws.iter().map(|draw| &draw.quad))
+        };
+        let snapshots =
+            !scene.backdrop_blur_rects.is_empty() || effect_quads().any(EffectQuad::needs_backdrop);
         if let BackdropState::Ready(state) = &mut self.backdrop {
             state.sync_app_effects(&self.device);
             let kernel_levels = scene
                 .backdrop_blur_rects
                 .iter()
                 .map(BackdropBlurRect::effective_kernel_levels)
-                .chain(
-                    scene
-                        .effect_quads
-                        .iter()
-                        .map(EffectQuad::effective_kernel_levels),
-                )
+                .chain(effect_quads().map(EffectQuad::effective_kernel_levels))
                 .max()
                 .unwrap_or(0) as usize;
             state.trim_targets(if backdrop && snapshots {
@@ -259,7 +273,7 @@ impl MetalRenderer {
         Ok(())
     }
 
-    fn ensure_backdrop(&mut self) -> bool {
+    pub(super) fn ensure_backdrop(&mut self) -> bool {
         if matches!(self.backdrop, BackdropState::Unbuilt) {
             self.backdrop = match MetalBackdrop::new(&self.device, &self.library) {
                 Ok(backdrop) => BackdropState::Ready(Box::new(backdrop)),
@@ -335,6 +349,7 @@ impl MetalRenderer {
                 instances,
                 viewport_size,
                 Some(&textures),
+                [None, None],
                 start + group.start..start + group.end,
             );
         }
@@ -381,7 +396,15 @@ impl MetalRenderer {
         let Some(pipeline) = state.effect(effect_id) else {
             return;
         };
-        state.draw_instances(encoder, pipeline, instances, viewport_size, None, range);
+        state.draw_instances(
+            encoder,
+            pipeline,
+            instances,
+            viewport_size,
+            None,
+            [None, None],
+            range,
+        );
     }
 
     /// An effect that reads the backdrop takes the backdrop blur's path:
@@ -422,10 +445,22 @@ impl MetalRenderer {
                 instances,
                 viewport_size,
                 Some(&textures),
+                [None, None],
                 start + group.start..start + group.end,
             );
         }
         Ok(encoder)
+    }
+
+    /// The backdrop of an effect layer's effect, which may sample it anywhere.
+    /// Called between encoders.
+    pub(super) fn snapshot_layer_backdrop(
+        &mut self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        frame: &FrameTarget,
+        kernel_levels: usize,
+    ) -> Result<BackdropTextures> {
+        self.snapshot_backdrop(command_buffer, frame, kernel_levels, None)
     }
 
     /// Copies what the frame holds so far and blurs it `kernel_levels` deep,
@@ -558,7 +593,7 @@ impl MetalRenderer {
 }
 
 /// A render pass over all of `texture`, stored.
-fn render_pass(
+pub(super) fn render_pass(
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     texture: &ProtocolObject<dyn MTLTexture>,
     load: MTLLoadAction,
@@ -724,6 +759,23 @@ impl MetalBackdrop {
                 ));
             })
             .ok();
+        let content = function("content_fragment")
+            .and_then(|fragment| {
+                backdrop_pipeline(
+                    device,
+                    "effect_content",
+                    &effect_vertex,
+                    &fragment,
+                    Blend::Premultiplied,
+                )
+            })
+            .inspect_err(|error| {
+                effects_advisory(&format!(
+                    "an effect whose pipeline is missing hides its element — the content \
+                     pipeline failed to build: {error:#}"
+                ));
+            })
+            .ok();
 
         let sampler_descriptor = MTLSamplerDescriptor::new();
         sampler_descriptor.setMinFilter(MTLSamplerMinMagFilter::Linear);
@@ -750,8 +802,10 @@ impl MetalBackdrop {
             app_effects: Default::default(),
             effect_vertex,
             punch,
+            content,
             clamp_sampler,
             placeholder,
+            histories: Default::default(),
             targets: None,
             idle_frames: 0,
         };
@@ -759,11 +813,33 @@ impl MetalBackdrop {
         Ok(backdrop)
     }
 
-    fn sync_app_effects(&mut self, device: &ProtocolObject<dyn MTLDevice>) {
+    pub(super) fn sync_app_effects(&mut self, device: &ProtocolObject<dyn MTLDevice>) {
         let vertex = &self.effect_vertex;
         self.app_effects.sync(|effect| {
             let (_, msl) = effect.metal.get("Metal shader")?;
-            effect_pipeline(device, vertex, &effect.name, msl, effect.needs_backdrop)
+            let library = effect_library(device, msl)?;
+            let shade = effect_pipeline(
+                device,
+                vertex,
+                &library,
+                &effect.name,
+                MTLPixelFormat::BGRA8Unorm,
+                effect.needs_backdrop,
+            )?;
+            let history = effect
+                .history
+                .then(|| {
+                    effect_pipeline(
+                        device,
+                        vertex,
+                        &library,
+                        &format!("{}_history", effect.name),
+                        HISTORY_FORMAT,
+                        true,
+                    )
+                })
+                .transpose()?;
+            Ok(AppEffectPipeline { shade, history })
         });
     }
 
@@ -789,12 +865,23 @@ impl MetalBackdrop {
         }
     }
 
-    fn effect(&self, effect_id: u32) -> Option<&Pipeline> {
+    pub(super) fn effect(&self, effect_id: u32) -> Option<&Pipeline> {
         match effect_id {
             effect_id::PUNCH => self.punch.as_ref(),
+            effect_id::CONTENT => self.content.as_ref(),
             id if id < effect_id::COUNT => self.effects.get(id as usize)?.as_ref(),
-            id => self.app_effects.get((id - effect_id::COUNT) as usize),
+            id => Some(
+                &self
+                    .app_effects
+                    .get((id - effect_id::COUNT) as usize)?
+                    .shade,
+            ),
         }
+    }
+
+    pub(super) fn history_effect(&self, effect_id: u32) -> Option<&Pipeline> {
+        let index = effect_id.checked_sub(effect_id::COUNT)?;
+        self.app_effects.get(index as usize)?.history.as_ref()
     }
 
     fn ensure_targets(
@@ -861,14 +948,15 @@ impl MetalBackdrop {
 
     /// Draws `range` of the frame's `instances` (effect quads or blur rects)
     /// with every slot the backdrop pipelines and the generated effect stages
-    /// declare bound.
-    fn draw_instances(
+    /// declare bound; `layer` is an effect layer's content and history.
+    pub(super) fn draw_instances(
         &self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
         instances: &InstanceBinding,
         viewport_size: Size<DevicePixels>,
         textures: Option<&BackdropTextures>,
+        layer: [Option<&Texture>; 2],
         range: Range<usize>,
     ) {
         if range.is_empty() {
@@ -925,6 +1013,14 @@ impl MetalBackdrop {
                 Some(original),
                 BackdropTextureIndex::Original as usize,
             );
+            encoder.setFragmentTexture_atIndex(
+                Some(layer[0].unwrap_or(&self.placeholder)),
+                BackdropTextureIndex::Content as usize,
+            );
+            encoder.setFragmentTexture_atIndex(
+                Some(layer[1].unwrap_or(&self.placeholder)),
+                BackdropTextureIndex::History as usize,
+            );
             encoder.setFragmentSamplerState_atIndex(Some(&self.clamp_sampler), CLAMP_SAMPLER_INDEX);
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::TriangleStrip,
@@ -949,7 +1045,7 @@ fn build_builtin_effect_pipelines(
         let pipeline = msl
             .context("this build carries no shader for it")
             .and_then(|msl| {
-                effect_pipeline(device, vertex, name, msl, builtin_needs_backdrop(index))
+                frame_effect_pipeline(device, vertex, name, msl, builtin_needs_backdrop(index))
             });
         pipelines.push(match pipeline {
             Ok(pipeline) => Some(pipeline),
@@ -966,19 +1062,45 @@ fn build_builtin_effect_pipelines(
 
 /// Compiles an effect's generated MSL at runtime: neither the built-ins nor
 /// an app's effects need the Metal toolchain.
-fn effect_pipeline(
+fn effect_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+    msl: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    device
+        .newLibraryWithSource_options_error(
+            &NSString::from_str(msl),
+            Some(&MTLCompileOptions::new()),
+        )
+        .context("its Metal source does not compile")
+}
+
+/// An effect drawn into the frame, from its MSL.
+fn frame_effect_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     vertex: &ProtocolObject<dyn MTLFunction>,
     name: &str,
     msl: &str,
     needs_backdrop: bool,
 ) -> Result<Pipeline> {
-    let library = device
-        .newLibraryWithSource_options_error(
-            &NSString::from_str(msl),
-            Some(&MTLCompileOptions::new()),
-        )
-        .context("its Metal source does not compile")?;
+    let library = effect_library(device, msl)?;
+    effect_pipeline(
+        device,
+        vertex,
+        &library,
+        name,
+        MTLPixelFormat::BGRA8Unorm,
+        needs_backdrop,
+    )
+}
+
+fn effect_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    vertex: &ProtocolObject<dyn MTLFunction>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    name: &str,
+    format: MTLPixelFormat,
+    needs_backdrop: bool,
+) -> Result<Pipeline> {
     let fragment = library
         .newFunctionWithName(&NSString::from_str("effect_fragment"))
         .context("its Metal source has no `effect_fragment`")?;
@@ -989,7 +1111,14 @@ fn effect_pipeline(
     } else {
         Blend::Premultiplied
     };
-    backdrop_pipeline(device, &format!("effect_{name}"), vertex, &fragment, blend)
+    pipeline_in(
+        device,
+        &format!("effect_{name}"),
+        vertex,
+        &fragment,
+        format,
+        blend,
+    )
 }
 
 fn backdrop_pipeline(
@@ -999,13 +1128,31 @@ fn backdrop_pipeline(
     fragment: &ProtocolObject<dyn MTLFunction>,
     blend: Blend,
 ) -> Result<Pipeline> {
+    pipeline_in(
+        device,
+        label,
+        vertex,
+        fragment,
+        MTLPixelFormat::BGRA8Unorm,
+        blend,
+    )
+}
+
+fn pipeline_in(
+    device: &ProtocolObject<dyn MTLDevice>,
+    label: &str,
+    vertex: &ProtocolObject<dyn MTLFunction>,
+    fragment: &ProtocolObject<dyn MTLFunction>,
+    format: MTLPixelFormat,
+    blend: Blend,
+) -> Result<Pipeline> {
     let descriptor = MTLRenderPipelineDescriptor::new();
     descriptor.setLabel(Some(&NSString::from_str(label)));
     descriptor.setVertexFunction(Some(vertex));
     descriptor.setFragmentFunction(Some(fragment));
     // SAFETY: Index zero is within the pipeline's color attachment array.
     let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.setPixelFormat(format);
     let source = match blend {
         Blend::Off => None,
         Blend::Premultiplied => Some(MTLBlendFactor::One),
@@ -1032,13 +1179,31 @@ pub(super) fn create_target_texture(
     height: usize,
     usage: MTLTextureUsage,
 ) -> Result<Texture> {
+    create_texture_in(
+        device,
+        label,
+        width,
+        height,
+        usage,
+        MTLPixelFormat::BGRA8Unorm,
+    )
+}
+
+pub(super) fn create_texture_in(
+    device: &ProtocolObject<dyn MTLDevice>,
+    label: &str,
+    width: usize,
+    height: usize,
+    usage: MTLTextureUsage,
+    format: MTLPixelFormat,
+) -> Result<Texture> {
     let descriptor = MTLTextureDescriptor::new();
     // SAFETY: Both dimensions are at least one and this descriptor creates a 2D texture.
     unsafe {
         descriptor.setWidth(width.max(1));
         descriptor.setHeight(height.max(1));
     }
-    descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    descriptor.setPixelFormat(format);
     descriptor.setStorageMode(MTLStorageMode::Private);
     descriptor.setUsage(usage);
     let texture = device
@@ -1066,7 +1231,7 @@ pub(super) fn effects_advisory(message: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::metal_renderer::InstanceBufferPool;
     use gpui::{
@@ -1737,7 +1902,7 @@ mod tests {
             .library
             .newFunctionWithName(&NSString::from_str("effect_vertex"))
             .context("effect_vertex")?;
-        let broken = effect_pipeline(
+        let broken = frame_effect_pipeline(
             &renderer.device,
             &vertex,
             "broken",
@@ -1748,7 +1913,7 @@ mod tests {
             broken.is_err(),
             "a shader that does not compile must be refused"
         );
-        let mismatched = effect_pipeline(
+        let mismatched = frame_effect_pipeline(
             &renderer.device,
             &vertex,
             "mismatched",
@@ -1786,13 +1951,13 @@ mod tests {
     }
 
     /// The app's effects are process-wide; tests that install them take turns.
-    static APP_EFFECTS: Mutex<()> = Mutex::new(());
+    pub(in crate::metal_renderer) static APP_EFFECTS: Mutex<()> = Mutex::new(());
 
     fn install_app_effect(msl: &str) -> Result<()> {
         gpui::reload_app_effects(
             gpui::AppEffects::new(
                 "test",
-                r#"{"schema": 8, "effects": [
+                r#"{"schema": 9, "effects": [
                     {"name": "tint", "backdrop": false, "metal": "tint.metal"}
                 ]}"#,
                 [("tint.metal".to_string(), msl.to_string())],
@@ -1887,7 +2052,7 @@ mod tests {
                 effect.name
             );
             assert!(
-                (8..56).any(|x| pixel(&image, x, 32) != [0, 0, 0, 255]),
+                effect.content || (8..56).any(|x| pixel(&image, x, 32) != [0, 0, 0, 255]),
                 "{} must draw",
                 effect.name
             );

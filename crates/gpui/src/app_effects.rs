@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 pub const APP_EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
 
 /// The `effects.json` layout this build understands.
-pub const APP_EFFECTS_SCHEMA: u32 = 8;
+pub const APP_EFFECTS_SCHEMA: u32 = 9;
 
 /// One generated shader of an [`AppEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,11 @@ pub struct AppEffect {
     pub name: String,
     /// Decides the blend state and whether the renderer breaks the pass for a snapshot.
     pub needs_backdrop: bool,
+    /// Whether it draws its element's painting (`[SkContent]`), and nothing without it.
+    pub content: bool,
+    /// Whether it keeps a history (`[SkHistory]`), which a second pipeline
+    /// steps: blending off, a 16-bit float target.
+    pub history: bool,
     /// For DirectX.
     pub hlsl: AppEffectSource,
     /// For wgpu.
@@ -82,6 +87,10 @@ struct RawManifest {
 struct RawEffect {
     name: String,
     backdrop: bool,
+    #[serde(default)]
+    content: bool,
+    #[serde(default)]
+    history: bool,
     #[serde(default)]
     hlsl: Option<String>,
     #[serde(default)]
@@ -124,6 +133,8 @@ impl AppEffects {
                 wgsl: source(effect.wgsl),
                 metal: source(effect.metal),
                 needs_backdrop: effect.backdrop,
+                content: effect.content,
+                history: effect.history,
                 name: effect.name,
             })
             .collect();
@@ -346,7 +357,7 @@ mod tests {
     fn the_manifest_resolves_each_effect_to_its_shader_per_target() -> Result<(), String> {
         let app = AppEffects::new(
             "test",
-            r#"{"schema": 8, "kind": "user", "effects": [
+            r#"{"schema": 9, "kind": "user", "effects": [
                 {"name": "ripple", "backdrop": true, "hlsl": "ripple.hlsl", "wgsl": "ripple.wgsl"},
                 {"name": "plain", "backdrop": false, "hlsl": "plain.hlsl"}
             ]}"#,

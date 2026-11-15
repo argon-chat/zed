@@ -20,7 +20,7 @@ use objc2_metal::{
 use std::{mem, ptr};
 
 /// Deeper groups draw inline, unclipped by their shape, as on DirectX.
-const MAX_DEPTH: usize = 8;
+pub(super) const MAX_DEPTH: usize = 8;
 
 /// Frames the layer targets may sit unused before release.
 const TARGET_RELEASE_FRAMES: u32 = 90;
@@ -81,6 +81,18 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
     ) -> Result<()> {
+        if let Some(effect) = draw.scene.vn_effect_layer(index) {
+            return self.draw_vn_effect_layer(
+                draw,
+                index,
+                effect,
+                depth,
+                command_buffer,
+                frame,
+                writer,
+                surface_textures,
+            );
+        }
         let layer = draw.scene.vn_layers[index];
         let group = layer.group as usize;
         let inline = |this: &mut Self,
@@ -220,7 +232,11 @@ impl MetalRenderer {
 
     /// The target for `depth`, the frame's size; a backdrop drawn inside the
     /// group copies from it, so the group is its Backdrop Root.
-    fn vn_layer_target(&mut self, depth: usize, frame: &FrameTarget) -> Result<FrameTarget> {
+    pub(super) fn vn_layer_target(
+        &mut self,
+        depth: usize,
+        frame: &FrameTarget,
+    ) -> Result<FrameTarget> {
         let (width, height) = (frame.texture.width(), frame.texture.height());
         let state = &mut self.vn_layers;
         if state

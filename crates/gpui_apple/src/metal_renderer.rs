@@ -1,12 +1,13 @@
 mod backdrop;
+mod vn_effect;
 mod vn_layer;
 
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, VnBatch, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectQuad, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, VnBatch, point, size,
 };
 use image::RgbaImage;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
@@ -682,7 +683,9 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         )?;
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
+        let effects = self.prepare_vn_effects(scene);
+        let instance_bindings = write_instances(scene, effects.effect_quads(scene), &mut writer)
+            .with_context(|| {
             format!(
                 "writing instance data: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -698,6 +701,7 @@ impl MetalRenderer {
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
+            &effects,
             &mut writer,
             texture,
             viewport_size,
@@ -867,6 +871,7 @@ impl MetalRenderer {
         &mut self,
         scene: &Scene,
         instance_bindings: &InstanceBindings,
+        effects: &vn_effect::VnEffectFrame,
         writer: &mut InstanceBufferWriter,
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
@@ -884,6 +889,7 @@ impl MetalRenderer {
             scene,
             instances: instance_bindings,
             layers: layers.as_ref(),
+            effects,
             viewport_size,
         };
         self.draw_group(
@@ -902,6 +908,7 @@ impl MetalRenderer {
             surface_textures,
         )?;
         self.finish_vn_layers();
+        self.finish_vn_effects();
         self.finish_frame_target(&command_buffer, &frame)?;
 
         Ok(command_buffer)
@@ -1799,6 +1806,7 @@ struct GroupDraw<'a> {
     scene: &'a Scene,
     instances: &'a InstanceBindings,
     layers: Option<&'a vn_layer::VnLayerBindings>,
+    effects: &'a vn_effect::VnEffectFrame,
     viewport_size: Size<DevicePixels>,
 }
 
@@ -1813,12 +1821,16 @@ struct InstanceBindings {
     surfaces: InstanceBinding,
 }
 
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
+fn write_instances(
+    scene: &Scene,
+    effect_quads: &[EffectQuad],
+    writer: &mut InstanceBufferWriter,
+) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
         backdrop_blur_rects: writer.write(&scene.backdrop_blur_rects)?,
-        effect_quads: writer.write(&scene.effect_quads)?,
+        effect_quads: writer.write(effect_quads)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
         polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
@@ -2057,11 +2069,14 @@ enum BackdropInputIndex {
 }
 
 /// Texture slots of the same pipelines, the generated stages' `[[texture(0)]]`
-/// (the blurred backdrop) and `[[texture(2)]]` (the untouched snapshot).
+/// (the blurred backdrop), `[[texture(2)]]` (the untouched snapshot), and an
+/// effect layer's content and history.
 #[repr(C)]
 enum BackdropTextureIndex {
     Processed = 0,
     Original = 2,
+    Content = 7,
+    History = 8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

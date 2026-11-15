@@ -63,6 +63,7 @@ mod util;
 mod view;
 mod window;
 mod vn_clip;
+mod vn_effect_history;
 
 #[cfg(feature = "profiler")]
 mod debug_overlay;
@@ -156,6 +157,7 @@ pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 pub use vn_clip::*;
+pub use vn_effect_history::*;
 
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;

@@ -48,6 +48,11 @@ struct EffectQuad {
 
 @group(0) @binding(0) var<uniform> effect_globals: EffectGlobals;
 @group(1) @binding(0) var<storage, read> effect_quads: array<EffectQuad>;
+@group(2) @binding(1) var effect_sampler: sampler;
+@group(2) @binding(7) var effect_content: texture_2d<f32>;
+
+// `gpui::EFFECT_FLAG_HISTORY_PASS`.
+const HISTORY_PASS: u32 = 8u;
 
 // Exactly the varyings the generated fragment stage declares.
 struct EffectVarying {
@@ -63,6 +68,13 @@ struct EffectVarying {
 fn vs_effect(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> EffectVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let quad = effect_quads[instance_id];
+    // A history step covers its whole target: the quad's own texels.
+    if ((quad.flags & HISTORY_PASS) != 0u) {
+        var step = EffectVarying();
+        step.position = vec4<f32>(unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+        step.effect_quad_id = instance_id;
+        return step;
+    }
     let origin = max(quad.bounds.origin, quad.content_mask.origin);
     let corner = min(quad.bounds.origin + quad.bounds.size, quad.content_mask.origin + quad.content_mask.size);
     let position = origin + unit_vertex * max(corner - origin, vec2<f32>(0.0));
@@ -91,4 +103,14 @@ fn fs_punch(input: EffectVarying) -> @location(0) vec4<f32> {
     let inside = saturate(0.5 - punch_distance(input.position.xy, quad.bounds, quad.corner_radii));
     let unmasked = saturate(0.5 - punch_distance(input.position.xy, quad.content_mask, quad.content_mask_radii));
     return vec4<f32>(0.0, 0.0, 0.0, inside * unmasked * quad.opacity);
+}
+
+// `gpui::effect_id::CONTENT`: an effect layer's content as it is, at the
+// quad's opacity, cut by its content mask.
+@fragment
+fn fs_content(input: EffectVarying) -> @location(0) vec4<f32> {
+    let quad = effect_quads[input.effect_quad_id];
+    let unmasked = saturate(0.5 - punch_distance(input.position.xy, quad.content_mask, quad.content_mask_radii));
+    let uv = input.position.xy / effect_globals.viewport_size;
+    return textureSampleLevel(effect_content, effect_sampler, uv, 0.0) * (quad.opacity * unmasked);
 }

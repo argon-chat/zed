@@ -936,6 +936,17 @@ fn transform_bounds(
 /// smaller factor, a circular corner inside the elliptical one, so the clip
 /// shows a little more rather than less. A rotation, skew or flip drops the
 /// radii, leaving the square bounding box that `transform_bounds` gives.
+/// The key of `spec`'s history on `element`, 0 for none.
+fn vn_history_key(element: u64, spec: &EffectSpec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if element == 0 || spec.flags & crate::EFFECT_FLAG_HISTORY == 0 {
+        return 0;
+    }
+    let mut hasher = collections::FxHasher::default();
+    (element, spec.id).hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
 fn transform_mask(
     matrix: TransformationMatrix,
     mask: ContentMask<Pixels>,
@@ -1746,6 +1757,9 @@ pub struct Window {
     /// change to false clear it. It starts as the platform's `is_hovered()`.
     pointer_inside: bool,
     vn_effect_pointer: VnEffectPointer,
+    /// vue-native fork: the identity of the element whose style paints next,
+    /// which keys an `[SkHistory]` effect's state; 0 when it has none.
+    vn_effect_element: u64,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -2915,6 +2929,7 @@ impl Window {
             visibility,
             visibility_observers: SingleSubscriberSet::new(),
             vn_effect_pointer: VnEffectPointer::new(hovered.get()),
+            vn_effect_element: 0,
             pointer_inside: hovered.get(),
             hovered,
             needs_present,
@@ -6324,14 +6339,135 @@ impl Window {
         corner_radii: Corners<Pixels>,
         spec: EffectSpec,
     ) {
-        self.invalidator.debug_assert_paint();
+        self.vn_paint_effect(bounds, corner_radii, spec, 0);
+    }
 
-        if !spec.is_some() {
+    /// vue-native fork: [`Self::paint_effect_quad`] for `element`
+    /// ([`Self::vn_take_effect_element`]), which keys an `[SkHistory]` state.
+    pub fn vn_paint_effect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        spec: EffectSpec,
+        element: u64,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        let Some(mut quad) = self.vn_effect_quad(bounds, corner_radii, spec, opacity) else {
+            return;
+        };
+        quad.flags &= !crate::EFFECT_FLAG_NEEDS_CONTENT;
+        let history = vn_history_key(element, &spec);
+        if history == 0 {
+            quad.flags &= !crate::EFFECT_FLAG_HISTORY;
+            self.next_frame.scene.insert_primitive(quad);
             return;
         }
+        let content_mask = quad.content_mask;
+        self.next_frame.scene.vn_push_effect(crate::VnEffectPaint {
+            draws: vec![crate::VnEffectDraw { quad, history }],
+            content: false,
+            content_mask,
+        });
+        self.next_frame.scene.vn_pop_isolation();
+    }
+
+    /// vue-native fork: names the element whose style paints next
+    /// ([`Self::vn_take_effect_element`]).
+    pub fn vn_set_effect_element(&mut self, id: Option<&GlobalElementId>) {
+        use std::hash::{Hash, Hasher};
+        // Views are left out: a cached subtree is painted inside its view on
+        // one frame and replayed without it on the next.
+        self.vn_effect_element = id.map_or(0, |id| {
+            let mut hasher = collections::FxHasher::default();
+            for id in id.iter() {
+                if !matches!(id, ElementId::View(_)) {
+                    id.hash(&mut hasher);
+                }
+            }
+            hasher.finish().max(1)
+        });
+    }
+
+    /// vue-native fork: the element [`Self::vn_set_effect_element`] named, 0
+    /// for none; taken, so a child without an identity does not inherit it.
+    pub fn vn_take_effect_element(&mut self) -> u64 {
+        mem::take(&mut self.vn_effect_element)
+    }
+
+    /// vue-native fork: paints `f` into an isolated group at full opacity, which
+    /// the `[SkContent]` effects among `effects` composite in its place; the
+    /// opacity share none of them takes composites the group as it is.
+    pub fn vn_with_effect_content<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        effects: &[(EffectSpec, f32)],
+        element: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         let opacity = self.element_opacity();
-        if opacity <= 0. {
-            return;
+        if !self.invalidator.is_painting() || opacity <= 0. {
+            return f(self);
+        }
+        let mut draws = Vec::new();
+        let mut plain = 1.;
+        for (spec, weight) in effects {
+            if spec.flags & crate::EFFECT_FLAG_NEEDS_CONTENT == 0 || *weight <= 0. {
+                continue;
+            }
+            let Some(mut quad) = self.vn_effect_quad(bounds, corner_radii, *spec, opacity * weight)
+            else {
+                continue;
+            };
+            let history = vn_history_key(element, spec);
+            if history == 0 {
+                quad.flags &= !crate::EFFECT_FLAG_HISTORY;
+            }
+            plain -= weight;
+            draws.push(crate::VnEffectDraw { quad, history });
+        }
+        let content_mask = self.snapped_content_mask();
+        if plain > 1e-3 {
+            draws.insert(
+                0,
+                crate::VnEffectDraw {
+                    quad: EffectQuad {
+                        effect_id: crate::effect_id::CONTENT,
+                        bounds: content_mask.bounds,
+                        content_mask,
+                        opacity: opacity * plain.min(1.),
+                        scale: self.scale_factor(),
+                        flags: crate::EFFECT_FLAG_NEEDS_CONTENT,
+                        ..Default::default()
+                    },
+                    history: 0,
+                },
+            );
+        }
+        self.next_frame.scene.vn_push_effect(crate::VnEffectPaint {
+            draws,
+            content: true,
+            content_mask,
+        });
+        let opacity = mem::replace(&mut self.element_opacity, 1.);
+        let result = f(self);
+        self.element_opacity = opacity;
+        self.next_frame.scene.vn_pop_isolation();
+        result
+    }
+
+    /// The quad `spec` draws over `bounds` at `opacity`, None when it draws
+    /// nothing; asks for the next frame while it animates.
+    fn vn_effect_quad(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        spec: EffectSpec,
+        opacity: f32,
+    ) -> Option<EffectQuad> {
+        if !spec.is_some() || opacity <= 0. {
+            return None;
         }
 
         let scale_factor = self.scale_factor();
@@ -6362,7 +6498,7 @@ impl Window {
             self.snap_bounds(draw_bounds),
             self.element_transform,
         ) else {
-            return;
+            return None;
         };
         let bleed = bleed.scale(scale_factor);
         let now = crate::effect_clock_seconds();
@@ -6395,7 +6531,7 @@ impl Window {
             self.request_animation_frame();
         }
 
-        self.next_frame.scene.insert_primitive(EffectQuad {
+        Some(EffectQuad {
             order: 0,
             effect_id: spec.id,
             bounds: draw_bounds,
@@ -6408,7 +6544,7 @@ impl Window {
             backdrop_blur_radius: px(spec.backdrop_blur_radius()).scale(scale_factor),
             scale: scale_factor,
             flags: spec.flags,
-        });
+        })
     }
 
     /// vue-native: makes `bounds` (rounded by `corner_radii`) transparent in
