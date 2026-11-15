@@ -1430,6 +1430,25 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// vue-native fork: hides the cursor and holds it in this window; mouse moves keep coming,
+    /// their motion in [`PlatformWindow::take_pointer_motion`]. `unadjusted` asks for the
+    /// device's own counts, without pointer acceleration. The platform lets go by itself when
+    /// the window loses activation or closes.
+    fn lock_pointer(&self, _unadjusted: bool) -> Result<(), PointerLockError> {
+        Err(PointerLockError::Unsupported)
+    }
+    /// vue-native fork: shows the cursor again where it was when locked.
+    fn unlock_pointer(&self) {}
+    /// vue-native fork: still held ([`PlatformWindow::lock_pointer`])?
+    fn is_pointer_locked(&self) -> bool {
+        false
+    }
+    /// vue-native fork: the motion behind the mouse move being delivered while the pointer is
+    /// locked, logical pixels (device counts when unadjusted).
+    fn take_pointer_motion(&self) -> Option<Point<Pixels>> {
+        None
+    }
+
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {
         self.window_bounds()
@@ -1519,6 +1538,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+}
+
+/// vue-native fork: why [`PlatformWindow::lock_pointer`] did not lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerLockError {
+    /// This platform (or this mode, `unadjusted`) cannot lock the pointer.
+    Unsupported,
+    /// The system refused: the window is not the active one, or a call failed.
+    Refused,
 }
 
 /// A renderer for headless windows that can produce real rendered output.

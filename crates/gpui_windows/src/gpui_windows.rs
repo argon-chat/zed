@@ -19,6 +19,7 @@ mod events;
 mod frame_pacing;
 mod keyboard;
 mod platform;
+mod pointer_lock;
 mod profiling;
 mod system_notifications;
 mod system_settings;

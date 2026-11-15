@@ -670,6 +670,8 @@ struct MacWindowState {
     fullscreen_backdrop: FullscreenBackdrop,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
+    pointer_locked: bool,
+    pointer_motion: Option<Point<Pixels>>,
     frame_source: FrameSource,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -1136,6 +1138,8 @@ impl MacWindow {
                 fullscreen_backdrop: FullscreenBackdrop::new(),
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
+                pointer_locked: false,
+                pointer_motion: None,
                 frame_source: match &metal_frames {
                     Some(metal_frames) => FrameSource::Metal(metal_frames.clone()),
                     None => FrameSource::DisplayLink(None),
@@ -2204,6 +2208,42 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn lock_pointer(&self, unadjusted: bool) -> Result<(), gpui::PointerLockError> {
+        use core_graphics::display::CGDisplay;
+        if unadjusted {
+            return Err(gpui::PointerLockError::Unsupported);
+        }
+        let mut lock = self.0.lock();
+        if !lock.native_window().isKeyWindow() {
+            return Err(gpui::PointerLockError::Refused);
+        }
+        if lock.pointer_locked {
+            return Ok(());
+        }
+        // The cursor stays where it is; mouse-moved events keep their deltas.
+        CGDisplay::associate_mouse_and_mouse_cursor_position(false)
+            .map_err(|_| gpui::PointerLockError::Refused)?;
+        if CGDisplay::main().hide_cursor().is_err() {
+            CGDisplay::associate_mouse_and_mouse_cursor_position(true).ok();
+            return Err(gpui::PointerLockError::Refused);
+        }
+        lock.pointer_locked = true;
+        lock.pointer_motion = None;
+        Ok(())
+    }
+
+    fn unlock_pointer(&self) {
+        release_pointer_lock(&mut self.0.lock());
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.lock().pointer_locked
+    }
+
+    fn take_pointer_motion(&self) -> Option<Point<Pixels>> {
+        self.0.lock().pointer_motion.take()
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().foreground_executor.clone();
         executor
@@ -2899,6 +2939,14 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
     }
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
+    if lock.pointer_locked && matches!(event, Some(PlatformInput::MouseMove(_))) {
+        // SAFETY: a mouse-moved or -dragged NSEvent answers `deltaX`/`deltaY` (points, y down).
+        let dx: f64 = unsafe { msg_send![native_event, deltaX] };
+        let dy: f64 = unsafe { msg_send![native_event, deltaY] };
+        let by = point(px(dx as f32), px(dy as f32));
+        lock.pointer_motion = Some(lock.pointer_motion.map_or(by, |sum| sum + by));
+    }
+
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
@@ -3037,6 +3085,16 @@ extern "C" fn handle_view_event(this: &AnyObject, _: Sel, native_event: *mut Any
             window_state.lock().event_callback = Some(callback);
         }
     }
+}
+
+fn release_pointer_lock(state: &mut MacWindowState) {
+    use core_graphics::display::CGDisplay;
+    if !std::mem::take(&mut state.pointer_locked) {
+        return;
+    }
+    state.pointer_motion = None;
+    CGDisplay::associate_mouse_and_mouse_cursor_position(true).ok();
+    CGDisplay::main().show_cursor().ok();
 }
 
 fn visibility(state: &MacWindowState) -> WindowVisibility {
@@ -3409,8 +3467,11 @@ fn report_display_change(window_state: &Rc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *mut AnyObject) {
     let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = lock.native_window().isKeyWindow();
+    if !is_active {
+        release_pointer_lock(&mut lock);
+    }
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
@@ -3512,6 +3573,7 @@ extern "C" fn close_window(this: &AnyObject, _: Sel) {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
+            release_pointer_lock(&mut lock);
             (
                 lock.close_callback.take(),
                 lock.simple_fullscreen_state.take(),

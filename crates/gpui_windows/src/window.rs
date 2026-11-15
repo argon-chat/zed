@@ -91,6 +91,7 @@ pub struct WindowsWindowState {
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
     pub(crate) mouse_position: Cell<Option<Point<Pixels>>>,
+    pub(crate) pointer_lock: crate::pointer_lock::PointerLock,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -193,6 +194,7 @@ impl WindowsWindowState {
             direct_manipulation,
             a11y: RefCell::new(None),
             mouse_position: Cell::new(None),
+            pointer_lock: Default::default(),
         })
     }
 
@@ -1201,6 +1203,22 @@ impl PlatformWindow for WindowsWindow {
     #[cfg(feature = "native-dx12")]
     fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
         self.state.renderer.borrow().vn_composition_underlay()
+    }
+
+    fn lock_pointer(&self, unadjusted: bool) -> std::result::Result<(), PointerLockError> {
+        self.state.pointer_lock.lock(self.0.hwnd, unadjusted)
+    }
+
+    fn unlock_pointer(&self) {
+        self.state.pointer_lock.unlock();
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.state.pointer_lock.is_locked()
+    }
+
+    fn take_pointer_motion(&self) -> Option<Point<Pixels>> {
+        self.state.pointer_lock.take_motion()
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

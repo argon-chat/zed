@@ -1372,7 +1372,11 @@ impl X11Client {
                 state.modifiers = modifiers;
                 drop(state);
 
-                if event.valuator_mask[0] & 3 != 0 {
+                let locked = window.locked_motion(
+                    event.event_x as f32 / 65536.0,
+                    event.event_y as f32 / 65536.0,
+                );
+                if event.valuator_mask[0] & 3 != 0 && locked != Some(false) {
                     window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
                         position,
                         pressed_button,
@@ -2593,7 +2597,7 @@ fn make_scroll_wheel_event(
     }
 }
 
-fn create_invisible_cursor(
+pub(super) fn create_invisible_cursor(
     connection: &XCBConnection,
 ) -> anyhow::Result<crate::linux::x11::client::xproto::Cursor> {
     let empty_pixmap = connection.generate_id()?;

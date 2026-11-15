@@ -292,7 +292,24 @@ pub struct X11WindowState {
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    pointer_lock: Option<PointerLock>,
 }
+
+/// vue-native fork: an XI2 grab holds the pointer with an invisible cursor; it is put back at the
+/// centre whenever it strays half way to an edge, so motion never stops at one.
+struct PointerLock {
+    device: xinput::DeviceId,
+    cursor: xproto::Cursor,
+    /// Window pixels, as are the rest.
+    restore: (i16, i16),
+    center: (f32, f32),
+    last: (f32, f32),
+    /// Events left before a warp is assumed done; until then they predate it.
+    warping: u8,
+    motion: Option<Point<Pixels>>,
+}
+
+const WARP_GRACE: u8 = 8;
 
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
@@ -854,6 +871,7 @@ impl X11WindowState {
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
+                pointer_lock: None,
                 edge_constraints: None,
                 accesskit_adapter: None,
                 counter_id: sync_request_counter,
@@ -1161,6 +1179,7 @@ impl X11WindowStatePtr {
     }
 
     pub fn close(&self) {
+        self.release_pointer_lock();
         let state = self.state.borrow();
         let client = state.client.clone();
         #[allow(clippy::mutable_key_type)]
@@ -1332,7 +1351,57 @@ impl X11WindowStatePtr {
         Ok(())
     }
 
+    /// A motion event at `(x, y)` window pixels: `None` unless the pointer is locked, then
+    /// whether it carries motion to report.
+    pub fn locked_motion(&self, x: f32, y: f32) -> Option<bool> {
+        let mut state = self.state.borrow_mut();
+        let scale = state.scale_factor;
+        let lock = state.pointer_lock.as_mut()?;
+        if lock.warping > 0 {
+            lock.warping -= 1;
+            if (x, y) == lock.center || lock.warping == 0 {
+                lock.warping = 0;
+                lock.last = (x, y);
+            }
+            return Some(false);
+        }
+        let (dx, dy) = (x - lock.last.0, y - lock.last.1);
+        lock.last = (x, y);
+        if dx == 0.0 && dy == 0.0 {
+            return Some(false);
+        }
+        let by = gpui::point(px(dx / scale), px(dy / scale));
+        lock.motion = Some(lock.motion.map_or(by, |sum| sum + by));
+        let (cx, cy) = lock.center;
+        if (x - cx).abs() > cx / 2.0 || (y - cy).abs() > cy / 2.0 {
+            lock.warping = WARP_GRACE;
+            self.xcb
+                .warp_pointer(x11rb::NONE, self.x_window, 0, 0, 0, 0, cx as i16, cy as i16)
+                .log_err();
+            xcb_flush(&self.xcb);
+        }
+        Some(true)
+    }
+
+    pub fn release_pointer_lock(&self) {
+        let Some(lock) = self.state.borrow_mut().pointer_lock.take() else {
+            return;
+        };
+        self.xcb
+            .xinput_xi_ungrab_device(x11rb::CURRENT_TIME, lock.device)
+            .log_err();
+        let (x, y) = lock.restore;
+        self.xcb
+            .warp_pointer(x11rb::NONE, self.x_window, 0, 0, 0, 0, x, y)
+            .log_err();
+        self.xcb.free_cursor(lock.cursor).log_err();
+        xcb_flush(&self.xcb);
+    }
+
     pub fn set_active(&self, focus: bool) {
+        if !focus {
+            self.release_pointer_lock();
+        }
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
             fun(focus);
@@ -1978,6 +2047,85 @@ impl PlatformWindow for X11Window {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.as_ref()?.gpu_specs()
+    }
+
+    fn lock_pointer(&self, unadjusted: bool) -> Result<(), gpui::PointerLockError> {
+        use gpui::PointerLockError::{Refused, Unsupported};
+        if unadjusted {
+            return Err(Unsupported);
+        }
+        if !self.is_active() {
+            return Err(Refused);
+        }
+        self.0.release_pointer_lock();
+        let (xcb, window) = (&self.0.xcb, self.0.x_window);
+        let device = xcb
+            .xinput_xi_get_client_pointer(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .ok_or(Refused)?
+            .deviceid;
+        let at = xcb
+            .query_pointer(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .ok_or(Refused)?;
+        let cursor = super::client::create_invisible_cursor(xcb).map_err(|_| Refused)?;
+        let mask = [u32::from(
+            xinput::XIEventMask::MOTION
+                | xinput::XIEventMask::BUTTON_PRESS
+                | xinput::XIEventMask::BUTTON_RELEASE,
+        )];
+        let grabbed = xcb
+            .xinput_xi_grab_device(
+                window,
+                x11rb::CURRENT_TIME,
+                cursor,
+                device,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+                xinput::GrabOwner::OWNER,
+                &mask,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|reply| reply.status == xproto::GrabStatus::SUCCESS);
+        if !grabbed {
+            xcb.free_cursor(cursor).log_err();
+            xcb_flush(xcb);
+            return Err(Refused);
+        }
+        let mut state = self.0.state.borrow_mut();
+        let size = state.bounds.size;
+        let center = (
+            (size.width.as_f32() * state.scale_factor / 2.0).round(),
+            (size.height.as_f32() * state.scale_factor / 2.0).round(),
+        );
+        xcb.warp_pointer(x11rb::NONE, window, 0, 0, 0, 0, center.0 as i16, center.1 as i16)
+            .log_err();
+        xcb_flush(xcb);
+        state.pointer_lock = Some(PointerLock {
+            device,
+            cursor,
+            restore: (at.win_x, at.win_y),
+            center,
+            last: center,
+            warping: WARP_GRACE,
+            motion: None,
+        });
+        Ok(())
+    }
+
+    fn unlock_pointer(&self) {
+        self.0.release_pointer_lock();
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.state.borrow().pointer_lock.is_some()
+    }
+
+    fn take_pointer_motion(&self) -> Option<Point<Pixels>> {
+        self.0.state.borrow_mut().pointer_lock.as_mut()?.motion.take()
     }
 
     fn play_system_bell(&self) {

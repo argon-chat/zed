@@ -1062,6 +1062,19 @@ pub enum VnHitKind {
 /// See [`Window::set_vn_hit_refiner`].
 pub type VnHitRefiner = Rc<dyn Fn(VnHitKind, Point<Pixels>, &mut Window, &mut App)>;
 
+/// vue-native fork: how [`Window::vn_lock_pointer`] holds the pointer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VnPointerLock {
+    /// The platform hides and holds the cursor ([`PlatformWindow::lock_pointer`]).
+    System {
+        /// The device's own counts, without pointer acceleration.
+        unadjusted: bool,
+    },
+    /// gpui's half alone, for tests: mouse events hold still at the lock position and moves
+    /// report how far their own position moved. The cursor is left alone.
+    Simulated,
+}
+
 /// How the hitbox affects mouse behavior.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum HitboxBehavior {
@@ -1670,6 +1683,12 @@ pub struct Window {
     input_interceptor: Option<Rc<dyn Fn(&PlatformInput, &mut Window, &mut App) -> bool>>,
     /// vue-native fork: see [`Window::vn_key_event_seq`].
     vn_key_event_seq: u64,
+    /// vue-native fork: [`Window::vn_lock_pointer`]'s mode and the position mouse events hold at.
+    vn_pointer_lock: Option<(VnPointerLock, Point<Pixels>)>,
+    /// vue-native fork: the last mouse move's position as delivered, before a lock pinned it.
+    vn_raw_mouse_position: Option<Point<Pixels>>,
+    /// vue-native fork: see [`Window::vn_mouse_movement`].
+    vn_mouse_movement: Point<Pixels>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// vue-native fork: the `clip-path` shapes in force that are no rounded
     /// rectangle, innermost first ([`Window::vn_with_clip_shape`]). A hitbox
@@ -2864,6 +2883,9 @@ impl Window {
             vn_hit_refiner: None,
             input_interceptor: None,
             vn_key_event_seq: 0,
+            vn_pointer_lock: None,
+            vn_raw_mouse_position: None,
+            vn_mouse_movement: Point::default(),
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
@@ -7448,6 +7470,82 @@ impl Window {
         self.pointer_inside
     }
 
+    /// vue-native fork: a browser's pointer lock. Until [`Window::vn_unlock_pointer`], every
+    /// mouse event is delivered at the position the pointer had now, and a move's motion is
+    /// [`Window::vn_mouse_movement`]. Locking again changes the mode.
+    pub fn vn_lock_pointer(&mut self, how: VnPointerLock) -> Result<(), crate::PointerLockError> {
+        let anchor = match self.vn_pointer_lock.take() {
+            Some((previous, anchor)) => {
+                if matches!(previous, VnPointerLock::System { .. }) {
+                    self.platform_window.unlock_pointer();
+                }
+                anchor
+            }
+            None => self.mouse_position,
+        };
+        if let VnPointerLock::System { unadjusted } = how {
+            self.platform_window.lock_pointer(unadjusted)?;
+        }
+        self.vn_pointer_lock = Some((how, anchor));
+        self.vn_raw_mouse_position = None;
+        Ok(())
+    }
+
+    /// vue-native fork: releases [`Window::vn_lock_pointer`]'s lock, if any.
+    pub fn vn_unlock_pointer(&mut self) {
+        if let Some((VnPointerLock::System { .. }, _)) = self.vn_pointer_lock.take() {
+            self.platform_window.unlock_pointer();
+        }
+        self.vn_raw_mouse_position = None;
+    }
+
+    /// vue-native fork: is the pointer still locked? The platform lets go by itself when the
+    /// window loses activation.
+    pub fn vn_pointer_locked(&self) -> bool {
+        match self.vn_pointer_lock {
+            Some((VnPointerLock::System { .. }, _)) => self.platform_window.is_pointer_locked(),
+            Some((VnPointerLock::Simulated, _)) => true,
+            None => false,
+        }
+    }
+
+    /// vue-native fork: how far the mouse move being dispatched moved the pointer since the
+    /// previous move, logical pixels: a browser's `movementX`/`movementY`. While the pointer is
+    /// locked by the system it is the platform's measure (device counts when unadjusted).
+    pub fn vn_mouse_movement(&self) -> Point<Pixels> {
+        self.vn_mouse_movement
+    }
+
+    fn vn_pin_to_pointer_lock(&mut self, mut event: PlatformInput) -> PlatformInput {
+        let system = matches!(
+            self.vn_pointer_lock,
+            Some((VnPointerLock::System { .. }, _))
+        );
+        if system && !self.platform_window.is_pointer_locked() {
+            self.vn_pointer_lock = None;
+            self.vn_raw_mouse_position = None;
+        }
+        if let PlatformInput::MouseMove(mouse_move) = &event {
+            let previous = self.vn_raw_mouse_position.replace(mouse_move.position);
+            let motion = system.then(|| self.platform_window.take_pointer_motion());
+            self.vn_mouse_movement = motion.flatten().unwrap_or_else(|| {
+                previous.map_or_else(Point::default, |previous| mouse_move.position - previous)
+            });
+        }
+        let Some((_, anchor)) = self.vn_pointer_lock else {
+            return event;
+        };
+        match &mut event {
+            PlatformInput::MouseMove(e) => e.position = anchor,
+            PlatformInput::MouseDown(e) => e.position = anchor,
+            PlatformInput::MouseUp(e) => e.position = anchor,
+            PlatformInput::Scroll(e) => e.position = anchor,
+            PlatformInput::MouseExited(e) => e.position = anchor,
+            _ => {}
+        }
+        event
+    }
+
     /// vue-native fork: will this frame draw the window? `true` once anything
     /// invalidated it since its last draw (a notify, a `refresh`, a resize).
     /// An embedder with work that must follow the frame's layout and precede
@@ -7902,6 +8000,7 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let event = self.vn_pin_to_pointer_lock(event);
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.

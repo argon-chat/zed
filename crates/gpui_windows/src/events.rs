@@ -112,6 +112,7 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
+            WM_INPUT => self.handle_raw_input_msg(lparam),
             WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
@@ -173,6 +174,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        self.state.pointer_lock.follow_window();
         let origin = logical_point(
             lparam.signed_loword() as f32,
             lparam.signed_hiword() as f32,
@@ -225,6 +227,7 @@ impl WindowsWindowInner {
         // Minimizing and restoring both arrive as `WM_SIZE`; the deferred report
         // reads `IsIconic` at delivery, so one call covers both directions.
         self.report_visibility();
+        self.state.pointer_lock.follow_window();
 
         // Don't resize the renderer when the window is minimized, but record that it was minimized so
         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
@@ -338,6 +341,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.pointer_lock.unlock();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -364,25 +368,19 @@ impl WindowsWindowInner {
 
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
         self.start_tracking_mouse(handle, TME_LEAVE);
+        let scale_factor = self.state.scale_factor.get();
+        let pressed_button = pressed_button_from_flags(MODIFIERKEYS_FLAGS(wparam.loword() as u32));
+        if let Some(moved) = self.state.pointer_lock.on_mouse_move(scale_factor) {
+            if moved {
+                self.deliver_locked_move(pressed_button);
+            }
+            return Some(0);
+        }
         self.restore_cursor_after_hide();
 
         let x = lparam.signed_loword() as f32;
         let y = lparam.signed_hiword() as f32;
-        let scale_factor = self.state.scale_factor.get();
         let new_position = logical_point(x, y, scale_factor);
-
-        let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
-            flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
-            flags if flags.contains(MK_RBUTTON) => Some(MouseButton::Right),
-            flags if flags.contains(MK_MBUTTON) => Some(MouseButton::Middle),
-            flags if flags.contains(MK_XBUTTON1) => {
-                Some(MouseButton::Navigate(NavigationDirection::Back))
-            }
-            flags if flags.contains(MK_XBUTTON2) => {
-                Some(MouseButton::Navigate(NavigationDirection::Forward))
-            }
-            _ => None,
-        };
 
         // Suppress synthetic WM_MOUSEMOVE events that Windows fires when a window
         // repaints under the cursor (e.g. command palette opening). These are not
@@ -404,6 +402,29 @@ impl WindowsWindowInner {
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
         if handled { Some(0) } else { Some(1) }
+    }
+
+    fn handle_raw_input_msg(&self, lparam: LPARAM) -> Option<isize> {
+        if self.state.pointer_lock.on_raw_input(lparam) {
+            self.deliver_locked_move(pressed_button_from_keys());
+        }
+        // `DefWindowProc` frees the input's buffer.
+        None
+    }
+
+    /// A move while the pointer is locked: gpui pins it to the lock position and reads its
+    /// motion from `take_pointer_motion`.
+    fn deliver_locked_move(&self, pressed_button: Option<MouseButton>) {
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return;
+        };
+        let input = PlatformInput::MouseMove(MouseMoveEvent {
+            position: self.state.mouse_position.get().unwrap_or_default(),
+            pressed_button,
+            modifiers: current_modifiers(),
+        });
+        func(input);
+        self.state.callbacks.input.set(Some(func));
     }
 
     fn handle_mouse_leave_msg(&self) -> Option<isize> {
@@ -826,6 +847,7 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
+            this.state.pointer_lock.unlock();
             this.state.cursor_visible.store(true, Ordering::Relaxed);
         }
 
@@ -1211,6 +1233,10 @@ impl WindowsWindowInner {
     }
 
     fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        if self.state.pointer_lock.is_locked() {
+            unsafe { SetCursor(None) };
+            return Some(1);
+        }
         if unsafe { !IsWindowEnabled(handle).as_bool() }
             || matches!(
                 lparam.loword() as u32,
@@ -1815,6 +1841,39 @@ pub(crate) fn current_modifiers() -> Modifiers {
         platform: is_virtual_key_pressed(VK_LWIN) || is_virtual_key_pressed(VK_RWIN),
         function: false,
     }
+}
+
+fn pressed_button_from_flags(flags: MODIFIERKEYS_FLAGS) -> Option<MouseButton> {
+    match flags {
+        flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
+        flags if flags.contains(MK_RBUTTON) => Some(MouseButton::Right),
+        flags if flags.contains(MK_MBUTTON) => Some(MouseButton::Middle),
+        flags if flags.contains(MK_XBUTTON1) => {
+            Some(MouseButton::Navigate(NavigationDirection::Back))
+        }
+        flags if flags.contains(MK_XBUTTON2) => {
+            Some(MouseButton::Navigate(NavigationDirection::Forward))
+        }
+        _ => None,
+    }
+}
+
+fn pressed_button_from_keys() -> Option<MouseButton> {
+    [
+        (VK_LBUTTON, MouseButton::Left),
+        (VK_RBUTTON, MouseButton::Right),
+        (VK_MBUTTON, MouseButton::Middle),
+        (
+            VK_XBUTTON1,
+            MouseButton::Navigate(NavigationDirection::Back),
+        ),
+        (
+            VK_XBUTTON2,
+            MouseButton::Navigate(NavigationDirection::Forward),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(key, button)| is_virtual_key_pressed(key).then_some(button))
 }
 
 #[inline]
