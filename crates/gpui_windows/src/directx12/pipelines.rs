@@ -82,6 +82,8 @@ enum PipelineKind {
     Content,
     /// vue-native: an app effect's `[SkHistory]` step, blending off.
     AppHistory(u64),
+    /// vue-native: the layer composite blended `plus-lighter`.
+    VnPlusLighter,
 }
 
 /// vue-native: an app effect's fragment stage, compiled when the app's effects
@@ -286,6 +288,15 @@ impl Pipelines {
         })
     }
 
+    /// The layer composite with `gpui::vn_layer_flags::PLUS_LIGHTER`'s blend.
+    pub fn vn_plus_lighter(&mut self, format: DXGI_FORMAT) -> Result<ID3D12PipelineState> {
+        self.get(PipelineKey {
+            kind: PipelineKind::VnPlusLighter,
+            format,
+            samples: 1,
+        })
+    }
+
     /// The pipeline for `EffectQuad::effect_id` `index` and whether it reads the
     /// backdrop; None for an app effect that never built or an id past the
     /// app's effects, whose quads draw nothing.
@@ -467,6 +478,10 @@ impl Pipelines {
                 Cow::Owned(compile_content()?),
                 Blend::Premultiplied,
             ),
+            PipelineKind::VnPlusLighter => {
+                let (vertex, fragment) = embedded::module(ShaderModule::VnLayer);
+                (Cow::Borrowed(vertex), Cow::Borrowed(fragment), Blend::PlusLighter)
+            }
             PipelineKind::AppEffect(id) | PipelineKind::AppHistory(id) => {
                 let fragment = self
                     .app_effects
@@ -648,6 +663,8 @@ enum Blend {
     Premultiplied,
     Replace,
     Subpixel,
+    /// vue-native: CSS `plus-lighter` over premultiplied colour.
+    PlusLighter,
 }
 
 fn app_effect_blend(needs_backdrop: bool) -> Blend {
@@ -685,10 +702,10 @@ fn blend_description(blend: Blend) -> D3D12_BLEND_DESC {
         Blend::Subpixel => D3D12_BLEND_SRC1_COLOR,
         _ => D3D12_BLEND_ONE,
     };
-    target.DestBlend = if matches!(blend, Blend::Subpixel) {
-        D3D12_BLEND_INV_SRC1_COLOR
-    } else {
-        D3D12_BLEND_INV_SRC_ALPHA
+    target.DestBlend = match blend {
+        Blend::Subpixel => D3D12_BLEND_INV_SRC1_COLOR,
+        Blend::PlusLighter => D3D12_BLEND_ONE,
+        _ => D3D12_BLEND_INV_SRC_ALPHA,
     };
     target.BlendOp = D3D12_BLEND_OP_ADD;
     target.SrcBlendAlpha = if matches!(blend, Blend::DestinationOut) {
@@ -696,10 +713,10 @@ fn blend_description(blend: Blend) -> D3D12_BLEND_DESC {
     } else {
         D3D12_BLEND_ONE
     };
-    target.DestBlendAlpha = if matches!(blend, Blend::Subpixel) {
-        D3D12_BLEND_ZERO
-    } else {
-        D3D12_BLEND_INV_SRC_ALPHA
+    target.DestBlendAlpha = match blend {
+        Blend::Subpixel => D3D12_BLEND_ZERO,
+        Blend::PlusLighter => D3D12_BLEND_ONE,
+        _ => D3D12_BLEND_INV_SRC_ALPHA,
     };
     target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     target.LogicOp = D3D12_LOGIC_OP_NOOP;

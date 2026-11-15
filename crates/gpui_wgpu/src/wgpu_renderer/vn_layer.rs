@@ -9,8 +9,8 @@ use super::backdrop::{
 };
 use super::{GroupDraw, InstanceBinding, VN_LAYER_SHADERS, WgpuRendererCore, continue_pass};
 use anyhow::Result;
-use gpui::{Scene, VnLayer, VnTextBackground};
-use std::mem::size_of;
+use gpui::{Scene, VnLayer, VnTextBackground, vn_layer_flags};
+use std::{collections::HashMap, mem::size_of};
 
 /// Deeper groups draw inline, unclipped by their shape, as on DirectX.
 pub(super) const MAX_DEPTH: usize = 8;
@@ -18,7 +18,10 @@ pub(super) const MAX_DEPTH: usize = 8;
 /// Frames the layer targets may sit unused before release.
 const TARGET_RELEASE_FRAMES: u32 = 90;
 
-const LAYER_WORDS: usize = 40;
+/// Renders a snapshot no frame captured or painted may sit before release.
+const SNAPSHOT_IDLE_RENDERS: u32 = 4;
+
+const LAYER_WORDS: usize = 56;
 const SEGMENT_WORDS: usize = 4;
 const TEXT_BACKGROUND_WORDS: usize = 69;
 
@@ -31,10 +34,19 @@ const _: () = {
 #[derive(Default)]
 pub(super) struct VnLayerState {
     pipeline: PipelineState,
+    plus_lighter_pipeline: PipelineState,
     /// One per nesting depth.
     targets: Vec<TargetTexture>,
     depth_used: usize,
     idle_frames: u32,
+    /// The captures' pixels by id (`Scene::vn_captures`); they outlive a
+    /// resize and go with the device.
+    snapshots: HashMap<u64, Snapshot>,
+}
+
+struct Snapshot {
+    texture: TargetTexture,
+    idle: u32,
 }
 
 #[derive(Default)]
@@ -129,6 +141,25 @@ impl WgpuRendererCore {
         }
         let layer = draw.scene.vn_layers[index];
         let group = layer.group as usize;
+        if let Some(id) = layer.snapshot_id() {
+            let Some(layers) = draw.layers else {
+                return Ok(());
+            };
+            let Some(view) = self
+                .resources
+                .vn_layers
+                .snapshots
+                .get(&id)
+                .map(|snapshot| snapshot.texture.view.clone())
+            else {
+                return Ok(());
+            };
+            let Some(pipeline) = self.vn_layer_pipeline(layer.flags) else {
+                return Ok(());
+            };
+            self.vn_composite(&layers.bind_group, &pipeline, &view, index, encoder, frame);
+            return Ok(());
+        }
         let Some(layers) = draw.layers else {
             return self.draw_group(draw, group, depth, encoder, frame, None, instance_offset);
         };
@@ -139,54 +170,178 @@ impl WgpuRendererCore {
             ));
             return self.draw_group(draw, group, depth, encoder, frame, None, instance_offset);
         }
-        let Some(pipeline) = self.vn_layer_pipeline() else {
+        let Some(pipeline) = self.vn_layer_pipeline(layer.flags) else {
             return self.draw_group(draw, group, depth, encoder, frame, None, instance_offset);
         };
 
-        let target = self.vn_layer_target(depth, frame);
-        self.draw_group(
-            draw,
-            group,
-            depth + 1,
-            encoder,
-            &target,
-            Some(wgpu::Color::TRANSPARENT),
-            instance_offset,
-        )?;
-        let texture = self.create_texture_bind_group("vn_layer_texture", &target.view);
+        let target = self.draw_group_offscreen(draw, group, depth, encoder, frame, instance_offset)?;
+        self.vn_composite(&layers.bind_group, &pipeline, &target.view, index, encoder, frame);
+        Ok(())
+    }
+
+    /// Layer `index`'s composite from `source` over `frame`.
+    fn vn_composite(
+        &self,
+        layers: &wgpu::BindGroup,
+        pipeline: &wgpu::RenderPipeline,
+        source: &wgpu::TextureView,
+        index: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameTarget,
+    ) {
+        let texture = self.create_texture_bind_group("vn_layer_texture", source);
         let mut pass = continue_pass(encoder, &frame.view, "vn_layer_composite");
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources.globals_bind_group, &[]);
-        pass.set_bind_group(1, &layers.bind_group, &[]);
+        pass.set_bind_group(1, layers, &[]);
         pass.set_bind_group(2, &texture, &[]);
         pass.draw(0..4, index as u32..index as u32 + 1);
-        Ok(())
     }
 
     pub(super) fn finish_vn_layers(&mut self) {
         self.resources.vn_layers.trim_targets();
     }
 
-    fn vn_layer_pipeline(&mut self) -> Option<wgpu::RenderPipeline> {
+    /// Each capture's group into a cleared target, its ink copied into the
+    /// capture's snapshot; then snapshots unused for a few renders go.
+    pub(super) fn draw_vn_captures(
+        &mut self,
+        draw: &GroupDraw<'_>,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameTarget,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        if self.uses_webgl_instance_data {
+            return Ok(());
+        }
+        let (width, height) = (frame.texture.width(), frame.texture.height());
+        for capture in &draw.scene.vn_captures {
+            let id = capture.info.id;
+            let ink = capture.ink;
+            let left = ink.origin.x.0.max(0.) as u32;
+            let top = ink.origin.y.0.max(0.) as u32;
+            let right = ((ink.origin.x.0 + ink.size.width.0).max(0.) as u32).min(width);
+            let bottom = ((ink.origin.y.0 + ink.size.height.0).max(0.) as u32).min(height);
+            if right <= left || bottom <= top {
+                self.resources.vn_layers.snapshots.remove(&id);
+                continue;
+            }
+            let target =
+                self.draw_group_offscreen(draw, capture.group as usize, 0, encoder, frame, instance_offset)?;
+            let (copy_width, copy_height) = (right - left, bottom - top);
+            let reuse = self
+                .resources
+                .vn_layers
+                .snapshots
+                .get(&id)
+                .is_some_and(|s| {
+                    s.texture.texture.width() == copy_width
+                        && s.texture.texture.height() == copy_height
+                });
+            if !reuse {
+                let texture = create_target_texture(
+                    &self.resources.device,
+                    "vn_snapshot",
+                    self.target_format,
+                    copy_width,
+                    copy_height,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                );
+                self.resources
+                    .vn_layers
+                    .snapshots
+                    .insert(id, Snapshot { texture, idle: 0 });
+            }
+            let Some(snapshot) = self.resources.vn_layers.snapshots.get_mut(&id) else {
+                continue;
+            };
+            snapshot.idle = 0;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: left,
+                        y: top,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &snapshot.texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: copy_width,
+                    height: copy_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let state = &mut self.resources.vn_layers;
-        if let PipelineState::Unbuilt = state.pipeline {
-            let device = &self.resources.device;
-            let layouts = &self.resources.bind_group_layouts;
+        if !state.snapshots.is_empty() {
+            for layer in &draw.scene.vn_layers {
+                if let Some(snapshot) = layer
+                    .snapshot_id()
+                    .and_then(|id| state.snapshots.get_mut(&id))
+                {
+                    snapshot.idle = 0;
+                }
+            }
+            for snapshot in state.snapshots.values_mut() {
+                snapshot.idle += 1;
+            }
+            state
+                .snapshots
+                .retain(|_, snapshot| snapshot.idle <= SNAPSHOT_IDLE_RENDERS);
+        }
+        Ok(())
+    }
+
+    /// The composite pipeline: source-over, or `plus-lighter`
+    /// ([`vn_layer_flags::PLUS_LIGHTER`]).
+    fn vn_layer_pipeline(&mut self, flags: u32) -> Option<wgpu::RenderPipeline> {
+        let plus_lighter = flags & vn_layer_flags::PLUS_LIGHTER != 0;
+        let format = self.target_format;
+        let device = self.resources.device.clone();
+        let layouts = &self.resources.bind_group_layouts;
+        let state = &mut self.resources.vn_layers;
+        let slot = if plus_lighter {
+            &mut state.plus_lighter_pipeline
+        } else {
+            &mut state.pipeline
+        };
+        if let PipelineState::Unbuilt = slot {
             let layout = pipeline_layout(
-                device,
+                &device,
                 "vn_layer_layout",
                 &[&layouts.globals, &layouts.instances, &layouts.texture],
             );
-            state.pipeline = match capture_validation(device, || {
-                let module = shader_module(device, "vn_layer_shaders", VN_LAYER_SHADERS);
+            let blend = if plus_lighter {
+                let add = wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                };
+                wgpu::BlendState {
+                    color: add,
+                    alpha: add,
+                }
+            } else {
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+            };
+            *slot = match capture_validation(&device, || {
+                let module = shader_module(&device, "vn_layer_shaders", VN_LAYER_SHADERS);
                 render_pipeline(
-                    device,
+                    &device,
                     "vn_layer",
                     &layout,
                     (&module, "vs_vn_layer"),
                     (&module, "fs_vn_layer"),
-                    self.target_format,
-                    Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    format,
+                    Some(blend),
                 )
             }) {
                 Ok(pipeline) => PipelineState::Ready(pipeline),
@@ -199,7 +354,7 @@ impl WgpuRendererCore {
                 }
             };
         }
-        match &state.pipeline {
+        match slot {
             PipelineState::Ready(pipeline) => Some(pipeline.clone()),
             PipelineState::Unbuilt | PipelineState::Unavailable => None,
         }
@@ -241,8 +396,8 @@ mod tests {
     use gpui::{
         AtlasKey, BackdropBlurRect, Bounds, ContentMask, DevicePixels, MonochromeSprite,
         PlatformHeadlessRenderer, Quad, RenderSvgParams, Rgba, ScaledPixels, TransformationMatrix,
-        VnClipGeometry, VnColorMatrix, VnFillRule, VnIsolation, VnTextFill, VnTextPaint,
-        linear_color_stop, linear_gradient, point, rgb, size,
+        VnCaptureInfo, VnClipGeometry, VnColorMatrix, VnFillRule, VnIsolation, VnSnapshotPaint,
+        VnTextFill, VnTextPaint, linear_color_stop, linear_gradient, point, rgb, size,
     };
     use std::{borrow::Cow, sync::Arc};
 
@@ -315,6 +470,7 @@ mod tests {
             }),
             text_paint: None,
             content_mask: mask(),
+            capture: None,
         }
     }
 
@@ -480,6 +636,84 @@ mod tests {
             pixel(&image, 33, 32),
             [0, 0, 0, 255],
             "the page's edge stays sharp"
+        );
+        Ok(())
+    }
+
+    fn snapshot_into(
+        id: u64,
+        rect: Bounds<ScaledPixels>,
+        opacity: f32,
+        plus_lighter: bool,
+    ) -> VnSnapshotPaint {
+        let (x, y) = (rect.origin.x.0, rect.origin.y.0);
+        let (w, h) = (rect.size.width.0, rect.size.height.0);
+        VnSnapshotPaint {
+            id,
+            to_unit: [1. / w, 0., -x / w, 0., 1. / h, -y / h],
+            bounds: rect,
+            content_mask: mask(),
+            opacity,
+            plus_lighter,
+            in_place: false,
+        }
+    }
+
+    #[test]
+    fn a_capture_is_kept_and_composites_later_through_its_box() -> Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let info = VnCaptureInfo {
+            id: 7,
+            border_box: bounds(20., 20., 20., 20.),
+            transform: TransformationMatrix::unit(),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0xffffff)));
+        scene.vn_push_isolation(VnIsolation {
+            capture: Some(info),
+            ..isolation(rectangle(0., 0., SIDE, SIDE), None, false)
+        });
+        scene.insert_primitive(quad(bounds(20., 20., 20., 20.), rgb(0xff0000)));
+        scene.vn_pop_isolation();
+        scene.finish();
+        let ink = scene.vn_captures[0].ink;
+        let image = renderer.render_scene_to_image(&scene, frame_size())?;
+        assert_close(
+            pixel(&image, 30, 30),
+            [255; 4],
+            "a capture does not paint the page",
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0xffffff)));
+        scene.vn_insert_snapshot(snapshot_into(7, bounds(34., 34., 28., 28.), 1., false));
+        scene.finish();
+        scene.vn_resolve_snapshots(|id| (id == 7).then_some((info, ink)));
+        let image = renderer.render_scene_to_image(&scene, frame_size())?;
+        assert_close(
+            pixel(&image, 48, 48),
+            [255, 0, 0, 255],
+            "the snapshot in its new box",
+        );
+        assert_close(
+            pixel(&image, 30, 30),
+            [255; 4],
+            "nothing where it was captured",
+        );
+
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(isolation(rectangle(0., 0., SIDE, SIDE), None, false));
+        for _ in 0..2 {
+            scene.vn_insert_snapshot(snapshot_into(7, bounds(0., 0., SIDE, SIDE), 0.5, true));
+        }
+        scene.vn_pop_isolation();
+        scene.finish();
+        scene.vn_resolve_snapshots(|id| (id == 7).then_some((info, ink)));
+        let image = render_transparent(&mut renderer, &scene)?;
+        assert_close(
+            pixel(&image, 32, 32),
+            [255, 0, 0, 255],
+            "plus-lighter halves sum to opaque",
         );
         Ok(())
     }

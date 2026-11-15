@@ -1189,6 +1189,13 @@ impl WgpuRenderer {
         self.core().is_some_and(|core| core.dual_source_blending)
     }
 
+    /// Whether captures are drawn and kept as snapshots
+    /// (`PlatformWindow::vn_supports_snapshots`); not on WebGL2.
+    pub fn supports_snapshots(&self) -> bool {
+        self.core()
+            .is_some_and(|core| !core.uses_webgl_instance_data)
+    }
+
     /// Returns `None` once GPU resources have been released by `destroy` or a pending
     /// device recovery.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
@@ -1610,6 +1617,7 @@ impl WgpuRendererCore {
             layers: layers.as_ref(),
             effects: &effects,
         };
+        self.draw_vn_captures(&draw, &mut encoder, &frame, &mut instance_offset)?;
         self.draw_group(
             &draw,
             0,

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -79,6 +80,10 @@ pub(crate) struct DirectXRenderer {
     /// layer draws (`prepare_vn_effects`).
     vn_histories: VnEffectHistories<HistoryTexture>,
     vn_effects: VnEffectFrame,
+
+    /// vue-native fork: the snapshots captures keep (`Scene::vn_captures`),
+    /// by id. They outlive a resize; a device loss drops them.
+    vn_snapshots: HashMap<u64, VnSnapshot>,
 }
 
 /// vue-native fork: one `[SkHistory]` texture, RGBA 16-bit float.
@@ -168,6 +173,7 @@ struct DirectXRenderPipelines {
     /// vue-native fork: the isolated layer composite, and the clip segments
     /// it reads at t9.
     vn_layer_pipeline: PipelineState<VnLayer>,
+    vn_plus_lighter_blend: ID3D11BlendState,
     vn_clip_segments: VnStructuredBuffer,
     vn_text_backgrounds: VnStructuredBuffer,
     /// The images of `--shading` effects, bound at t3..t6.
@@ -212,6 +218,16 @@ struct VnLayerTarget {
     texture: ID3D11Texture2D,
     rtv: Option<ID3D11RenderTargetView>,
     srv: Option<ID3D11ShaderResourceView>,
+}
+
+/// vue-native fork: a capture's pixels, kept across frames until no frame
+/// has captured or painted it for a while.
+struct VnSnapshot {
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+    width: u32,
+    height: u32,
+    idle: u32,
 }
 
 /// vue-native fork: a growable dynamic structured buffer the shaders read
@@ -322,6 +338,7 @@ impl DirectXRenderer {
             vn_target: None,
             vn_histories: VnEffectHistories::default(),
             vn_effects: VnEffectFrame::default(),
+            vn_snapshots: HashMap::default(),
         })
     }
 
@@ -414,6 +431,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.vn_snapshots.clear();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -505,13 +523,80 @@ impl DirectXRenderer {
         self.upload_scene_buffers(scene)?;
         self.pipelines.effect_textures.begin_frame();
 
-        // vue-native fork: the root group, and through its composites every
-        // isolated layer's (`Scene::vn_batches`).
+        // vue-native fork: captures first, so a composite later in this frame
+        // samples what they hold now; then the root group, and through its
+        // composites every isolated layer's (`Scene::vn_batches`).
         self.vn_target = None;
+        self.vn_draw_captures(scene)?;
+        self.vn_age_snapshots(scene);
         let result = self.draw_vn_group(scene, 0, 0);
         self.vn_target = None;
         self.vn_histories.finish_frame();
         result
+    }
+
+    /// vue-native fork: draws each capture's group into a cleared target and
+    /// copies its ink into the capture's snapshot.
+    fn vn_draw_captures(&mut self, scene: &Scene) -> Result<()> {
+        for capture in &scene.vn_captures {
+            let ink = capture.ink;
+            let left = ink.origin.x.0.max(0.) as u32;
+            let top = ink.origin.y.0.max(0.) as u32;
+            let right = ((ink.origin.x.0 + ink.size.width.0).max(0.) as u32).min(self.width);
+            let bottom = ((ink.origin.y.0 + ink.size.height.0).max(0.) as u32).min(self.height);
+            if right <= left || bottom <= top {
+                self.vn_snapshots.remove(&capture.info.id);
+                continue;
+            }
+            let target = self.draw_vn_group_offscreen(scene, capture.group as usize, 0)?;
+            let (width, height) = (right - left, bottom - top);
+            let devices = self.devices.as_ref().context("devices missing")?;
+            let reuse = self
+                .vn_snapshots
+                .get(&capture.info.id)
+                .is_some_and(|s| s.width == width && s.height == height);
+            if !reuse {
+                let (texture, srv) = create_vn_snapshot_texture(&devices.device, width, height)?;
+                self.vn_snapshots.insert(
+                    capture.info.id,
+                    VnSnapshot { texture, srv, width, height, idle: 0 },
+                );
+            }
+            let snapshot = self.vn_snapshots.get_mut(&capture.info.id).context("snapshot")?;
+            snapshot.idle = 0;
+            unsafe {
+                unbind_shader_resources(&devices.device_context);
+                devices.device_context.CopySubresourceRegion(
+                    &snapshot.texture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &target.texture,
+                    0,
+                    Some(&D3D11_BOX { left, top, front: 0, right, bottom, back: 1 }),
+                );
+            }
+        }
+        self.bind_current_target()
+    }
+
+    /// vue-native fork: a snapshot no frame captured or painted for a few
+    /// renders is freed.
+    fn vn_age_snapshots(&mut self, scene: &Scene) {
+        const IDLE_RENDERS: u32 = 4;
+        if self.vn_snapshots.is_empty() {
+            return;
+        }
+        for layer in &scene.vn_layers {
+            if let Some(snapshot) = layer.snapshot_id().and_then(|id| self.vn_snapshots.get_mut(&id)) {
+                snapshot.idle = 0;
+            }
+        }
+        for snapshot in self.vn_snapshots.values_mut() {
+            snapshot.idle += 1;
+        }
+        self.vn_snapshots.retain(|_, snapshot| snapshot.idle <= IDLE_RENDERS);
     }
 
     /// vue-native fork: draws one group's batches into the current target,
@@ -603,6 +688,12 @@ impl DirectXRenderer {
             return self.draw_vn_effect_layer(scene, index, effect, depth);
         }
         let layer = scene.vn_layers[index];
+        if let Some(id) = layer.snapshot_id() {
+            let Some(srv) = self.vn_snapshots.get(&id).map(|s| s.srv.clone()) else {
+                return Ok(());
+            };
+            return self.vn_composite(index, layer.flags, &srv);
+        }
         if depth >= MAX_VN_LAYER_DEPTH {
             effects_advisory(&format!(
                 "`clip-path` shapes nested more than {MAX_VN_LAYER_DEPTH} deep are not \
@@ -611,12 +702,23 @@ impl DirectXRenderer {
             return self.draw_vn_group(scene, layer.group as usize, depth);
         }
         let target = self.draw_vn_group_offscreen(scene, layer.group as usize, depth)?;
+        self.vn_composite(index, layer.flags, &target.srv)
+    }
+
+    /// vue-native fork: composites layer `index` from `source` over the
+    /// current target.
+    fn vn_composite(
+        &self,
+        index: usize,
+        flags: u32,
+        source: &Option<ID3D11ShaderResourceView>,
+    ) -> Result<()> {
         self.bind_current_target()?;
         let devices = self.devices.as_ref().context("devices missing")?;
-        let layer_texture = slice::from_ref(&target.srv);
+        let layer_texture = slice::from_ref(source);
         let segments = slice::from_ref(&self.pipelines.vn_clip_segments.view);
         let text_backgrounds = slice::from_ref(&self.pipelines.vn_text_backgrounds.view);
-        self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources(
+        self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources_blend(
             &devices.device_context,
             None,
             &[(0, layer_texture), (9, segments), (10, text_backgrounds)],
@@ -627,6 +729,8 @@ impl DirectXRenderer {
             &self.samplers(),
             index as u32,
             1,
+            (flags & vn_layer_flags::PLUS_LIGHTER != 0)
+                .then_some(&self.pipelines.vn_plus_lighter_blend),
         )?;
         unsafe {
             unbind_shader_resources(&devices.device_context);
@@ -2007,6 +2111,7 @@ impl DirectXRenderPipelines {
             subpixel_sprites,
             poly_sprites,
             vn_layer_pipeline,
+            vn_plus_lighter_blend: create_blend_state_for_plus_lighter(device)?,
             vn_clip_segments,
             vn_text_backgrounds,
             effect_textures: EffectTextureCache::default(),
@@ -2579,6 +2684,32 @@ impl<T> PipelineState<T> {
         first_instance: u32,
         instance_count: u32,
     ) -> Result<()> {
+        self.draw_range_with_texture_resources_blend(
+            device_context,
+            vertex_texture,
+            fragment_textures,
+            batch_params_buffer,
+            sampler,
+            first_instance,
+            instance_count,
+            None,
+        )
+    }
+
+    /// [`Self::draw_range_with_texture_resources`] with `blend` in place of
+    /// the pipeline's own blend state.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_range_with_texture_resources_blend(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        vertex_texture: Option<&[Option<ID3D11ShaderResourceView>]>,
+        fragment_textures: &[(u32, &[Option<ID3D11ShaderResourceView>])],
+        batch_params_buffer: &ID3D11Buffer,
+        sampler: &[Option<ID3D11SamplerState>],
+        first_instance: u32,
+        instance_count: u32,
+        blend: Option<&ID3D11BlendState>,
+    ) -> Result<()> {
         anyhow::ensure!(
             first_instance as usize + instance_count as usize <= self.buffer_size,
             "DirectX instance range exceeds the {} buffer",
@@ -2591,7 +2722,7 @@ impl<T> PipelineState<T> {
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             &self.vertex,
             &self.fragment,
-            &self.blend_state,
+            blend.unwrap_or(&self.blend_state),
         );
         unsafe {
             device_context.PSSetSamplers(0, Some(sampler));
@@ -2876,6 +3007,35 @@ fn create_blur_snapshot_texture(
     Ok((texture, shader_resource_view))
 }
 
+/// vue-native fork: a snapshot's texture: the swap chain's format, sampled
+/// only.
+fn create_vn_snapshot_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(ID3D11Texture2D, Option<ID3D11ShaderResourceView>)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.context("creating a snapshot texture")?
+    };
+    let mut srv = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv))? };
+    Ok((texture, srv))
+}
+
 /// vue-native fork: an isolated layer's target: the swap chain's format and
 /// size, a render target and a shader resource.
 fn create_vn_layer_target(device: &ID3D11Device, width: u32, height: u32) -> Result<VnLayerTarget> {
@@ -3032,6 +3192,25 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+/// vue-native fork: CSS `plus-lighter` over premultiplied colour: both
+/// factors one, saturating in the unorm target.
+fn create_blend_state_for_plus_lighter(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -4092,6 +4271,7 @@ pub(crate) mod effect_layer_tests {
                 vn_target: None,
                 vn_histories: VnEffectHistories::default(),
                 vn_effects: VnEffectFrame::default(),
+                vn_snapshots: HashMap::default(),
             })
         }
 

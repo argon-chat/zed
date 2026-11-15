@@ -1706,6 +1706,9 @@ pub struct Window {
     /// rectangle, innermost first ([`Window::vn_with_clip_shape`]). A hitbox
     /// and a deferred draw take it as they take the content mask.
     pub(crate) vn_clip_stack: Option<Arc<crate::VnClipNode>>,
+    /// vue-native fork: every capture drawn and not forgotten, with the
+    /// pixels its snapshot covers ([Window::vn_with_capture]).
+    vn_capture_records: FxHashMap<u64, (crate::VnCaptureInfo, Bounds<ScaledPixels>)>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
     /// window, so that only actual changes are forwarded (reconfiguring a live
@@ -2887,6 +2890,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             vn_clip_stack: None,
+            vn_capture_records: FxHashMap::default(),
             element_opacity: 1.0,
             element_image_tint: Hsla::transparent_black(),
             element_transform: TransformationMatrix::unit(),
@@ -4469,6 +4473,7 @@ impl Window {
         {
             let _profile = crate::native_profiling::current_span("native", "GPUI finish scene");
             self.next_frame.finish(&mut self.rendered_frame);
+            self.vn_settle_captures();
         }
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -5330,6 +5335,7 @@ impl Window {
         let node = Arc::new(crate::VnClipNode {
             geometry,
             color_matrix: None,
+            capture: None,
             parent: self.vn_clip_stack.clone(),
         });
         let previous = self.vn_clip_stack.replace(node.clone());
@@ -5362,6 +5368,7 @@ impl Window {
         let node = Arc::new(crate::VnClipNode {
             geometry,
             color_matrix: Some(matrix),
+            capture: None,
             parent: self.vn_clip_stack.clone(),
         });
         let previous = self.vn_clip_stack.replace(node.clone());
@@ -5394,7 +5401,7 @@ impl Window {
     pub fn vn_with_text_mask<R>(&mut self, paint: Arc<crate::VnTextPaint>, f: impl FnOnce(&mut Self) -> R) -> R {
         self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
             geometry: paint.geometry.clone(), color_matrix: None,
-            content_mask: paint.content_mask, text_paint: Some(paint),
+            content_mask: paint.content_mask, text_paint: Some(paint), capture: None,
         });
         let result = f(self);
         self.next_frame.scene.vn_pop_isolation();
@@ -5417,6 +5424,7 @@ impl Window {
             color_matrix: node.color_matrix,
             text_paint: None,
             content_mask,
+            capture: node.capture,
         });
         let result = f(self);
         self.next_frame.scene.vn_pop_isolation();
@@ -5457,6 +5465,7 @@ impl Window {
                     color_matrix: node.color_matrix,
                     text_paint: None,
                     content_mask,
+                    capture: node.capture,
                 });
             }
             let result = f(window);
@@ -5465,6 +5474,164 @@ impl Window {
             }
             result
         })
+    }
+
+    /// vue-native fork: `f` paints into the snapshot `id` rather than the
+    /// page: untransformed, unclipped by its ancestors and at full opacity,
+    /// in a group the renderer draws first and keeps
+    /// ([`crate::Scene::vn_captures`]). `bounds` and `own` (the element's
+    /// transform) are what the capture reports of the element.
+    pub fn vn_with_capture<R>(
+        &mut self,
+        id: Option<u64>,
+        bounds: Bounds<Pixels>,
+        own: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(id) = id else { return f(self) };
+        let scale_factor = self.scale_factor();
+        let viewport = Bounds { origin: Point::default(), size: self.viewport_size };
+        let device = viewport.scale(scale_factor);
+        let info = crate::VnCaptureInfo {
+            id,
+            border_box: bounds.scale(scale_factor),
+            transform: self.element_transform.compose(own),
+        };
+        let node = Arc::new(crate::VnClipNode {
+            geometry: Arc::new(crate::VnClipGeometry::rect(device)),
+            color_matrix: None,
+            capture: Some(info),
+            parent: None,
+        });
+        let previous_clip = self.vn_clip_stack.replace(node.clone());
+        self.content_mask_stack.push(ContentMask::rect(viewport));
+        let result = self.with_absolute_element_transform(TransformationMatrix::unit(), |window| {
+            window.with_absolute_element_opacity(1., |window| {
+                if !window.invalidator.is_painting() {
+                    return f(window);
+                }
+                window.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+                    geometry: node.geometry.clone(),
+                    color_matrix: None,
+                    text_paint: None,
+                    content_mask: ContentMask { bounds: device, corner_radii: Default::default() },
+                    capture: Some(info),
+                });
+                let result = f(window);
+                window.next_frame.scene.vn_pop_isolation();
+                result
+            })
+        });
+        self.content_mask_stack.pop();
+        self.vn_clip_stack = previous_clip;
+        result
+    }
+
+    /// vue-native fork: `f` paints into an isolated group composited
+    /// source-over, so what blends inside it blends with the group only.
+    pub fn vn_with_isolation<R>(&mut self, isolate: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !isolate || !self.invalidator.is_painting() {
+            return f(self);
+        }
+        let device = Bounds { origin: Point::default(), size: self.viewport_size }.scale(self.scale_factor());
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+            geometry: Arc::new(crate::VnClipGeometry::rect(device)),
+            color_matrix: None,
+            text_paint: None,
+            content_mask,
+            capture: None,
+        });
+        let result = f(self);
+        self.next_frame.scene.vn_pop_isolation();
+        result
+    }
+
+    /// vue-native fork: draws the snapshot `id` so that the border box it
+    /// captured fills `bounds`, through the transform and opacity in force.
+    /// Ink outside the border box scales along. Nothing is drawn for a
+    /// snapshot the renderer does not hold.
+    pub fn vn_paint_snapshot(&mut self, id: u64, bounds: Bounds<Pixels>, plus_lighter: bool) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        let device = bounds.scale(scale_factor);
+        if device.size.width.0 <= 0. || device.size.height.0 <= 0. {
+            return;
+        }
+        let Some(inverse) = self.element_transform.inverse() else { return };
+        let (w, h) = (device.size.width.0, device.size.height.0);
+        let [[a, b], [c, d]] = inverse.rotation_scale;
+        let [tx, ty] = inverse.translation;
+        let (x, y) = (device.origin.x.0, device.origin.y.0);
+        let to_unit = [a / w, b / w, (tx - x) / w, c / h, d / h, (ty - y) / h];
+        let covered = crate::scene::transformed_bounds(device, self.element_transform);
+        let covered = Bounds::from_corners(
+            point(ScaledPixels(covered.origin.x.0.floor()), ScaledPixels(covered.origin.y.0.floor())),
+            point(
+                ScaledPixels((covered.origin.x.0 + covered.size.width.0).ceil()),
+                ScaledPixels((covered.origin.y.0 + covered.size.height.0).ceil()),
+            ),
+        );
+        let opacity = self.element_opacity;
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.vn_insert_snapshot(crate::VnSnapshotPaint {
+            id,
+            to_unit,
+            bounds: covered,
+            content_mask,
+            opacity,
+            plus_lighter,
+            in_place: false,
+        });
+    }
+
+    /// vue-native fork: draws the snapshot `id` where its element was when
+    /// captured, through the opacity in force.
+    pub fn vn_paint_snapshot_in_place(&mut self, id: u64) {
+        self.invalidator.debug_assert_paint();
+        let viewport = Bounds { origin: Point::default(), size: self.viewport_size }.scale(self.scale_factor());
+        let opacity = self.element_opacity;
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.vn_insert_snapshot(crate::VnSnapshotPaint {
+            id,
+            to_unit: [0.; 6],
+            bounds: viewport,
+            content_mask,
+            opacity,
+            plus_lighter: false,
+            in_place: true,
+        });
+    }
+
+    /// vue-native fork: what the last drawn frame knows of capture `id`:
+    /// the element's border box and transform in device pixels.
+    pub fn vn_capture(&self, id: u64) -> Option<crate::VnCaptureInfo> {
+        self.vn_capture_records.get(&id).map(|(info, _)| *info)
+    }
+
+    /// vue-native fork: forgets captures; their snapshots stop drawing and
+    /// the renderer frees them once no frame paints them.
+    pub fn vn_forget_captures(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.vn_capture_records.remove(id);
+        }
+    }
+
+    /// vue-native fork: whether this window's renderer keeps snapshots
+    /// ([`Window::vn_with_capture`]).
+    pub fn vn_supports_snapshots(&self) -> bool {
+        self.platform_window.vn_supports_snapshots()
+    }
+
+    fn vn_settle_captures(&mut self) {
+        let viewport = Bounds { origin: Point::default(), size: self.viewport_size }.scale(self.scale_factor());
+        let scene = &mut self.next_frame.scene;
+        for capture in &mut scene.vn_captures {
+            capture.ink = capture.ink.intersect(&viewport);
+            self.vn_capture_records.insert(capture.info.id, (capture.info, capture.ink));
+        }
+        let records = &self.vn_capture_records;
+        scene.vn_resolve_snapshots(|id| records.get(&id).copied());
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement

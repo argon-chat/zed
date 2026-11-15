@@ -6,18 +6,20 @@
 use super::backdrop::{FrameTarget, create_target_texture, effects_advisory};
 use super::{
     GroupDraw, InstanceBinding, InstanceBufferWriter, MetalRenderer, VnLayerInputIndex,
-    build_path_sprite_pipeline_state, new_command_encoder_for_texture,
+    build_path_sprite_pipeline_state, build_premultiplied_pipeline_state,
+    new_command_encoder_for_texture,
 };
 use anyhow::{Context as _, Result};
-use gpui::Scene;
+use gpui::{Scene, vn_layer_flags};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVMetalTexture;
 use objc2_metal::{
-    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPipelineState, MTLTexture, MTLTextureUsage,
+    MTLBlendFactor, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
+    MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineState,
+    MTLSize, MTLTexture, MTLTextureUsage,
 };
-use std::{mem, ptr};
+use std::{collections::HashMap, mem, ptr};
 
 /// Deeper groups draw inline, unclipped by their shape, as on DirectX.
 pub(super) const MAX_DEPTH: usize = 8;
@@ -25,15 +27,26 @@ pub(super) const MAX_DEPTH: usize = 8;
 /// Frames the layer targets may sit unused before release.
 const TARGET_RELEASE_FRAMES: u32 = 90;
 
+/// Renders a snapshot may go uncaptured and unpainted before release.
+const SNAPSHOT_IDLE_RENDERS: u32 = 4;
+
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 
 #[derive(Default)]
 pub(super) struct VnLayerState {
     pipeline: PipelineState,
+    plus_lighter: PipelineState,
     /// One per nesting depth.
     targets: Vec<Texture>,
     depth_used: usize,
     idle_frames: u32,
+    /// What captures keep (`Scene::vn_captures`), by id; they outlive a resize.
+    snapshots: HashMap<u64, Snapshot>,
+}
+
+struct Snapshot {
+    texture: Texture,
+    idle: u32,
 }
 
 #[derive(Default)]
@@ -94,6 +107,27 @@ impl MetalRenderer {
             );
         }
         let layer = draw.scene.vn_layers[index];
+        if let Some(id) = layer.snapshot_id() {
+            let Some(bindings) = draw.layers else {
+                return Ok(());
+            };
+            let Some(texture) = self.vn_layers.snapshots.get(&id).map(|s| s.texture.clone())
+            else {
+                return Ok(());
+            };
+            let Some(pipeline) = self.vn_composite_pipeline(layer.flags) else {
+                return Ok(());
+            };
+            return encode_composite(
+                bindings,
+                &pipeline,
+                &texture,
+                index,
+                command_buffer,
+                frame,
+                draw.viewport_size,
+            );
+        }
         let group = layer.group as usize;
         let inline = |this: &mut Self,
                       writer: &mut InstanceBufferWriter,
@@ -119,78 +153,115 @@ impl MetalRenderer {
             ));
             return inline(self, writer, surface_textures);
         }
-        let Some(pipeline) = self.vn_layer_pipeline() else {
+        let Some(pipeline) = self.vn_composite_pipeline(layer.flags) else {
             return inline(self, writer, surface_textures);
         };
 
-        let target = self.vn_layer_target(depth, frame)?;
-        self.draw_group(
+        let target = self.draw_group_offscreen(
             draw,
             group,
-            depth + 1,
+            depth,
             command_buffer,
-            &target,
-            Some(MTLClearColor {
-                red: 0.,
-                green: 0.,
-                blue: 0.,
-                alpha: 0.,
-            }),
+            frame,
             writer,
             surface_textures,
         )?;
-        let viewport_size = draw.viewport_size;
-        let encoder =
-            new_command_encoder_for_texture(command_buffer, &frame.texture, viewport_size, None)?;
-        encoder.setRenderPipelineState(&pipeline);
-        // SAFETY: the bindings hold the scene's layers, segments and text
-        // backgrounds in the layouts shaders.metal declares through cbindgen,
-        // at the slots it reads them from; `index` is one of the layers. Metal
-        // retains the buffers and the target, and the viewport bytes are copied.
-        unsafe {
-            encoder.setVertexBuffer_offset_atIndex(
-                Some(&bindings.layers.buffer),
-                bindings.layers.offset,
-                VnLayerInputIndex::Layers as usize,
-            );
-            encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                VnLayerInputIndex::ViewportSize as usize,
-            );
-            encoder.setFragmentBuffer_offset_atIndex(
-                Some(&bindings.layers.buffer),
-                bindings.layers.offset,
-                VnLayerInputIndex::Layers as usize,
-            );
-            encoder.setFragmentBuffer_offset_atIndex(
-                Some(&bindings.segments.buffer),
-                bindings.segments.offset,
-                VnLayerInputIndex::Segments as usize,
-            );
-            encoder.setFragmentBuffer_offset_atIndex(
-                Some(&bindings.text_backgrounds.buffer),
-                bindings.text_backgrounds.offset,
-                VnLayerInputIndex::TextBackgrounds as usize,
-            );
-            encoder.setFragmentTexture_atIndex(
-                Some(&target.texture),
-                VnLayerInputIndex::Texture as usize,
-            );
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                MTLPrimitiveType::TriangleStrip,
+        encode_composite(
+            bindings,
+            &pipeline,
+            &target.texture,
+            index,
+            command_buffer,
+            frame,
+            draw.viewport_size,
+        )
+    }
+
+    /// Each capture's group into a cleared target, its ink copied into the
+    /// capture's snapshot, before anything samples it this frame.
+    pub(super) fn draw_vn_captures(
+        &mut self,
+        draw: &GroupDraw<'_>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        frame: &FrameTarget,
+        writer: &mut InstanceBufferWriter,
+        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+    ) -> Result<()> {
+        let (frame_width, frame_height) = (frame.texture.width(), frame.texture.height());
+        for capture in &draw.scene.vn_captures {
+            let ink = capture.ink;
+            let left = ink.origin.x.0.max(0.) as usize;
+            let top = ink.origin.y.0.max(0.) as usize;
+            let right = ((ink.origin.x.0 + ink.size.width.0).max(0.) as usize).min(frame_width);
+            let bottom = ((ink.origin.y.0 + ink.size.height.0).max(0.) as usize).min(frame_height);
+            let id = capture.info.id;
+            if right <= left || bottom <= top {
+                self.vn_layers.snapshots.remove(&id);
+                continue;
+            }
+            let target = self.draw_group_offscreen(
+                draw,
+                capture.group as usize,
                 0,
-                4,
-                1,
-                index,
-            );
+                command_buffer,
+                frame,
+                writer,
+                surface_textures,
+            )?;
+            let (width, height) = (right - left, bottom - top);
+            let reuse = self
+                .vn_layers
+                .snapshots
+                .get(&id)
+                .is_some_and(|s| s.texture.width() == width && s.texture.height() == height);
+            if !reuse {
+                let texture = create_target_texture(
+                    &self.device,
+                    "vn_snapshot",
+                    width,
+                    height,
+                    MTLTextureUsage::ShaderRead,
+                )?;
+                self.vn_layers.snapshots.insert(id, Snapshot { texture, idle: 0 });
+            }
+            let snapshot = self.vn_layers.snapshots.get_mut(&id).context("snapshot")?;
+            snapshot.idle = 0;
+            let blit = command_buffer
+                .blitCommandEncoder()
+                .context("creating snapshot blit encoder")?;
+            // SAFETY: both are retained BGRA8Unorm 2D textures; the region lies
+            // within the frame-sized target and is the snapshot's size.
+            unsafe {
+                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    &target.texture,
+                    0,
+                    0,
+                    MTLOrigin { x: left, y: top, z: 0 },
+                    MTLSize { width, height, depth: 1 },
+                    &snapshot.texture,
+                    0,
+                    0,
+                    MTLOrigin { x: 0, y: 0, z: 0 },
+                );
+            }
+            blit.endEncoding();
         }
-        encoder.endEncoding();
         Ok(())
     }
 
-    pub(super) fn finish_vn_layers(&mut self) {
+    pub(super) fn finish_vn_layers(&mut self, scene: &Scene) {
         let state = &mut self.vn_layers;
+        if !state.snapshots.is_empty() {
+            for layer in &scene.vn_layers {
+                if let Some(snapshot) = layer.snapshot_id().and_then(|id| state.snapshots.get_mut(&id)) {
+                    snapshot.idle = 0;
+                }
+            }
+            for snapshot in state.snapshots.values_mut() {
+                snapshot.idle += 1;
+            }
+            state.snapshots.retain(|_, snapshot| snapshot.idle <= SNAPSHOT_IDLE_RENDERS);
+        }
         if state.depth_used >= state.targets.len() {
             state.idle_frames = 0;
             return;
@@ -202,29 +273,52 @@ impl MetalRenderer {
         }
     }
 
-    fn vn_layer_pipeline(
+    /// Source-over, or additive for a `plus-lighter` layer.
+    fn vn_composite_pipeline(
         &mut self,
+        flags: u32,
     ) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-        if let PipelineState::Unbuilt = self.vn_layers.pipeline {
-            self.vn_layers.pipeline = match build_path_sprite_pipeline_state(
-                &self.device,
-                &self.library,
-                "vn_layers",
-                "vn_layer_vertex",
-                "vn_layer_fragment",
-                MTLPixelFormat::BGRA8Unorm,
-            ) {
+        let plus_lighter = flags & vn_layer_flags::PLUS_LIGHTER != 0;
+        let (device, library) = (&self.device, &self.library);
+        let slot = if plus_lighter {
+            &mut self.vn_layers.plus_lighter
+        } else {
+            &mut self.vn_layers.pipeline
+        };
+        if let PipelineState::Unbuilt = slot {
+            let built = if plus_lighter {
+                build_premultiplied_pipeline_state(
+                    device,
+                    library,
+                    "vn_layers_plus_lighter",
+                    "vn_layer_vertex",
+                    "vn_layer_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                    MTLBlendFactor::One,
+                )
+            } else {
+                build_path_sprite_pipeline_state(
+                    device,
+                    library,
+                    "vn_layers",
+                    "vn_layer_vertex",
+                    "vn_layer_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                )
+            };
+            *slot = match built {
                 Ok(pipeline) => PipelineState::Ready(pipeline),
                 Err(error) => {
                     effects_advisory(&format!(
-                        "`clip-path` shapes, `filter` color matrices and `background-clip: text` \
-                         are unavailable — their pipeline failed to build: {error:#}"
+                        "`clip-path` shapes, `filter` color matrices, `background-clip: text` \
+                         and view transitions are unavailable — their pipeline failed to \
+                         build: {error:#}"
                     ));
                     PipelineState::Unavailable
                 }
             };
         }
-        match &self.vn_layers.pipeline {
+        match slot {
             PipelineState::Ready(pipeline) => Some(pipeline.clone()),
             PipelineState::Unbuilt | PipelineState::Unavailable => None,
         }
@@ -264,14 +358,70 @@ impl MetalRenderer {
     }
 }
 
+/// Layer `index`'s composite from `source` over `frame`, in a pass of its own.
+fn encode_composite(
+    bindings: &VnLayerBindings,
+    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
+    source: &ProtocolObject<dyn MTLTexture>,
+    index: usize,
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    frame: &FrameTarget,
+    viewport_size: gpui::Size<gpui::DevicePixels>,
+) -> Result<()> {
+    let encoder =
+        new_command_encoder_for_texture(command_buffer, &frame.texture, viewport_size, None)?;
+    encoder.setRenderPipelineState(pipeline);
+    // SAFETY: the bindings hold the scene's layers, segments and text
+    // backgrounds in the layouts shaders.metal declares through cbindgen, at
+    // the slots it reads them from; `index` is one of the layers. Metal retains
+    // the buffers and the source, and the viewport bytes are copied.
+    unsafe {
+        encoder.setVertexBuffer_offset_atIndex(
+            Some(&bindings.layers.buffer),
+            bindings.layers.offset,
+            VnLayerInputIndex::Layers as usize,
+        );
+        encoder.setVertexBytes_length_atIndex(
+            ptr::NonNull::from(&viewport_size).cast(),
+            mem::size_of_val(&viewport_size),
+            VnLayerInputIndex::ViewportSize as usize,
+        );
+        encoder.setFragmentBuffer_offset_atIndex(
+            Some(&bindings.layers.buffer),
+            bindings.layers.offset,
+            VnLayerInputIndex::Layers as usize,
+        );
+        encoder.setFragmentBuffer_offset_atIndex(
+            Some(&bindings.segments.buffer),
+            bindings.segments.offset,
+            VnLayerInputIndex::Segments as usize,
+        );
+        encoder.setFragmentBuffer_offset_atIndex(
+            Some(&bindings.text_backgrounds.buffer),
+            bindings.text_backgrounds.offset,
+            VnLayerInputIndex::TextBackgrounds as usize,
+        );
+        encoder.setFragmentTexture_atIndex(Some(source), VnLayerInputIndex::Texture as usize);
+        encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+            MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            1,
+            index,
+        );
+    }
+    encoder.endEncoding();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{
         AtlasKey, BackdropBlurRect, Bounds, ContentMask, DevicePixels, MonochromeSprite,
         PlatformAtlas, Quad, RenderSvgParams, Rgba, ScaledPixels, TransformationMatrix,
-        VnClipGeometry, VnColorMatrix, VnFillRule, VnIsolation, VnTextFill, VnTextPaint,
-        linear_color_stop, linear_gradient, point, rgb, size,
+        VnCaptureInfo, VnClipGeometry, VnColorMatrix, VnFillRule, VnIsolation, VnSnapshotPaint,
+        VnTextFill, VnTextPaint, linear_color_stop, linear_gradient, point, rgb, size,
     };
     use std::{borrow::Cow, sync::Arc};
 
@@ -344,6 +494,7 @@ mod tests {
             }),
             text_paint: None,
             content_mask: mask(),
+            capture: None,
         }
     }
 
@@ -594,6 +745,62 @@ mod tests {
             renderer.vn_layers.targets.is_empty(),
             "closed isolated groups must release their targets"
         );
+        Ok(())
+    }
+
+    fn snapshot_into(id: u64, rect: Bounds<ScaledPixels>, opacity: f32, plus_lighter: bool) -> VnSnapshotPaint {
+        let (x, y) = (rect.origin.x.0, rect.origin.y.0);
+        let (w, h) = (rect.size.width.0, rect.size.height.0);
+        VnSnapshotPaint {
+            id,
+            to_unit: [1. / w, 0., -x / w, 0., 1. / h, -y / h],
+            bounds: rect,
+            content_mask: mask(),
+            opacity,
+            plus_lighter,
+            in_place: false,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_redraws_its_capture_elsewhere_and_plus_lighter_sums() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let info = VnCaptureInfo {
+            id: 7,
+            border_box: bounds(4., 4., 12., 12.),
+            transform: TransformationMatrix::unit(),
+        };
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(VnIsolation {
+            capture: Some(info),
+            ..isolation(rectangle(0., 0., SIDE, SIDE), None, false)
+        });
+        scene.insert_primitive(quad(bounds(4., 4., 12., 12.), rgb(0xff0000)));
+        scene.vn_pop_isolation();
+        scene.finish();
+        let ink = scene.vn_captures[0].ink;
+        let image = render_transparent(&mut renderer, &scene)?;
+        assert_eq!(pixel(&image, 10, 10), [0; 4], "a capture composites nowhere");
+
+        let mut scene = Scene::default();
+        scene.vn_insert_snapshot(snapshot_into(7, bounds(28., 28., 32., 32.), 1., false));
+        scene.vn_push_isolation(isolation(rectangle(0., 0., SIDE, SIDE), None, false));
+        for _ in 0..2 {
+            scene.vn_insert_snapshot(snapshot_into(7, bounds(2., 36., 24., 24.), 0.5, true));
+        }
+        scene.vn_pop_isolation();
+        scene.finish();
+        scene.vn_resolve_snapshots(|id| (id == 7).then_some((info, ink)));
+        let image = render_transparent(&mut renderer, &scene)?;
+
+        assert_close(pixel(&image, 44, 44), [255, 0, 0, 255], "the snapshot in its new box");
+        assert_eq!(pixel(&image, 10, 10), [0; 4], "nothing where it was captured");
+        assert_close(pixel(&image, 14, 48), [255, 0, 0, 255], "two halves add up to opaque");
+
+        for _ in 0..=SNAPSHOT_IDLE_RENDERS {
+            render_transparent(&mut renderer, &Scene::default())?;
+        }
+        assert!(renderer.vn_layers.snapshots.is_empty(), "an unused snapshot is freed");
         Ok(())
     }
 }

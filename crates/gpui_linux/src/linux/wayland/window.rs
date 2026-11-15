@@ -2073,6 +2073,13 @@ impl PlatformWindow for WaylandWindow {
         self.0.schedule_frame();
     }
 
+    fn vn_supports_snapshots(&self) -> bool {
+        self.borrow()
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.supports_snapshots())
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.borrow()
             .renderer

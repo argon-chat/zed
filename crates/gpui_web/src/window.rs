@@ -1013,6 +1013,10 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow().renderer.sprite_atlas().clone()
     }
 
+    fn vn_supports_snapshots(&self) -> bool {
+        self.inner.state.borrow().renderer.supports_snapshots()
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         self.inner
             .state

@@ -1896,6 +1896,22 @@ fragment float4 vn_layer_fragment(
     texture2d<float> source [[texture(VnLayerInputIndex_Texture)]]) {
   VnLayer layer = layers[input.layer_id];
   float2 p = input.position.xy;
+  if ((layer.flags & 1u) != 0u) {
+    // A snapshot: the pixel maps into the capture's device space, where the
+    // snapshot covers `source_rect`.
+    thread const float *t = layer.source_transform;
+    float2 q = float2(t[0] * p.x + t[1] * p.y + t[2], t[4] * p.x + t[5] * p.y + t[6]);
+    float4 rect = float4(layer.source_rect[0], layer.source_rect[1],
+                         layer.source_rect[2], layer.source_rect[3]);
+    float2 local = q - rect.xy;
+    float edge = min(min(local.x, local.y), min(rect.z - local.x, rect.w - local.y));
+    float snapshot_coverage = saturate(edge + 0.5) *
+        content_mask_coverage(p, layer.content_mask.bounds, layer.content_mask.corner_radii);
+    constexpr sampler clamped(mag_filter::linear, min_filter::linear,
+                              address::clamp_to_edge);
+    float4 sampled = source.sample(clamped, local / rect.zw);
+    return sampled * (snapshot_coverage * layer.opacity);
+  }
   float coverage = vn_clip_coverage(p, segments, layer.segment_start,
                                     layer.segment_count, layer.fill_rule) *
                    content_mask_coverage(p, layer.content_mask.bounds,
@@ -1942,5 +1958,5 @@ fragment float4 vn_layer_fragment(
     }
     color = float4(filtered.rgb * filtered.a, filtered.a);
   }
-  return color * coverage;
+  return color * (coverage * layer.opacity);
 }

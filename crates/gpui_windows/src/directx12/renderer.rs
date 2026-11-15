@@ -602,6 +602,16 @@ pub(crate) struct DirectXRenderer {
     histories: VnEffectHistories<Arc<Target>>,
     /// The images of `--shading` effects, bound at t3..t6.
     effect_textures: EffectTextureCache<AtlasTexture>,
+    /// vue-native: the snapshots captures keep (`Scene::vn_captures`), by id.
+    /// They outlive a resize; a device loss drops them with the renderer.
+    vn_snapshots: HashMap<u64, VnSnapshot>,
+}
+
+/// vue-native: a capture's pixels, kept across frames until no frame has
+/// captured or painted it for a few renders.
+struct VnSnapshot {
+    target: Arc<Target>,
+    idle: u32,
 }
 
 /// vue-native: one frame's effect quads as uploaded: the scene's own, then one
@@ -711,6 +721,7 @@ impl DirectXRenderer {
             uploads_failed: false,
             histories: VnEffectHistories::default(),
             effect_textures: EffectTextureCache::default(),
+            vn_snapshots: HashMap::new(),
         })
     }
     fn buffers(
@@ -968,8 +979,12 @@ impl DirectXRenderer {
         // allocation plus page zeroing. Keep them through short gaps (a
         // chevron scrolling out, a tooltip closing) and release them once
         // a run of drawn frames no longer needs them.
-        let depth = layer_depth(scene, 0, 0)?;
+        let mut depth = layer_depth(scene, 0, 0)?;
+        for capture in &scene.vn_captures {
+            depth = depth.max(layer_depth(scene, capture.group as usize, 1)?);
+        }
         trim_scratch(&mut self.layers, depth, &mut self.idle_frames.layers);
+        self.vn_age_snapshots(scene);
         let path_targets = if scene.paths.is_empty() { 0 } else { 1 };
         let mut held = usize::from(self.path_msaa.is_some());
         trim_scratch_count(&mut held, path_targets, &mut self.idle_frames.paths);
@@ -1128,7 +1143,9 @@ impl DirectXRenderer {
                 clip: full_rect(self.width, self.height),
                 reads_backdrop: needs_backdrop,
                 effects: &effects,
+                vn_snapshots: &mut self.vn_snapshots,
             };
+            encoding.captures()?;
             encoding.bind_target(&target)?;
             let clear = if appearance == WindowBackgroundAppearance::Opaque {
                 [1.0; 4]
@@ -1205,6 +1222,13 @@ impl DirectXRenderer {
                 self.pipelines.pipeline(module, FORMAT, samples)?;
             }
         }
+        if scene
+            .vn_layers
+            .iter()
+            .any(|layer| layer.flags & vn_layer_flags::PLUS_LIGHTER != 0)
+        {
+            self.pipelines.vn_plus_lighter(FORMAT)?;
+        }
         let mut needs_backdrop = !scene.backdrop_blur_rects.is_empty();
         let mut effects = HashSet::new();
         let layer_quads = scene.vn_effect_draws.iter().map(|draw| &draw.quad);
@@ -1272,6 +1296,32 @@ impl DirectXRenderer {
         }
         frame.quads.extend(steps);
         Ok(frame)
+    }
+    /// vue-native: a snapshot no render captured or painted for a few renders
+    /// is freed.
+    fn vn_age_snapshots(&mut self, scene: &Scene) {
+        const IDLE_RENDERS: u32 = 4;
+        if self.vn_snapshots.is_empty() {
+            return;
+        }
+        for layer in &scene.vn_layers {
+            if let Some(snapshot) = layer
+                .snapshot_id()
+                .and_then(|id| self.vn_snapshots.get_mut(&id))
+            {
+                snapshot.idle = 0;
+            }
+        }
+        for capture in &scene.vn_captures {
+            if let Some(snapshot) = self.vn_snapshots.get_mut(&capture.info.id) {
+                snapshot.idle = 0;
+            }
+        }
+        for snapshot in self.vn_snapshots.values_mut() {
+            snapshot.idle += 1;
+        }
+        self.vn_snapshots
+            .retain(|_, snapshot| snapshot.idle <= IDLE_RENDERS);
     }
     pub(crate) fn render_to_image(
         &mut self,
@@ -1489,7 +1539,7 @@ fn layer_depth(scene: &Scene, group: usize, depth: usize) -> Result<usize> {
                     .get(index)
                     .context("D3D12 layer index is out of range")?;
                 // An effect layer that does not read its content draws no group.
-                if layer.group == 0 {
+                if layer.group == 0 || layer.snapshot_id().is_some() {
                     continue;
                 }
                 required = required.max(layer_depth(scene, layer.group as usize, depth + 1)?);
@@ -1785,6 +1835,7 @@ struct Encoding<'a> {
     clip: RECT,
     reads_backdrop: bool,
     effects: &'a VnEffectFrame,
+    vn_snapshots: &'a mut HashMap<u64, VnSnapshot>,
 }
 impl Encoding<'_> {
     /// Binds a window-sized target, scissored to the current clip.
@@ -1954,6 +2005,14 @@ impl Encoding<'_> {
         if let Some(effect) = self.scene.vn_effect_layer(index) {
             return self.effect_layer(layer.group as usize, effect, depth);
         }
+        if let Some(id) = layer.snapshot_id() {
+            let Some(snapshot) = self.vn_snapshots.get(&id).map(|s| s.target.clone()) else {
+                return Ok(());
+            };
+            snapshot.to(self.list, SHADER_READ, self.changes);
+            retain(&self.retained, snapshot.clone());
+            return self.composite(index, layer.flags, &snapshot.sampled());
+        }
         ensure!(
             depth < MAX_LAYER_DEPTH,
             "D3D12 isolated layer nesting exceeds {MAX_LAYER_DEPTH}"
@@ -1972,18 +2031,72 @@ impl Encoding<'_> {
             return Ok(());
         }
         let target = self.draw_group_offscreen(layer.group as usize, depth, clip)?;
-        let texture = target.sampled();
+        self.composite(index, layer.flags, &target.sampled())
+    }
+    /// Composites layer `index` from `source` over the current target.
+    fn composite(&mut self, index: usize, flags: u32, source: &AtlasTexture) -> Result<()> {
+        let pipeline = if flags & vn_layer_flags::PLUS_LIGHTER != 0 {
+            self.pipelines.vn_plus_lighter(FORMAT)?
+        } else {
+            self.pipelines.pipeline(ShaderModule::VnLayer, FORMAT, 1)?
+        };
         let buffer = self.data.layers;
-        self.draw(
-            ShaderModule::VnLayer,
-            buffer,
-            index as u32,
-            1,
-            4,
-            Some(&texture),
-            None,
-            1,
-        )
+        self.draw_pipeline(&pipeline, buffer, index as u32, 1, 4, Some(source), None)
+    }
+    /// Draws each capture's group into a cleared layer target and copies its
+    /// ink into the capture's snapshot, before anything samples one.
+    fn captures(&mut self) -> Result<()> {
+        let scene = self.scene;
+        for capture in &scene.vn_captures {
+            let ink = capture.ink;
+            let rect = intersect(round_out(&ink, 0), full_rect(self.width, self.height));
+            let id = capture.info.id;
+            if ink.is_empty() || is_empty(&rect) {
+                self.vn_snapshots.remove(&id);
+                continue;
+            }
+            let clip = if self.reads_backdrop {
+                full_rect(self.width, self.height)
+            } else {
+                rect
+            };
+            let target = self.draw_group_offscreen(capture.group as usize, 0, clip)?;
+            let (width, height) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
+            let reuse = self
+                .vn_snapshots
+                .get(&id)
+                .is_some_and(|s| s.target.width == width && s.target.height == height);
+            if !reuse {
+                let snapshot = Target::new(self.gpu, width, height, 1)?;
+                self.vn_snapshots
+                    .insert(id, VnSnapshot { target: snapshot, idle: 0 });
+            }
+            let snapshot = self
+                .vn_snapshots
+                .get_mut(&id)
+                .context("D3D12 snapshot missing")?;
+            snapshot.idle = 0;
+            let snapshot = snapshot.target.clone();
+            target.to(self.list, D3D12_RESOURCE_STATE_COPY_SOURCE, self.changes);
+            snapshot.to(self.list, D3D12_RESOURCE_STATE_COPY_DEST, self.changes);
+            retain(&self.retained, snapshot.clone());
+            let source = TextureLocation::subresource(&target.resource, 0);
+            let destination = TextureLocation::subresource(&snapshot.resource, 0);
+            let region = D3D12_BOX {
+                left: rect.left as u32,
+                top: rect.top as u32,
+                front: 0,
+                right: rect.right as u32,
+                bottom: rect.bottom as u32,
+                back: 1,
+            };
+            unsafe {
+                self.list
+                    .CopyTextureRegion(destination.raw(), 0, 0, 0, source.raw(), Some(&region));
+            }
+            snapshot.to(self.list, SHADER_READ, self.changes);
+        }
+        Ok(())
     }
     /// Renders `group` (an element's subtree) into the window-sized target
     /// of `depth`, cleared to transparent within `clip` (window pixels) and
@@ -2733,6 +2846,7 @@ mod tests {
             uploads_failed: false,
             histories: VnEffectHistories::default(),
             effect_textures: EffectTextureCache::default(),
+            vn_snapshots: HashMap::new(),
         })
     }
 
@@ -2920,6 +3034,7 @@ mod tests {
             color_matrix: None,
             text_paint: Some(text_paint),
             content_mask,
+            capture: None,
         });
         scene.vn_push_isolation(VnIsolation {
             geometry: rectangle,
@@ -2930,6 +3045,7 @@ mod tests {
             }),
             text_paint: None,
             content_mask,
+            capture: None,
         });
         scene.insert_primitive(MonochromeSprite {
             order: 0,
@@ -2972,6 +3088,70 @@ mod tests {
             renderer.layers.is_empty(),
             "closed isolated groups must release their scratch targets"
         );
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_captures_keep_snapshots_that_later_frames_composite() -> Result<()> {
+        let mut renderer = offscreen(192, 100)?;
+        let content_mask = mask(192., 100.);
+        let whole = Arc::new(VnClipGeometry::rect(bounds(0., 0., 192., 100.)));
+        let isolation = |capture| VnIsolation {
+            geometry: whole.clone(),
+            color_matrix: None,
+            text_paint: None,
+            content_mask,
+            capture,
+        };
+        let info = VnCaptureInfo {
+            id: 7,
+            border_box: bounds(20., 20., 40., 40.),
+            transform: TransformationMatrix::unit(),
+        };
+        let mut captured = Scene::default();
+        captured.vn_push_isolation(isolation(Some(info)));
+        captured.insert_primitive(quad(bounds(20., 20., 40., 40.), rgb(0xff0000), content_mask));
+        captured.vn_pop_isolation();
+        captured.finish();
+        let ink = captured.vn_captures[0].ink;
+        let image = renderer.render_to_image(&captured, WindowBackgroundAppearance::Transparent)?;
+        assert_eq!(image.get_pixel(40, 40).0, [0; 4], "a capture paints nowhere");
+
+        let snapshot = |scene: &mut Scene, x: f32, y: f32, side: f32, opacity: f32, plus: bool| {
+            scene.vn_insert_snapshot(VnSnapshotPaint {
+                id: 7,
+                to_unit: [1. / side, 0., -x / side, 0., 1. / side, -y / side],
+                bounds: bounds(x, y, side, side),
+                content_mask,
+                opacity,
+                plus_lighter: plus,
+                in_place: false,
+            })
+        };
+        let mut moved = Scene::default();
+        snapshot(&mut moved, 100., 10., 80., 1., false);
+        moved.finish();
+        moved.vn_resolve_snapshots(|_| Some((info, ink)));
+        let image = renderer.render_to_image(&moved, WindowBackgroundAppearance::Transparent)?;
+        assert_eq!(image.get_pixel(140, 50).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(40, 40).0, [0; 4]);
+        assert_eq!(image.get_pixel(98, 50).0, [0; 4]);
+
+        let mut faded = Scene::default();
+        for (x, plus) in [(20., true), (100., false)] {
+            faded.vn_push_isolation(isolation(None));
+            snapshot(&mut faded, x, 20., 40., 0.5, plus);
+            snapshot(&mut faded, x, 20., 40., 0.5, plus);
+            faded.vn_pop_isolation();
+        }
+        faded.finish();
+        faded.vn_resolve_snapshots(|_| Some((info, ink)));
+        let image = renderer.render_to_image(&faded, WindowBackgroundAppearance::Transparent)?;
+        let summed = image.get_pixel(40, 40).0;
+        close_channel(summed[0], 255);
+        close_channel(summed[3], 255);
+        close_channel(image.get_pixel(120, 40).0[3], 191);
         Ok(())
     }
 

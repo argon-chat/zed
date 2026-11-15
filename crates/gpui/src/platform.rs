@@ -1539,6 +1539,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+
+    /// vue-native fork: whether the renderer draws [`Scene::vn_captures`]
+    /// and keeps them as snapshots for later frames.
+    fn vn_supports_snapshots(&self) -> bool {
+        false
+    }
 }
 
 /// vue-native fork: why [`PlatformWindow::lock_pointer`] did not lock.

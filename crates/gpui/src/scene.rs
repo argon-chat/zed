@@ -85,11 +85,51 @@ pub struct Scene {
     vn_groups: Vec<VnGroupLists>,
     // Reopened deferred descendants append to one source before the matrix
     // runs. Filtering separately changes translucent colors in linear RGB.
-    vn_color_groups: HashMap<(bool, u64, usize), usize>,
+    vn_color_groups: HashMap<(u8, u64, usize), usize>,
     vn_contexts: HashMap<(usize, VnIsolationIdentity), usize>,
     /// vue-native fork: where each group's primitives are after `finish`:
     /// the root at 0, then the groups a [`VnLayer::group`] names.
     vn_group_ranges: Vec<VnGroupRanges>,
+    /// vue-native fork: the groups painted for [`VnIsolation::capture`],
+    /// which the renderer draws first and keeps as snapshots.
+    pub vn_captures: Vec<VnCapture>,
+}
+
+/// vue-native fork: what a captured group knows of the element it holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VnCaptureInfo {
+    /// The snapshot this capture writes.
+    pub id: u64,
+    /// The element's border box in device pixels, as painted inside the
+    /// capture (untransformed).
+    pub border_box: Bounds<ScaledPixels>,
+    /// The device-space transform the element had on the page, its own
+    /// included.
+    pub transform: TransformationMatrix,
+}
+
+/// vue-native fork: one capture of a finished scene. The renderer draws
+/// `group` into a cleared target and keeps the `ink` rectangle of it as the
+/// snapshot `info.id`.
+#[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)]
+pub struct VnCapture {
+    pub info: VnCaptureInfo,
+    pub group: u32,
+    /// Device pixels the group painted, whole pixels; empty when nothing.
+    pub ink: Bounds<ScaledPixels>,
+}
+
+/// vue-native fork: [`VnLayer::flags`].
+pub mod vn_layer_flags {
+    /// The source is the snapshot [`super::VnLayer::snapshot`], not a group.
+    pub const SNAPSHOT: u32 = 1;
+    /// Composited with `plus-lighter` (both factors one) instead of
+    /// source-over.
+    pub const PLUS_LIGHTER: u32 = 2;
+    /// Drawn where the capture was taken; [`super::Scene::vn_resolve_snapshots`]
+    /// clears it, so no renderer sees it.
+    pub const IN_PLACE: u32 = 4;
 }
 
 /// vue-native fork: an isolated layer as it is opened: the clip it composites
@@ -105,17 +145,24 @@ pub struct VnIsolation {
     /// The content mask in force where the layer was opened; it cuts the
     /// composite as it cuts any primitive.
     pub content_mask: ContentMask<ScaledPixels>,
+    /// A captured group: it composites nowhere, the renderer keeps it as a
+    /// snapshot ([`Scene::vn_captures`]).
+    pub capture: Option<VnCaptureInfo>,
 }
 
 impl VnIsolation {
-    fn shared_key(&self, parent_context: usize) -> Option<(bool, u64, usize)> {
-        if let Some(text) = &self.text_paint {
-            return Some((true, text.fill.group_id, parent_context));
+    fn shared_key(&self, parent_context: usize) -> Option<(u8, u64, usize)> {
+        if let Some(capture) = &self.capture {
+            return Some((2, capture.id, 0));
         }
-        self.color_matrix.and_then(|matrix| (matrix.group_id != 0).then_some((false, matrix.group_id, 0)))
+        if let Some(text) = &self.text_paint {
+            return Some((1, text.fill.group_id, parent_context));
+        }
+        self.color_matrix.and_then(|matrix| (matrix.group_id != 0).then_some((0, matrix.group_id, 0)))
     }
 
     fn identity(&self) -> VnIsolationIdentity {
+        if let Some(capture) = &self.capture { return VnIsolationIdentity::Capture(capture.id); }
         if let Some(text) = &self.text_paint { return VnIsolationIdentity::Text(text.fill.group_id); }
         if let Some(matrix) = self.color_matrix.filter(|matrix| matrix.group_id != 0) {
             return VnIsolationIdentity::Matrix(matrix.group_id);
@@ -147,8 +194,12 @@ pub struct VnTextBackground {
 /// [`Scene::vn_clip_segments`] under `fill_rule` (0 nonzero, 1 evenodd), and
 /// by the content mask.
 ///
+/// A snapshot composite ([`vn_layer_flags::SNAPSHOT`]) samples the snapshot
+/// instead: each device pixel maps through `source_transform` into the
+/// capture's device space, where the snapshot covers `source_rect`.
+///
 /// Keep in sync with `struct VnLayer` in `gpui_windows/src/shaders.hlsl`
-/// (40 words); the renderer uploads this vector as it is.
+/// (56 words); the renderer uploads this vector as it is.
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
 #[allow(missing_docs)]
@@ -166,6 +217,42 @@ pub struct VnLayer {
     /// pixels and one more for the antialiased edge, cut by the mask.
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// The snapshot id, low and high words.
+    pub snapshot: [u32; 2],
+    /// [`vn_layer_flags`].
+    pub flags: u32,
+    pub opacity: f32,
+    /// `[x, y, width, height]` of the snapshot in capture device pixels.
+    pub source_rect: [f32; 4],
+    /// Rows `[a, b, tx, _]` and `[c, d, ty, _]`: device pixel to capture
+    /// device pixel.
+    pub source_transform: [f32; 8],
+}
+
+impl VnLayer {
+    /// The snapshot a [`vn_layer_flags::SNAPSHOT`] composite samples.
+    pub fn snapshot_id(&self) -> Option<u64> {
+        (self.flags & vn_layer_flags::SNAPSHOT != 0)
+            .then(|| self.snapshot[0] as u64 | (self.snapshot[1] as u64) << 32)
+    }
+}
+
+/// vue-native fork: a snapshot drawn into a box ([`Scene::vn_insert_snapshot`]).
+#[derive(Clone, Copy, Debug)]
+#[allow(missing_docs)]
+pub struct VnSnapshotPaint {
+    pub id: u64,
+    /// Device pixel to the box's unit square, `[a, b, tx, c, d, ty]`;
+    /// [`Scene::vn_resolve_snapshots`] maps the square onto the capture's
+    /// border box.
+    pub to_unit: [f32; 6],
+    /// The device pixels the box covers.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub opacity: f32,
+    pub plus_lighter: bool,
+    /// Where the capture was taken, ignoring `to_unit`.
+    pub in_place: bool,
 }
 
 /// vue-native fork: one `--shading` quad of a [`VnEffectLayer`], with the key
@@ -269,6 +356,70 @@ impl VnGroupLists {
             && self.vn_layers.is_empty()
     }
 
+    /// The device pixels everything in the group touches, before any clip of
+    /// a composite it holds.
+    fn ink(&self) -> Option<Bounds<ScaledPixels>> {
+        fn seen(
+            ink: &mut Option<Bounds<ScaledPixels>>,
+            bounds: Bounds<ScaledPixels>,
+            transform: Option<&TransformationMatrix>,
+            mask: &ContentMask<ScaledPixels>,
+        ) {
+            let bounds = match transform {
+                Some(matrix) if !matrix.is_unit() => transformed_bounds(bounds, *matrix),
+                _ => bounds,
+            }
+            .intersect(&mask.bounds);
+            if bounds.is_empty() {
+                return;
+            }
+            *ink = Some(ink.map_or(bounds, |ink| ink.union(&bounds)));
+        }
+        let mut ink = None;
+        for shadow in &self.shadows {
+            let spread = shadow.blur_radius * 2.;
+            let bounds = Bounds::from_corners(
+                point(shadow.bounds.origin.x - spread, shadow.bounds.origin.y - spread),
+                point(
+                    shadow.bounds.origin.x + shadow.bounds.size.width + spread,
+                    shadow.bounds.origin.y + shadow.bounds.size.height + spread,
+                ),
+            );
+            seen(&mut ink, bounds, Some(&shadow.transformation), &shadow.content_mask);
+        }
+        for quad in &self.quads {
+            seen(&mut ink, quad.bounds, Some(&quad.transformation), &quad.content_mask);
+        }
+        for rect in &self.backdrop_blur_rects {
+            seen(&mut ink, rect.bounds, None, &rect.content_mask);
+        }
+        for quad in &self.effect_quads {
+            seen(&mut ink, quad.bounds, None, &quad.content_mask);
+        }
+        for path in &self.paths {
+            seen(&mut ink, path.bounds, None, &path.content_mask);
+        }
+        for underline in &self.underlines {
+            seen(&mut ink, underline.bounds, Some(&underline.transformation), &underline.content_mask);
+        }
+        for sprite in &self.monochrome_sprites {
+            seen(&mut ink, sprite.bounds, Some(&sprite.transformation), &sprite.content_mask);
+        }
+        for sprite in &self.subpixel_sprites {
+            seen(&mut ink, sprite.bounds, Some(&sprite.transformation), &sprite.content_mask);
+        }
+        for sprite in &self.polychrome_sprites {
+            seen(&mut ink, sprite.bounds, Some(&sprite.transformation), &sprite.content_mask);
+        }
+        for surface in &self.surfaces {
+            seen(&mut ink, surface.bounds, None, &surface.content_mask);
+        }
+        for layer in &self.vn_layers {
+            seen(&mut ink, layer.bounds, None, &layer.content_mask);
+        }
+        ink
+    }
+
     /// The draw-order sort `Scene::finish` gives every group.
     fn sort(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
@@ -314,6 +465,7 @@ enum VnIsolationIdentity {
     Text(u64),
     Clip(usize),
     Effect(usize),
+    Capture(u64),
 }
 
 struct VnOpenGroup {
@@ -322,7 +474,7 @@ struct VnOpenGroup {
     isolation: VnIsolation,
     effect: Option<VnEffectPaint>,
     existing_group: Option<usize>,
-    shared_key: Option<(bool, u64, usize)>,
+    shared_key: Option<(u8, u64, usize)>,
     context: usize,
 }
 
@@ -362,6 +514,7 @@ impl Scene {
         self.vn_color_groups.clear();
         self.vn_contexts.clear();
         self.vn_group_ranges.clear();
+        self.vn_captures.clear();
     }
 
     /// vue-native fork: swaps the open group's lists with `lists`.
@@ -439,6 +592,7 @@ impl Scene {
             color_matrix: None,
             text_paint: None,
             content_mask: effect.content_mask,
+            capture: None,
         };
         self.vn_open.push(VnOpenGroup {
             saved,
@@ -479,6 +633,19 @@ impl Scene {
             return;
         }
         let color_group = open.shared_key;
+        if let Some(info) = open.isolation.capture {
+            if let Some(key) = color_group {
+                self.vn_color_groups.insert(key, self.vn_groups.len());
+            }
+            group.layer_stack = Vec::new();
+            self.vn_groups.push(group);
+            self.vn_captures.push(VnCapture {
+                info,
+                group: self.vn_groups.len() as u32,
+                ink: Bounds::default(),
+            });
+            return;
+        }
         let geometry = &open.isolation.geometry;
         let mask = open.isolation.content_mask;
         // The antialiased edge reaches half a pixel past the shape.
@@ -531,6 +698,8 @@ impl Scene {
             color_matrix: open.isolation.color_matrix.map_or([0.; 20], |matrix| matrix.gpu_values()),
             bounds,
             content_mask: mask,
+            opacity: 1.,
+            ..VnLayer::default()
         });
         self.vn_layer_effects.push(None);
     }
@@ -584,6 +753,7 @@ impl Scene {
             group: group_index,
             bounds,
             content_mask: mask,
+            opacity: 1.,
             ..Default::default()
         });
         self.vn_layer_effects.push(Some(VnEffectLayer {
@@ -596,6 +766,84 @@ impl Scene {
     /// [`Scene::vn_layers`]`[index]`, if effects do.
     pub fn vn_effect_layer(&self, index: usize) -> Option<VnEffectLayer> {
         self.vn_layer_effects.get(index).copied().flatten()
+    }
+
+    /// vue-native fork: composites the snapshot `paint.id` at the current
+    /// draw position. Its mapping is settled after `finish`
+    /// ([`Scene::vn_resolve_snapshots`]), once every capture is known.
+    pub fn vn_insert_snapshot(&mut self, paint: VnSnapshotPaint) {
+        let bounds = paint.bounds.intersect(&paint.content_mask.bounds);
+        if bounds.is_empty() || paint.opacity <= 0. {
+            return;
+        }
+        self.paint_operations.push(PaintOperation::VnSnapshot(paint));
+        let order = self
+            .layer_stack
+            .last()
+            .map(|layer| layer.order)
+            .unwrap_or_else(|| self.primitive_bounds.insert(bounds));
+        let [a, b, tx, c, d, ty] = paint.to_unit;
+        self.vn_layers.push(VnLayer {
+            order,
+            bounds,
+            content_mask: paint.content_mask,
+            snapshot: [paint.id as u32, (paint.id >> 32) as u32],
+            flags: vn_layer_flags::SNAPSHOT
+                | if paint.plus_lighter { vn_layer_flags::PLUS_LIGHTER } else { 0 }
+                | if paint.in_place { vn_layer_flags::IN_PLACE } else { 0 },
+            opacity: paint.opacity,
+            source_transform: [a, b, tx, 0., c, d, ty, 0.],
+            ..VnLayer::default()
+        });
+        self.vn_layer_effects.push(None);
+    }
+
+    /// vue-native fork: maps each snapshot composite's unit square onto its
+    /// capture's border box and names the snapshot's rectangle. `known` finds
+    /// a capture of an earlier frame; one of this scene wins. A composite
+    /// whose capture is unknown draws nothing.
+    pub fn vn_resolve_snapshots(&mut self, known: impl Fn(u64) -> Option<(VnCaptureInfo, Bounds<ScaledPixels>)>) {
+        let current: HashMap<u64, (VnCaptureInfo, Bounds<ScaledPixels>)> =
+            self.vn_captures.iter().map(|c| (c.info.id, (c.info, c.ink))).collect();
+        for layer in &mut self.vn_layers {
+            let Some(id) = layer.snapshot_id() else { continue };
+            let Some((info, ink)) = current.get(&id).copied().or_else(|| known(id)) else {
+                layer.opacity = 0.;
+                continue;
+            };
+            if ink.is_empty() {
+                layer.opacity = 0.;
+                continue;
+            }
+            if layer.flags & vn_layer_flags::IN_PLACE != 0 {
+                layer.flags &= !vn_layer_flags::IN_PLACE;
+                let Some(inverse) = info.transform.inverse() else {
+                    layer.opacity = 0.;
+                    continue;
+                };
+                let [[a, b], [c, d]] = inverse.rotation_scale;
+                let [tx, ty] = inverse.translation;
+                layer.source_transform = [a, b, tx, 0., c, d, ty, 0.];
+                let drawn = transformed_bounds(ink, info.transform);
+                let drawn = Bounds::from_corners(
+                    point(ScaledPixels(drawn.origin.x.0.floor()), ScaledPixels(drawn.origin.y.0.floor())),
+                    point(
+                        ScaledPixels((drawn.origin.x.0 + drawn.size.width.0).ceil()),
+                        ScaledPixels((drawn.origin.y.0 + drawn.size.height.0).ceil()),
+                    ),
+                );
+                layer.bounds = layer.bounds.intersect(&drawn);
+            } else {
+                let bb = info.border_box;
+                let t = layer.source_transform;
+                let (w, h) = (bb.size.width.0, bb.size.height.0);
+                layer.source_transform = [
+                    t[0] * w, t[1] * w, t[2] * w + bb.origin.x.0, 0.,
+                    t[4] * h, t[5] * h, t[6] * h + bb.origin.y.0, 0.,
+                ];
+            }
+            layer.source_rect = [ink.origin.x.0, ink.origin.y.0, ink.size.width.0, ink.size.height.0];
+        }
     }
 
     /// vue-native fork: appends a closed group to the scene's vectors.
@@ -668,7 +916,7 @@ impl Scene {
                         continue;
                     }
                     for layer in &self.vn_layers[range] {
-                        if layer.group != 0 {
+                        if layer.group != 0 && layer.snapshot_id().is_none() {
                             self.vn_flatten_into(layer.group as usize, depth + 1, out);
                         }
                     }
@@ -802,6 +1050,7 @@ impl Scene {
                 }
                 PaintOperation::VnStartEffect(effect) => self.vn_push_effect(effect.clone()),
                 PaintOperation::VnEndIsolation => self.vn_pop_isolation(),
+                PaintOperation::VnSnapshot(paint) => self.vn_insert_snapshot(*paint),
             }
         }
     }
@@ -826,7 +1075,18 @@ impl Scene {
             return;
         }
         let mut ranges = vec![self.vn_whole_ranges()];
-        for mut group in mem::take(&mut self.vn_groups) {
+        for (index, mut group) in mem::take(&mut self.vn_groups).into_iter().enumerate() {
+            if let Some(capture) = self.vn_captures.iter_mut().find(|c| c.group as usize == index + 1) {
+                capture.ink = group.ink().map_or_else(Bounds::default, |ink| {
+                    Bounds::from_corners(
+                        point(ScaledPixels(ink.origin.x.0.floor()), ScaledPixels(ink.origin.y.0.floor())),
+                        point(
+                            ScaledPixels((ink.origin.x.0 + ink.size.width.0).ceil()),
+                            ScaledPixels((ink.origin.y.0 + ink.size.height.0).ceil()),
+                        ),
+                    )
+                });
+            }
             group.sort();
             ranges.push(self.vn_append(group));
         }
@@ -963,6 +1223,8 @@ pub(crate) enum PaintOperation {
     VnStartEffect(VnEffectPaint),
     /// vue-native fork: [`Scene::vn_pop_isolation`].
     VnEndIsolation,
+    /// vue-native fork: [`Scene::vn_insert_snapshot`].
+    VnSnapshot(VnSnapshotPaint),
 }
 
 #[derive(Clone)]
@@ -2766,6 +3028,7 @@ mod vn_color_group_tests {
             }),
             color_matrix: Some(VnColorMatrix { group_id: id, values: VnColorMatrix::IDENTITY, linear_rgb: true }),
             content_mask: ContentMask { bounds: rectangle(), ..Default::default() },
+            capture: None,
         }
     }
 
@@ -2829,7 +3092,7 @@ mod vn_color_group_tests {
         assert_eq!(scene.vn_groups[1].vn_layers.len(), 1);
         assert_eq!(scene.vn_layers[0].pad[0], 1);
         assert_eq!(scene.vn_groups[1].vn_layers[0].pad[2], 2);
-        assert_eq!(std::mem::size_of::<VnLayer>(), 160, "keep existing HLSL layer ABI");
+        assert_eq!(std::mem::size_of::<VnLayer>(), 224, "keep the HLSL layer ABI");
         assert_eq!(std::mem::size_of::<VnTextBackground>(), 276, "match the HLSL structured buffer stride");
         assert_eq!(std::mem::offset_of!(VnTextBackground, bounds), 228);
         assert_eq!(std::mem::offset_of!(VnTextBackground, inverse), 244);
@@ -2929,5 +3192,37 @@ mod vn_color_group_tests {
         scene.finish();
         assert_eq!(scene.vn_group_count(), 3);
         assert_eq!(scene.vn_layers.len(), 2);
+    }
+
+    #[test]
+    fn an_in_place_snapshot_samples_through_the_captured_transform() {
+        let mut capture = filter(0);
+        capture.color_matrix = None;
+        capture.capture = Some(VnCaptureInfo {
+            id: 3,
+            border_box: rectangle(),
+            transform: crate::TransformationMatrix { rotation_scale: [[2., 0.], [0., 2.]], translation: [100., 5.] },
+        });
+        let mut scene = Scene::default();
+        scene.vn_push_isolation(capture);
+        paint(&mut scene);
+        scene.vn_pop_isolation();
+        let viewport = Bounds { origin: point(ScaledPixels(0.), ScaledPixels(0.)), size: size(ScaledPixels(400.), ScaledPixels(400.)) };
+        scene.vn_insert_snapshot(VnSnapshotPaint {
+            id: 3,
+            to_unit: [0.; 6],
+            bounds: viewport,
+            content_mask: ContentMask { bounds: viewport, ..Default::default() },
+            opacity: 1.,
+            plus_lighter: false,
+            in_place: true,
+        });
+        scene.finish();
+        scene.vn_resolve_snapshots(|_| None);
+        let layer = scene.vn_layers.iter().find(|l| l.snapshot_id() == Some(3)).copied().unwrap();
+        assert_eq!(layer.flags, vn_layer_flags::SNAPSHOT);
+        assert_eq!(layer.source_transform, [0.5, 0., -50., 0., 0., 0.5, -2.5, 0.]);
+        assert_eq!(layer.bounds.origin, point(ScaledPixels(100.), ScaledPixels(5.)));
+        assert_eq!(layer.bounds.size, size(ScaledPixels(200.), ScaledPixels(200.)));
     }
 }

@@ -1851,6 +1851,15 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn vn_supports_snapshots(&self) -> bool {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.supports_snapshots())
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0
             .state

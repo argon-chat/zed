@@ -1196,6 +1196,10 @@ impl PlatformWindow for WindowsWindow {
             .render_to_image(scene, self.state.background_appearance.get())
     }
 
+    fn vn_supports_snapshots(&self) -> bool {
+        true
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }

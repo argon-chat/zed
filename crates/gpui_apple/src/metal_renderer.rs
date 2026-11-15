@@ -892,6 +892,7 @@ impl MetalRenderer {
             effects,
             viewport_size,
         };
+        self.draw_vn_captures(&draw, &command_buffer, &frame, writer, surface_textures)?;
         self.draw_group(
             &draw,
             0,
@@ -907,7 +908,7 @@ impl MetalRenderer {
             writer,
             surface_textures,
         )?;
-        self.finish_vn_layers();
+        self.finish_vn_layers(scene);
         self.finish_vn_effects();
         self.finish_frame_target(&command_buffer, &frame)?;
 
@@ -1729,6 +1730,28 @@ fn build_path_sprite_pipeline_state(
     fragment_fn_name: &str,
     pixel_format: MTLPixelFormat,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+    build_premultiplied_pipeline_state(
+        device,
+        library,
+        label,
+        vertex_fn_name,
+        fragment_fn_name,
+        pixel_format,
+        MTLBlendFactor::OneMinusSourceAlpha,
+    )
+}
+
+/// Premultiplied colour in, `destination` scaling what is there: one minus
+/// source alpha is source-over, one is `plus-lighter`.
+fn build_premultiplied_pipeline_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: MTLPixelFormat,
+    destination: MTLBlendFactor,
+) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
     let vertex_fn = library
         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
         .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
@@ -1748,8 +1771,8 @@ fn build_path_sprite_pipeline_state(
     color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
     color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
     color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-    color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.setDestinationRGBBlendFactor(destination);
+    color_attachment.setDestinationAlphaBlendFactor(destination);
 
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)

@@ -2474,6 +2474,10 @@ impl PlatformWindow for MacWindow {
         this.renderer.render_to_image(scene)
     }
 
+    fn vn_supports_snapshots(&self) -> bool {
+        true
+    }
+
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
         let mut lock = self.0.lock();
 

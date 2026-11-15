@@ -2607,7 +2607,13 @@ impl Interactivity {
                 // hitbox that did not know its element was rotated would be
                 // clickable where nothing is drawn. Same matrix, from the same
                 // `Style`, so the picture and the hit test cannot drift.
-                let transformation = style.transform_matrix(bounds, window.scale_factor());
+                let own_transform = style.transform_matrix(bounds, window.scale_factor());
+                let transformation = if style.vn_capture.is_some() {
+                    crate::TransformationMatrix::unit()
+                } else {
+                    own_transform
+                };
+                window.vn_with_capture(style.vn_capture, bounds, own_transform, |window| {
                 window.with_element_transform(transformation, |window| {
                     window.note_tagged_transform(transformation.is_unit());
                     // vue-native fork: opacity too, so a draw deferred from in
@@ -2649,6 +2655,7 @@ impl Interactivity {
                         })
                     })
                     })
+                })
                 })
             },
         )
@@ -2808,6 +2815,8 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
+                let own_transform = style.transform_matrix(bounds, window.scale_factor());
+                window.vn_with_capture(style.vn_capture, bounds, own_transform, |window| {
                 window.vn_set_effect_element(global_id);
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
@@ -2899,6 +2908,7 @@ impl Interactivity {
                             );
                         });
                     });
+                });
                 });
 
                 ((), element_state)

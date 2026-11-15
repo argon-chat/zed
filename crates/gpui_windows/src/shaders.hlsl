@@ -1775,6 +1775,12 @@ struct VnLayer {
     Bounds bounds;
     Bounds content_mask;
     Corners content_mask_radii;
+    uint2 snapshot;
+    uint flags;
+    float opacity;
+    float4 source_rect;
+    float4 source_row0;
+    float4 source_row1;
 };
 
 StructuredBuffer<VnLayer> vn_layers: register(t1);
@@ -1844,8 +1850,25 @@ float vn_clip_coverage(float2 p, uint start, uint count, uint fill_rule) {
     return saturate(0.5 + (inside ? d : -d));
 }
 
+// A snapshot composite: the pixel maps into the capture's device space, where
+// the snapshot (bound at t0) covers `source_rect`.
+float4 vn_snapshot_fragment(VnLayer layer, float2 position) {
+    float2 q = float2(dot(layer.source_row0.xy, position) + layer.source_row0.z,
+        dot(layer.source_row1.xy, position) + layer.source_row1.z);
+    float2 local = q - layer.source_rect.xy;
+    float edge = min(min(local.x, local.y),
+        min(layer.source_rect.z - local.x, layer.source_rect.w - local.y));
+    float coverage = saturate(edge + 0.5) *
+        content_mask_coverage(position, layer.content_mask, layer.content_mask_radii);
+    float4 color = t_sprite.SampleLevel(s_clamp, local / layer.source_rect.zw, 0.0);
+    return color * (coverage * layer.opacity);
+}
+
 float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
     VnLayer layer = vn_layers[input.layer_id];
+    if ((layer.flags & 1u) != 0u) {
+        return vn_snapshot_fragment(layer, input.position.xy);
+    }
     float coverage = vn_clip_coverage(input.position.xy, layer.segment_start,
         layer.segment_count, layer.fill_rule);
     coverage *= content_mask_coverage(input.position.xy, layer.content_mask, layer.content_mask_radii);
@@ -1882,5 +1905,5 @@ float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
         color = float4(filtered.rgb * filtered.a, filtered.a);
     }
     // Premultiplied over premultiplied (the path sprite blend).
-    return color * coverage;
+    return color * (coverage * layer.opacity);
 }

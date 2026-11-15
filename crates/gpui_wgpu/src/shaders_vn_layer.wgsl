@@ -3,10 +3,11 @@
 // a clip shape, a color matrix and a text background stack. A port of
 // `vn_layer_*` in gpui_windows' shaders.hlsl.
 //
-// The instance buffer holds the frame's layers (40 words each), then every
+// The instance buffer holds the frame's layers (56 words each), then every
 // clip segment (4 words), then every text background (69 words). The renderer
 // rewrites `segment_start` and `text_start` to the word where each run begins.
-// Group 2 binding 0 (`t_sprite`) is the layer's target.
+// Group 2 binding 0 (`t_sprite`) is the layer's target, or the snapshot a
+// snapshot composite samples.
 
 struct VnLayer {
     segment_start: u32,
@@ -20,6 +21,11 @@ struct VnLayer {
     bounds: Bounds,
     content_mask: Bounds,
     content_mask_radii: Corners,
+    flags: u32,
+    opacity: f32,
+    source_rect: vec4<f32>,
+    source_row0: vec4<f32>,
+    source_row1: vec4<f32>,
 }
 
 fn read_vec4_f32(cursor: ptr<function, InstanceCursor>) -> vec4<f32> {
@@ -28,7 +34,7 @@ fn read_vec4_f32(cursor: ptr<function, InstanceCursor>) -> vec4<f32> {
 
 fn load_vn_layer(layer_id: u32) -> VnLayer {
     // `order` and `group` are the scene's, not the shader's.
-    var cursor = instance_cursor(layer_id * 40u + 2u);
+    var cursor = instance_cursor(layer_id * 56u + 2u);
     let segment_start = read_word(&cursor);
     let segment_count = read_word(&cursor);
     let fill_rule = read_word(&cursor);
@@ -43,6 +49,14 @@ fn load_vn_layer(layer_id: u32) -> VnLayer {
     let bounds = read_bounds(&cursor);
     let content_mask = read_bounds(&cursor);
     let content_mask_radii = read_corners(&cursor);
+    // The snapshot id is the renderer's.
+    _ = read_word(&cursor);
+    _ = read_word(&cursor);
+    let flags = read_word(&cursor);
+    let opacity = read_f32(&cursor);
+    let source_rect = read_vec4_f32(&cursor);
+    let source_row0 = read_vec4_f32(&cursor);
+    let source_row1 = read_vec4_f32(&cursor);
     return VnLayer(
         segment_start,
         segment_count,
@@ -55,6 +69,11 @@ fn load_vn_layer(layer_id: u32) -> VnLayer {
         bounds,
         content_mask,
         content_mask_radii,
+        flags,
+        opacity,
+        source_rect,
+        source_row0,
+        source_row1,
     );
 }
 
@@ -118,10 +137,27 @@ fn vn_clip_coverage(p: vec2<f32>, start: u32, count: u32, fill_rule: u32) -> f32
     return saturate(0.5 + select(-d, d, inside));
 }
 
+// A snapshot composite: the pixel maps into the capture's device space, where
+// the snapshot covers `source_rect`.
+fn vn_snapshot_color(layer: VnLayer, position: vec2<f32>) -> vec4<f32> {
+    let q = vec2<f32>(dot(layer.source_row0.xy, position) + layer.source_row0.z,
+        dot(layer.source_row1.xy, position) + layer.source_row1.z);
+    let local = q - layer.source_rect.xy;
+    let edge = min(min(local.x, local.y),
+        min(layer.source_rect.z - local.x, layer.source_rect.w - local.y));
+    let coverage = saturate(edge + 0.5)
+        * content_mask_coverage(position, layer.content_mask, layer.content_mask_radii);
+    let color = textureSampleLevel(t_sprite, s_sprite, local / layer.source_rect.zw, 0.0);
+    return color * (coverage * layer.opacity);
+}
+
 @fragment
 fn fs_vn_layer(input: VnLayerVarying) -> @location(0) vec4<f32> {
     let layer = load_vn_layer(input.layer_id);
     let position = input.position.xy;
+    if ((layer.flags & 1u) != 0u) {
+        return vn_snapshot_color(layer, position);
+    }
     let coverage = vn_clip_coverage(position, layer.segment_start, layer.segment_count, layer.fill_rule)
         * content_mask_coverage(position, layer.content_mask, layer.content_mask_radii);
     var color = textureLoad(t_sprite, vec2<i32>(position), 0);
@@ -154,5 +190,5 @@ fn fs_vn_layer(input: VnLayerVarying) -> @location(0) vec4<f32> {
         }
         color = vec4<f32>(filtered.rgb * filtered.a, filtered.a);
     }
-    return color * coverage;
+    return color * (coverage * layer.opacity);
 }

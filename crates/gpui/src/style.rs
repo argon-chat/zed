@@ -804,6 +804,14 @@ pub struct Style {
     /// SVG color filtering of the whole painted subtree.
     pub vn_color_matrix: Option<crate::VnColorMatrix>,
 
+    /// vue-native fork: paint this element into the snapshot of this id
+    /// instead of the page ([`Window::vn_with_capture`]).
+    pub vn_capture: Option<u64>,
+
+    /// vue-native fork: paint the subtree into an isolated group, so a
+    /// `plus-lighter` composite inside blends with the group only.
+    pub vn_isolate: bool,
+
     /// CSS backgrounds painted through the descendant glyph alpha, not the box.
     pub vn_text_fill: Option<VnTextFill>,
 
@@ -1659,7 +1667,13 @@ impl Style {
         // A shape that is no rounded rectangle paints into an isolated layer
         // composited through it (`Window::vn_with_clip_shape`), inside its
         // box's mask.
-        let transformation = self.transform_matrix(bounds, window.scale_factor());
+        // A captured element paints untransformed; its transform travels with
+        // the capture (`Window::vn_with_capture`).
+        let transformation = if self.vn_capture.is_some() {
+            TransformationMatrix::unit()
+        } else {
+            self.transform_matrix(bounds, window.scale_factor())
+        };
         let clip = self.vn_clip_mask(bounds, window.rem_size());
         let outline = self.vn_clip_outline(bounds, window.rem_size());
         let element = window.vn_take_effect_element();
@@ -1668,7 +1682,9 @@ impl Style {
                 window.with_content_mask(clip, |window| {
                     window.vn_with_clip_shape(outline.as_ref(), |window| {
                         window.vn_with_color_matrix(self.vn_color_matrix, |window| {
-                            self.paint_shaded(bounds, element, window, cx, continuation)
+                            window.vn_with_isolation(self.vn_isolate, |window| {
+                                self.paint_shaded(bounds, element, window, cx, continuation)
+                            })
                         })
                     })
                 })
@@ -1677,7 +1693,9 @@ impl Style {
         window.with_content_mask(clip, |window| {
             window.vn_with_clip_shape(outline.as_ref(), |window| {
                 window.vn_with_color_matrix(self.vn_color_matrix, |window| {
-                    self.paint_shaded(bounds, element, window, cx, continuation)
+                    window.vn_with_isolation(self.vn_isolate, |window| {
+                        self.paint_shaded(bounds, element, window, cx, continuation)
+                    })
                 })
             })
         })
@@ -2099,6 +2117,8 @@ impl Default for Style {
             vn_mask_ring: false,
             vn_clip_path: VnClipPath::None,
             vn_color_matrix: None,
+            vn_capture: None,
+            vn_isolate: false,
             vn_text_fill: None,
             vn_corner_radii: Corners::default(),
 
