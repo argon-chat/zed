@@ -159,6 +159,7 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     path_sample_count: u32,
+    sprite_gamma: SpriteGammaParams,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -458,6 +459,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            sprite_gamma: SpriteGammaParams::from_env(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         })
@@ -1412,6 +1414,11 @@ impl MetalRenderer {
                 instance_bindings.monochrome_sprites.offset,
                 SpriteInputIndex::Sprites as usize,
             );
+            command_encoder.setFragmentBytes_length_atIndex(
+                ptr::NonNull::from(&self.sprite_gamma).cast(),
+                mem::size_of::<SpriteGammaParams>(),
+                SpriteInputIndex::GammaParams as usize,
+            );
             command_encoder.setFragmentTexture_atIndex(
                 Some(&texture),
                 SpriteInputIndex::AtlasTexture as usize,
@@ -1987,6 +1994,31 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
+    GammaParams = 5,
+}
+
+/// `SpriteGammaParams` in shaders.metal: the glyph alpha correction the
+/// DirectX and wgpu renderers apply, with the same defaults and overrides.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SpriteGammaParams {
+    gamma_ratios: [f32; 4],
+    grayscale_enhanced_contrast: f32,
+    _pad: [f32; 3],
+}
+
+impl SpriteGammaParams {
+    fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
+        let gamma = var("ZED_FONTS_GAMMA").unwrap_or(1.8).clamp(1.0, 2.2);
+        Self {
+            gamma_ratios: gpui::get_gamma_correction_ratios(gamma),
+            grayscale_enhanced_contrast: var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
+                .unwrap_or(1.0)
+                .max(0.0),
+            _pad: [0.0; 3],
+        }
+    }
 }
 
 #[repr(C)]
@@ -2088,6 +2120,66 @@ mod tests {
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
     use objc2_metal::MTLCommandBufferStatus;
+
+    /// Half-covered glyph pixels must match what DirectWrite's default gamma
+    /// (1.8) and grayscale contrast (1.0) produce on the DirectX renderer.
+    #[test]
+    fn glyph_edges_get_the_directx_gamma_and_contrast_correction() -> Result<()> {
+        use gpui::{AtlasKey, MonochromeSprite, PlatformAtlas as _, Quad, RenderSvgParams, rgb};
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        renderer.sprite_gamma = SpriteGammaParams {
+            gamma_ratios: gpui::get_gamma_correction_ratios(1.8),
+            grayscale_enhanced_contrast: 1.0,
+            _pad: [0.0; 3],
+        };
+        let tile_size = size(DevicePixels(8), DevicePixels(8));
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "half-coverage".into(),
+                    size: tile_size,
+                }),
+                &mut || Ok(Some((tile_size, std::borrow::Cow::Owned(vec![128u8; 64])))),
+            )?
+            .context("coverage tile was not allocated")?;
+        let mut scene = Scene::default();
+        for (x, foreground, background) in [(0.0, 0xffffff, 0x000000), (8.0, 0x000000, 0xffffff)] {
+            let bounds = Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(0.0)),
+                size(ScaledPixels(8.0), ScaledPixels(8.0)),
+            );
+            scene.insert_primitive(Quad {
+                bounds,
+                background: rgb(background).into(),
+                content_mask: ContentMask::rect(bounds),
+                ..Default::default()
+            });
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                tile,
+                bounds,
+                content_mask: ContentMask::rect(bounds),
+                color: rgb(foreground).into(),
+                transformation: gpui::TransformationMatrix::unit(),
+            });
+        }
+        scene.finish();
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(8)))?;
+        let white_on_black = image.get_pixel(4, 4).0[0];
+        let black_on_white = image.get_pixel(12, 4).0[0];
+        assert!(
+            white_on_black.abs_diff(177) <= 3,
+            "white on black: {white_on_black}"
+        );
+        assert!(
+            black_on_white.abs_diff(137) <= 3,
+            "black on white: {black_on_white}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {
