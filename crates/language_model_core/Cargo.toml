@@ -16,7 +16,7 @@ anyhow.workspace = true
 cloud_llm_client.workspace = true
 collections.workspace = true
 futures.workspace = true
-gpui_shared_string.workspace = true
+gpui_shared_string = { workspace = true, features = ["schemars"] }
 http.workspace = true
 log.workspace = true
 partial-json-fixer.workspace = true

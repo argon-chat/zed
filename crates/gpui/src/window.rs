@@ -32,9 +32,9 @@ use crate::{
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
+use crate::util::impl_deref;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
@@ -965,12 +965,11 @@ fn transform_mask(
 
 /// A rectangular region that potentially blocks hitboxes inserted prior.
 /// See [Window::insert_hitbox] for more details.
-#[derive(Clone, Debug, Deref)]
+#[derive(Clone, Debug)]
 pub struct Hitbox {
     /// A unique identifier for the hitbox.
     pub id: HitboxId,
     /// The bounds of the hitbox.
-    #[deref]
     pub bounds: Bounds<Pixels>,
     /// The content mask when the hitbox was inserted.
     pub content_mask: ContentMask<Pixels>,
@@ -990,6 +989,8 @@ pub struct Hitbox {
     /// point outside any of them does not hit it (CSS Masking 1 §5).
     pub vn_clip: Option<Arc<crate::VnClipNode>>,
 }
+
+impl_deref!([] Hitbox => bounds: Bounds<Pixels>);
 
 impl Hitbox {
     /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
@@ -9629,13 +9630,12 @@ impl From<u64> for WindowId {
 
 /// A handle to a window with a specific root view type.
 /// Note that this does not keep the window alive on its own.
-#[derive(Deref, DerefMut)]
 pub struct WindowHandle<V> {
-    #[deref]
-    #[deref_mut]
     pub(crate) any_handle: AnyWindowHandle,
     state_type: PhantomData<fn(V) -> V>,
 }
+
+impl_deref!([V] WindowHandle<V> => mut any_handle: AnyWindowHandle);
 
 impl<V> Debug for WindowHandle<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1,10 +1,12 @@
-use derive_more::{Deref, DerefMut};
+use crate::util::impl_deref;
 
 use crate::SharedString;
 
 /// A [`SharedString`] containing a URI.
-#[derive(Deref, DerefMut, Default, PartialEq, Eq, Hash, Clone)]
+#[derive(Default, PartialEq, Eq, Hash, Clone)]
 pub struct SharedUri(SharedString);
+
+impl_deref!([] SharedUri => mut 0: SharedString);
 
 impl std::fmt::Debug for SharedUri {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

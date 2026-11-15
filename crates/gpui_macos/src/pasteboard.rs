@@ -13,7 +13,6 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSData, NSString};
 use smallvec::SmallVec;
-use strum::IntoEnumIterator as _;
 #[cfg(test)]
 use uuid::Uuid;
 

@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 
+use crate::util::impl_deref;
 use anyhow::{Context as _, Result, anyhow};
-use derive_more::{Deref, DerefMut};
 use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -181,8 +181,9 @@ impl AppCell {
 }
 
 #[doc(hidden)]
-#[derive(Deref, DerefMut)]
 pub struct AppRef<'a>(Ref<'a, App>);
+
+impl_deref!(['a] AppRef<'a> => mut 0: Ref<'a, App>);
 
 impl Drop for AppRef<'_> {
     fn drop(&mut self) {
@@ -194,8 +195,9 @@ impl Drop for AppRef<'_> {
 }
 
 #[doc(hidden)]
-#[derive(Deref, DerefMut)]
 pub struct AppRefMut<'a>(RefMut<'a, App>);
+
+impl_deref!(['a] AppRefMut<'a> => mut 0: RefMut<'a, App>);
 
 impl Drop for AppRefMut<'_> {
     fn drop(&mut self) {
@@ -2803,6 +2805,7 @@ impl App {
     }
 
     /// Get all non-internal actions that have been registered, along with their schemas.
+    #[cfg(feature = "schemars")]
     pub fn action_schemas(
         &self,
         generator: &mut schemars::SchemaGenerator,
@@ -2814,6 +2817,7 @@ impl App {
     /// Returns `None` if the action is not found.
     /// Returns `Some(None)` if the action exists but has no schema.
     /// Returns `Some(Some(schema))` if the action exists and has a schema.
+    #[cfg(feature = "schemars")]
     pub fn action_schema_by_name(
         &self,
         name: &str,

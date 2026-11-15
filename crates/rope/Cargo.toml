@@ -17,7 +17,7 @@ gpui_util.workspace = true
 heapless.workspace = true
 log.workspace = true
 rayon.workspace = true
-sum_tree.workspace = true
+sum_tree = { workspace = true, features = ["rayon"] }
 unicode-segmentation.workspace = true
 ztracing.workspace = true
 tracing.workspace = true

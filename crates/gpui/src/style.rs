@@ -16,6 +16,7 @@ use crate::{
 };
 use collections::HashSet;
 use refineable::Refineable;
+#[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -142,9 +143,8 @@ impl ObjectFit {
 }
 
 /// The minimum size of a column or row in a grid layout
-#[derive(
-    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize,
-)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum GridTemplateMinSize {
     /// The column or row size may be 0
     #[default]
@@ -157,19 +157,9 @@ pub enum GridTemplateMinSize {
 
 /// A simplified representation of the grid-template-* value
 #[derive(
-    Copy,
-    Clone,
-    Refineable,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Debug,
-    Default,
-    JsonSchema,
-    Serialize,
-    Deserialize,
+    Copy, Clone, Refineable, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize,
 )]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct GridTemplate {
     /// How this template directive should be repeated
     pub repeat: u16,
@@ -183,7 +173,8 @@ pub struct GridTemplate {
 /// This is the full set taffy can express for a *definite* track. `fit-content()`
 /// and `calc()` are absent: the first has no caller and the second is resolved
 /// before it reaches here.
-#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum GridTrackSize {
     /// `auto`
     #[default]
@@ -207,7 +198,8 @@ pub enum GridTrackSize {
 /// Always stored in its `minmax()` normal form, which is what CSS says every
 /// track sizing function means: a bare `1fr` is `minmax(auto, 1fr)`, a bare
 /// `200px` is `minmax(200px, 200px)`.
-#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct GridTrack {
     /// The track's minimum size.
     pub min: GridTrackSize,
@@ -239,7 +231,8 @@ impl GridTrack {
 /// to ([`Style::vn_grid_cols`] / [`Style::vn_grid_rows`]); CSS allows one such
 /// repetition per list, and every other track in that list must then have a
 /// fixed size, which the caller checks.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct GridAutoRepeat {
     /// `auto-fit` (the empty repetitions collapse) rather than `auto-fill`
     /// (they keep their size).
@@ -252,7 +245,8 @@ pub struct GridAutoRepeat {
 
 /// CSS `grid-auto-flow`: which axis the auto-placement algorithm fills, and
 /// whether it backfills holes.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum GridAutoFlow {
     /// Fill each row in turn, adding rows as needed.
     #[default]
@@ -267,7 +261,8 @@ pub enum GridAutoFlow {
 
 /// CSS `outline`: a ring painted just outside the border box, taking no layout
 /// space. See [`Style::vn_outline`].
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Outline {
     /// `outline-width`. Zero paints nothing.
     pub width: Pixels,
@@ -283,7 +278,8 @@ pub struct Outline {
 /// vue-native fork: one CSS `border-*-radius` corner, as its two radii. Each
 /// is a length, a percentage of the box (`Fraction`), or a linear `calc()`
 /// with one. See [`Style::vn_corner_radii`].
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct VnCornerRadius {
     /// The horizontal radius; a percentage is of the box's width.
     pub x: DefiniteLength,
@@ -367,7 +363,8 @@ pub fn vn_resolve_corner_radii(
 /// vue-native fork: the box a `clip-path` is laid against (CSS Masking 1
 /// §5.1, `<geometry-box>`). `fill-box` is the content box and `stroke-box` and
 /// `view-box` the border box, as for any element with a CSS box.
-#[derive(Copy, Clone, Default, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum VnClipBox {
     /// The margin box.
     Margin,
@@ -381,7 +378,8 @@ pub enum VnClipBox {
 }
 
 /// vue-native fork: a `<shape-radius>` of `circle()` or `ellipse()`.
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum VnShapeRadius {
     /// A length. A percentage is of the reference box's width for an
     /// ellipse's horizontal radius, of its height for the vertical one, and
@@ -398,7 +396,8 @@ pub enum VnShapeRadius {
 /// content mask can carry are one ([`Style::vn_clip_mask`]); `polygon()`,
 /// `path()` and an ellipse that is no circle are an isolated layer composited
 /// through the shape ([`Style::vn_clip_outline`], [`crate::VnClipGeometry`]).
-#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum VnClipPath {
     /// `none`: no clip.
     #[default]
@@ -492,7 +491,8 @@ fn vn_clip_ellipse(
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 pub struct Style {
     /// What layout strategy should be used?
     pub display: Display,
@@ -812,7 +812,8 @@ impl StyleRefinement {
 }
 
 /// The value of the visibility property, similar to the CSS property `visibility`
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum Visibility {
     /// The element should be drawn as normal.
     #[default]
@@ -822,7 +823,8 @@ pub enum Visibility {
 }
 
 /// The possible values of the box-shadow property
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct BoxShadow {
     /// What color should the shadow have?
     pub color: Hsla,
@@ -870,7 +872,8 @@ impl BoxShadow {
 }
 
 /// How to handle whitespace in text
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum WhiteSpace {
     /// Normal line wrapping when text overflows the width of the element
     #[default]
@@ -881,9 +884,8 @@ pub enum WhiteSpace {
 
 /// vue-native fork: CSS `overflow-wrap` (CSS Text 3 §5.5). May a line break
 /// inside a word that does not fit on a line of its own?
-#[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum OverflowWrap {
     /// Lines break only at soft wrap opportunities. A word wider than the
     /// line overflows it.
@@ -898,9 +900,8 @@ pub enum OverflowWrap {
 }
 
 /// vue-native fork: CSS `word-break` (CSS Text 3 §5.2).
-#[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum WordBreak {
     /// The usual soft wrap opportunities.
     #[default]
@@ -918,9 +919,8 @@ pub enum WordBreak {
 
 /// vue-native fork: CSS `hyphens` (CSS Text 3 §6.1). There is no hyphenation
 /// dictionary, so `auto` is the caller's to map to `Manual`.
-#[derive(
-    Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum Hyphens {
     /// A soft hyphen (U+00AD) is no break opportunity.
     None,
@@ -964,7 +964,8 @@ impl TextWrap {
 }
 
 /// How to truncate text that overflows the width of the element
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum TextOverflow {
     /// Truncate the text at the end when it doesn't fit, and represent this truncation by
     /// displaying the provided string (e.g., "very long te…").
@@ -980,7 +981,8 @@ pub enum TextOverflow {
 }
 
 /// How to align text within the element
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum TextAlign {
     /// Align the text to the left of the element
     #[default]
@@ -994,7 +996,8 @@ pub enum TextAlign {
 }
 
 /// A CSS background stack clipped to the element's descendant text.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct VnTextFill {
     /// Stable element identity; reopened/deferred text shares one alpha mask.
     pub group_id: u64,
@@ -1004,7 +1007,8 @@ pub struct VnTextFill {
 
 /// A text background resolved against its element, in logical CSS pixels.
 /// Carried in TextStyle so deferred drawing and paint-cache keys retain it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct VnTextPaint {
     /// The authored stack.
     pub fill: VnTextFill,
@@ -1016,17 +1020,18 @@ pub struct VnTextPaint {
     pub scale_factor: f32,
     /// The owner scope's geometry, shared by every descendant glyph.
     #[serde(skip)]
-    #[schemars(skip)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     pub geometry: Arc<crate::VnClipGeometry>,
     /// The owner scope's outer mask. Glyphs retain their local child masks.
     #[serde(skip)]
-    #[schemars(skip)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     pub content_mask: ContentMask<crate::ScaledPixels>,
 }
 
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 pub struct TextStyle {
     /// The color of the text
     pub color: Hsla,
@@ -1981,9 +1986,8 @@ impl Default for Style {
 }
 
 /// The properties that can be applied to an underline.
-#[derive(
-    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct UnderlineStyle {
     /// The thickness of the underline.
     pub thickness: Pixels,
@@ -2001,9 +2005,8 @@ pub struct UnderlineStyle {
 }
 
 /// The properties that can be applied to a strikethrough.
-#[derive(
-    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct StrikethroughStyle {
     /// The thickness of the strikethrough.
     pub thickness: Pixels,
@@ -2013,7 +2016,8 @@ pub struct StrikethroughStyle {
 }
 
 /// The kinds of fill that can be applied to a shape.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum Fill {
     /// A solid color fill.
     Color(Background),
@@ -2198,7 +2202,8 @@ pub fn combine_highlights(
 /// For Grid it controls alignment in the block axis
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-items)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum AlignItems {
     /// Items are packed toward the start of the axis
@@ -2248,7 +2253,8 @@ pub type JustifySelf = AlignItems;
 /// For Grid it controls alignment in the block axis
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-content)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum AlignContent {
     /// Items are packed toward the start of the axis
@@ -2294,7 +2300,8 @@ pub type JustifyContent = AlignContent;
 /// Sets the layout used for the children of this node
 ///
 /// The default values depends on on which feature flags are enabled. The order of precedence is: Flex, Grid, Block, None.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Display {
     /// The children will follow the block layout algorithm
@@ -2313,7 +2320,8 @@ pub enum Display {
 /// Defaults to [`FlexWrap::NoWrap`]
 ///
 /// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum FlexWrap {
     /// Items will not wrap and stay on a single line
@@ -2336,7 +2344,8 @@ pub enum FlexWrap {
 /// The default behavior is [`FlexDirection::Row`].
 ///
 /// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-direction-property)
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum FlexDirection {
     /// Defines +x as the main axis
@@ -2371,7 +2380,8 @@ pub enum FlexDirection {
 /// a scrollbar is controlled by the `scrollbar_width` property. If this is `0` then `Scroll` behaves identically to `Hidden`.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow>
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Overflow {
     /// The automatic minimum size of this node as a flexbox/grid item should be based on the size of its content.
@@ -2399,7 +2409,8 @@ pub enum Overflow {
 /// which can be unintuitive.
 ///
 /// [`Position::Relative`] is the default value, in contrast to the default behavior in CSS.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Position {
     /// The offset is computed relative to the final position given by the layout algorithm.

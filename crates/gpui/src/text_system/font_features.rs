@@ -1,6 +1,8 @@
+#[cfg(feature = "schemars")]
 use std::borrow::Cow;
 use std::sync::Arc;
 
+#[cfg(feature = "schemars")]
 use schemars::{JsonSchema, json_schema};
 
 /// The OpenType features that can be configured for a given font.
@@ -138,6 +140,7 @@ impl serde::Serialize for FontFeatures {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for FontFeatures {
     fn schema_name() -> Cow<'static, str> {
         "FontFeatures".into()

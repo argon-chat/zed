@@ -11,9 +11,12 @@ pub use font_features::*;
 pub use line::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
+#[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::geometry::impl_newtype_ops;
+use crate::util::impl_deref;
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
     StrikethroughStyle, TextRenderingMode, TextWrap, UnderlineStyle, px,
@@ -21,7 +24,6 @@ use crate::{
 use anyhow::Context as _;
 use collections::{FxHashMap, FxHashSet};
 use core::fmt;
-use derive_more::{Add, Deref, FromStr, Sub};
 use itertools::Itertools;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::{SmallVec, smallvec};
@@ -679,13 +681,13 @@ impl TextSystem {
 }
 
 /// The GPUI text layout subsystem.
-#[derive(Deref)]
 pub struct WindowTextSystem {
     line_layout_cache: LineLayoutCache,
     font_runs_buffer: Cell<Vec<FontRun>>,
-    #[deref]
     text_system: Arc<TextSystem>,
 }
+
+impl_deref!([] WindowTextSystem => text_system: Arc<TextSystem>);
 
 impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
@@ -1058,9 +1060,18 @@ impl DerefMut for LineWrapperHandle {
 
 /// The degree of blackness or stroke thickness of a font. This value ranges from 100.0 to 900.0,
 /// with 400.0 as normal.
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize, Add, Sub, FromStr)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FontWeight(pub f32);
+
+impl_newtype_ops!(FontWeight(f32): Add, Sub);
+
+impl std::str::FromStr for FontWeight {
+    type Err = std::num::ParseFloatError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
 
 impl Display for FontWeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1123,6 +1134,7 @@ impl FontWeight {
     ];
 }
 
+#[cfg(feature = "schemars")]
 impl schemars::JsonSchema for FontWeight {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "FontWeight".into()
@@ -1141,7 +1153,8 @@ impl schemars::JsonSchema for FontWeight {
 }
 
 /// Allows italic or oblique faces to be selected.
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum FontStyle {
     /// A face that is neither italic not obliqued.
     #[default]

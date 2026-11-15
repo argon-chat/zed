@@ -27,7 +27,7 @@ rand = { workspace = true, optional = true }
 regex.workspace = true
 rope.workspace = true
 smallvec.workspace = true
-sum_tree.workspace = true
+sum_tree = { workspace = true, features = ["rayon"] }
 util = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -22,7 +22,7 @@ workspace = true
 anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 hex.workspace = true
 log.workspace = true
 parking_lot.workspace = true

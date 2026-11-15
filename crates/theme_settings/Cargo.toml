@@ -19,7 +19,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 gpui_util.workspace = true
 log.workspace = true
 palette.workspace = true

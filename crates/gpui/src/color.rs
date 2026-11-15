@@ -1,9 +1,11 @@
 use anyhow::{Context as _, bail};
+#[cfg(feature = "schemars")]
 use schemars::{JsonSchema, json_schema};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
+#[cfg(feature = "schemars")]
 use std::borrow::Cow;
 use std::{
     fmt::{self, Display, Formatter},
@@ -157,6 +159,7 @@ impl Visitor<'_> for RgbaVisitor {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for Rgba {
     fn schema_name() -> Cow<'static, str> {
         "Rgba".into()
@@ -712,6 +715,7 @@ impl From<Rgba> for Hsla {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for Hsla {
     fn schema_name() -> Cow<'static, str> {
         Rgba::schema_name()
@@ -740,7 +744,8 @@ impl<'de> Deserialize<'de> for Hsla {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(C)]
 pub(crate) enum BackgroundTag {
     Solid = 0,
@@ -820,7 +825,8 @@ pub(crate) const BG_STOP_PX_SHIFT: u32 = 16;
 /// References:
 /// - <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
 /// - <https://www.w3.org/TR/css-color-4/#typedef-color-space>
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(C)]
 pub enum ColorSpace {
     #[default]
@@ -846,7 +852,8 @@ impl Display for ColorSpace {
 /// The layout is the GPU layout — see the `Quad` word map in `scene.rs` and the
 /// hand-mirrored `struct Background` in each backend's shader. Adding a field
 /// here is a six-file change; the checklist is on `Quad`.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(C)]
 pub struct Background {
     pub(crate) tag: BackgroundTag,
@@ -1025,7 +1032,8 @@ fn gradient_with_stops(tag: BackgroundTag, angle: f32, stops: &[LinearColorStop]
 /// A color stop in a linear gradient.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient#linear-color-stop>
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(C)]
 pub struct LinearColorStop {
     /// The color of the color stop.

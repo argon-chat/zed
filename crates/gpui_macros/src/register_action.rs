@@ -18,6 +18,12 @@ pub(crate) fn generate_register_action(type_name: &Ident) -> TokenStream2 {
         type_name.to_string().to_lowercase()
     );
 
+    let json_schema = if cfg!(feature = "schemars") {
+        quote! { json_schema: <#type_name as gpui::Action>::action_json_schema, }
+    } else {
+        quote! {}
+    };
+
     quote! {
         impl #type_name {
             /// This is an auto generated function, do not use.
@@ -31,7 +37,7 @@ pub(crate) fn generate_register_action(type_name: &Ident) -> TokenStream2 {
                         name: <#type_name as gpui::Action>::name_for_type(),
                         type_id: ::std::any::TypeId::of::<#type_name>(),
                         build: <#type_name as gpui::Action>::build,
-                        json_schema: <#type_name as gpui::Action>::action_json_schema,
+                        #json_schema
                         deprecated_aliases: <#type_name as gpui::Action>::deprecated_aliases(),
                         deprecation_message: <#type_name as gpui::Action>::deprecation_message(),
                         documentation: <#type_name as gpui::Action>::documentation(),

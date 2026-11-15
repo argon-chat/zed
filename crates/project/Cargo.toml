@@ -59,7 +59,7 @@ git.workspace = true
 git_hosting_providers.workspace = true
 github_releases.workspace = true
 globset.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 http_client.workspace = true
 image.workspace = true
 indexmap.workspace = true

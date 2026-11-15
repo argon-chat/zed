@@ -40,7 +40,7 @@ fs.workspace = true
 feature_flags.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 heck.workspace = true
 http_client.workspace = true
 http_proxy.workspace = true

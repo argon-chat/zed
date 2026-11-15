@@ -5,6 +5,7 @@ mod tree_map;
 
 pub use cursor::{Cursor, FilterCursor, Iter};
 use heapless::Vec as ArrayVec;
+#[cfg(any(test, feature = "rayon"))]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator as _};
 use std::marker::PhantomData;
 use std::mem;
@@ -315,6 +316,7 @@ impl<T: Item> SumTree<T> {
         }
     }
 
+    #[cfg(any(test, feature = "rayon"))]
     pub fn from_par_iter<I, Iter>(iter: I, cx: <T::Summary as Summary>::Context<'_>) -> Self
     where
         I: IntoParallelIterator<Iter = Iter>,
@@ -754,6 +756,7 @@ impl<T: Item> SumTree<T> {
         self.append(Self::from_iter(iter, cx), cx);
     }
 
+    #[cfg(any(test, feature = "rayon"))]
     pub fn par_extend<I, Iter>(&mut self, iter: I, cx: <T::Summary as Summary>::Context<'_>)
     where
         I: IntoParallelIterator<Iter = Iter>,

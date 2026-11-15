@@ -15,12 +15,13 @@ doctest = false
 
 [dependencies]
 heapless.workspace = true
-rayon.workspace = true
+rayon = { workspace = true, optional = true }
 ztracing.workspace = true
 tracing.workspace = true
 proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
+rayon.workspace = true
 log.workspace = true
 ctor.workspace = true
 rand.workspace = true
@@ -32,4 +33,5 @@ zlog.workspace = true
 ignored = ["tracing"]
 
 [features]
+rayon = ["dep:rayon"]
 test-support = ["proptest"]

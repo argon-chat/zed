@@ -1,7 +1,7 @@
+use crate::util::impl_deref;
 use crate::{App, AppContext, GpuiBorrow, VisualContext, Window, seal::Sealed};
 use anyhow::{Context as _, Result};
 use collections::FxHashSet;
-use derive_more::{Deref, DerefMut};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use slotmap::{KeyData, SecondaryMap, SlotMap};
 use std::{
@@ -340,8 +340,9 @@ impl Drop for LeaseInner {
     }
 }
 
-#[derive(Deref, DerefMut)]
 pub(crate) struct Slot<T>(Entity<T>);
+
+impl_deref!([T] Slot<T> => mut 0: Entity<T>);
 
 /// A dynamically typed reference to a entity, which can be downcast into a `Entity<T>`.
 pub struct AnyEntity {
@@ -511,13 +512,12 @@ impl std::fmt::Debug for AnyEntity {
 
 /// A strong, well-typed reference to a struct which is managed
 /// by GPUI
-#[derive(Deref, DerefMut)]
 pub struct Entity<T> {
-    #[deref]
-    #[deref_mut]
     pub(crate) any_entity: AnyEntity,
     pub(crate) entity_type: PhantomData<fn(T) -> T>,
 }
+
+impl_deref!([T] Entity<T> => mut any_entity: AnyEntity);
 
 impl<T> Sealed for Entity<T> {}
 
@@ -841,13 +841,12 @@ impl PartialOrd for AnyWeakEntity {
 }
 
 /// A weak reference to a entity of the given type.
-#[derive(Deref, DerefMut)]
 pub struct WeakEntity<T> {
-    #[deref]
-    #[deref_mut]
     any_entity: AnyWeakEntity,
     entity_type: PhantomData<fn(T) -> T>,
 }
+
+impl_deref!([T] WeakEntity<T> => mut any_entity: AnyWeakEntity);
 
 impl<T> std::fmt::Debug for WeakEntity<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -33,7 +33,7 @@ dap-types.workspace = true
 fs.workspace = true
 futures.workspace = true
 github_releases.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 http_client.workspace = true
 language.workspace = true
 log.workspace = true

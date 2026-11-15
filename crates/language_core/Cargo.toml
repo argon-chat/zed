@@ -12,7 +12,7 @@ doctest = false
 anyhow.workspace = true
 bitflags.workspace = true
 collections.workspace = true
-gpui_shared_string.workspace = true
+gpui_shared_string = { workspace = true, features = ["schemars"] }
 gpui_util.workspace = true
 log.workspace = true
 lru.workspace = true

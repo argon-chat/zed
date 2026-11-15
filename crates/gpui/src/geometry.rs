@@ -4,12 +4,13 @@
 
 use anyhow::{Context as _, anyhow};
 use core::fmt::Debug;
-use derive_more::{Add, AddAssign, Div, DivAssign, Mul, Neg, Sub, SubAssign};
 use refineable::Refineable;
+#[cfg(feature = "schemars")]
 use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+#[cfg(feature = "schemars")]
 use std::borrow::Cow;
-use std::ops::{AddAssign, Range};
+use std::ops::{AddAssign, Range, SubAssign};
 use std::{
     cmp::{self, PartialOrd},
     fmt::{self, Display},
@@ -19,6 +20,143 @@ use std::{
 use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
 
 use crate::{App, DisplayId};
+
+/// Operator impls for a single-field tuple struct, applied to the field. `Mul`, `Div` and
+/// `DivAssign` take any right-hand side the field accepts.
+macro_rules! impl_newtype_ops {
+    (@Add $ty:ident $inner:ty) => {
+        impl ::std::ops::Add for $ty {
+            type Output = Self;
+            fn add(self, rhs: Self) -> Self {
+                Self(self.0 + rhs.0)
+            }
+        }
+    };
+    (@AddAssign $ty:ident $inner:ty) => {
+        impl ::std::ops::AddAssign for $ty {
+            fn add_assign(&mut self, rhs: Self) {
+                self.0 += rhs.0;
+            }
+        }
+    };
+    (@Sub $ty:ident $inner:ty) => {
+        impl ::std::ops::Sub for $ty {
+            type Output = Self;
+            fn sub(self, rhs: Self) -> Self {
+                Self(self.0 - rhs.0)
+            }
+        }
+    };
+    (@SubAssign $ty:ident $inner:ty) => {
+        impl ::std::ops::SubAssign for $ty {
+            fn sub_assign(&mut self, rhs: Self) {
+                self.0 -= rhs.0;
+            }
+        }
+    };
+    (@Neg $ty:ident $inner:ty) => {
+        impl ::std::ops::Neg for $ty {
+            type Output = Self;
+            fn neg(self) -> Self {
+                Self(-self.0)
+            }
+        }
+    };
+    (@Mul $ty:ident $inner:ty) => {
+        impl<Rhs> ::std::ops::Mul<Rhs> for $ty
+        where
+            $inner: ::std::ops::Mul<Rhs, Output = $inner>,
+        {
+            type Output = Self;
+            fn mul(self, rhs: Rhs) -> Self {
+                Self(self.0 * rhs)
+            }
+        }
+    };
+    (@Div $ty:ident $inner:ty) => {
+        impl<Rhs> ::std::ops::Div<Rhs> for $ty
+        where
+            $inner: ::std::ops::Div<Rhs, Output = $inner>,
+        {
+            type Output = Self;
+            fn div(self, rhs: Rhs) -> Self {
+                Self(self.0 / rhs)
+            }
+        }
+    };
+    (@DivAssign $ty:ident $inner:ty) => {
+        impl<Rhs> ::std::ops::DivAssign<Rhs> for $ty
+        where
+            $inner: ::std::ops::DivAssign<Rhs>,
+        {
+            fn div_assign(&mut self, rhs: Rhs) {
+                self.0 /= rhs;
+            }
+        }
+    };
+    ($ty:ident($inner:ty): $($op:ident),+) => {
+        $(impl_newtype_ops!(@$op $ty $inner);)+
+    };
+}
+pub(crate) use impl_newtype_ops;
+
+/// Field-wise operator impls for a generic struct over `T`. `Div` divides every field by the
+/// same scalar.
+macro_rules! impl_fieldwise_ops {
+    (@Add $ty:ident { $($f:ident),+ }) => {
+        impl<T: Clone + Debug + Default + PartialEq + Add<Output = T>> Add for $ty<T> {
+            type Output = Self;
+            fn add(self, rhs: Self) -> Self {
+                Self { $($f: self.$f + rhs.$f),+ }
+            }
+        }
+    };
+    (@AddAssign $ty:ident { $($f:ident),+ }) => {
+        impl<T: Clone + Debug + Default + PartialEq + AddAssign> AddAssign for $ty<T> {
+            fn add_assign(&mut self, rhs: Self) {
+                $(self.$f += rhs.$f;)+
+            }
+        }
+    };
+    (@Sub $ty:ident { $($f:ident),+ }) => {
+        impl<T: Clone + Debug + Default + PartialEq + Sub<Output = T>> Sub for $ty<T> {
+            type Output = Self;
+            fn sub(self, rhs: Self) -> Self {
+                Self { $($f: self.$f - rhs.$f),+ }
+            }
+        }
+    };
+    (@SubAssign $ty:ident { $($f:ident),+ }) => {
+        impl<T: Clone + Debug + Default + PartialEq + SubAssign> SubAssign for $ty<T> {
+            fn sub_assign(&mut self, rhs: Self) {
+                $(self.$f -= rhs.$f;)+
+            }
+        }
+    };
+    (@Neg $ty:ident { $($f:ident),+ }) => {
+        impl<T: Clone + Debug + Default + PartialEq + Neg<Output = T>> Neg for $ty<T> {
+            type Output = Self;
+            fn neg(self) -> Self {
+                Self { $($f: -self.$f),+ }
+            }
+        }
+    };
+    (@Div $ty:ident { $($f:ident),+ }) => {
+        impl<T, Rhs> Div<Rhs> for $ty<T>
+        where
+            T: Clone + Debug + Default + PartialEq + Div<Rhs, Output = T>,
+            Rhs: Copy,
+        {
+            type Output = Self;
+            fn div(self, rhs: Rhs) -> Self {
+                Self { $($f: self.$f / rhs),+ }
+            }
+        }
+    };
+    ($ty:ident $fields:tt: $($op:ident),+) => {
+        $(impl_fieldwise_ops!(@$op $ty $fields);)+
+    };
+}
 
 /// Axis in a 2D cartesian space.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -63,24 +201,10 @@ pub trait Along {
 /// let point = Point { x: 10, y: 20 };
 /// println!("{:?}", point); // Outputs: Point { x: 10, y: 20 }
 /// ```
-#[derive(
-    Refineable,
-    Default,
-    Add,
-    AddAssign,
-    Sub,
-    SubAssign,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-    Hash,
-    Neg,
-)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Refineable, Default, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 #[repr(C)]
 pub struct Point<T: Clone + Debug + Default + PartialEq> {
     /// The x coordinate of the point.
@@ -274,6 +398,8 @@ where
     }
 }
 
+impl_fieldwise_ops!(Point { x, y }: Add, AddAssign, Sub, SubAssign, Neg);
+
 impl<T> Point<T>
 where
     T: PartialOrd + Clone + Debug + Default + PartialEq,
@@ -388,10 +514,9 @@ impl<T: Clone + Debug + Default + PartialEq + Display> Display for Point<T> {
 ///
 /// This struct is generic over the type `T`, which can be any type that implements `Clone`, `Default`, and `Debug`.
 /// It is commonly used to specify dimensions for elements in a UI, such as a window or element.
-#[derive(
-    Add, Clone, Copy, Default, Deserialize, Div, Hash, Neg, PartialEq, Refineable, Serialize, Sub,
-)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Default, Deserialize, Hash, PartialEq, Refineable, Serialize)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 #[repr(C)]
 pub struct Size<T: Clone + Debug + Default + PartialEq> {
     /// The width component of the size.
@@ -399,6 +524,8 @@ pub struct Size<T: Clone + Debug + Default + PartialEq> {
     /// The height component of the size.
     pub height: T,
 }
+
+impl_fieldwise_ops!(Size { width, height }: Add, Sub, Neg, Div);
 
 impl<T: Clone + Debug + Default + PartialEq> Size<T> {
     /// Create a new Size, a synonym for [`size`]
@@ -1748,7 +1875,8 @@ impl Bounds<DevicePixels> {
 /// assert_eq!(edges.left, 40.0);
 /// ```
 #[derive(Refineable, Clone, Default, Debug, Eq, PartialEq)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 #[repr(C)]
 pub struct Edges<T: Clone + Debug + Default + PartialEq> {
     /// The size of the top edge.
@@ -2312,7 +2440,8 @@ impl Anchor {
 ///
 /// Each field represents the size of the corner on one side of the box: `top_left`, `top_right`, `bottom_right`, and `bottom_left`.
 #[derive(Refineable, Clone, Default, Debug, Eq, PartialEq)]
-#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", refineable(JsonSchema))]
 #[repr(C)]
 pub struct Corners<T: Clone + Debug + Default + PartialEq> {
     /// The value associated with the top left corner.
@@ -2635,24 +2764,11 @@ impl From<Pixels> for Corners<Pixels> {
 }
 
 /// Represents an angle in Radians
-#[derive(
-    Clone,
-    Copy,
-    Default,
-    Add,
-    AddAssign,
-    Sub,
-    SubAssign,
-    Neg,
-    Div,
-    DivAssign,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    Debug,
-)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize, Debug)]
 #[repr(transparent)]
 pub struct Radians(pub f32);
+
+impl_newtype_ops!(Radians(f32): Add, AddAssign, Sub, SubAssign, Neg, Div, DivAssign);
 
 /// Create a `Radian` from a raw value
 pub fn radians(value: f32) -> Radians {
@@ -2660,24 +2776,11 @@ pub fn radians(value: f32) -> Radians {
 }
 
 /// A type representing a percentage value.
-#[derive(
-    Clone,
-    Copy,
-    Default,
-    Add,
-    AddAssign,
-    Sub,
-    SubAssign,
-    Neg,
-    Div,
-    DivAssign,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    Debug,
-)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize, Debug)]
 #[repr(transparent)]
 pub struct Percentage(pub f32);
+
+impl_newtype_ops!(Percentage(f32): Add, AddAssign, Sub, SubAssign, Neg, Div, DivAssign);
 
 /// Generate a `Radian` from a percentage of a full circle.
 pub fn percentage(value: f32) -> Percentage {
@@ -2716,24 +2819,12 @@ impl From<Percentage> for Radians {
 /// let scaled_length = length.scale(2.0);
 /// assert_eq!(scaled_length, ScaledPixels::from(20.0));
 /// ```
-#[derive(
-    Clone,
-    Copy,
-    Default,
-    Add,
-    AddAssign,
-    Sub,
-    SubAssign,
-    Neg,
-    Div,
-    DivAssign,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(transparent)]
 pub struct Pixels(pub(crate) f32);
+
+impl_newtype_ops!(Pixels(f32): Add, AddAssign, Sub, SubAssign, Neg, Div, DivAssign);
 
 impl Div for Pixels {
     type Output = f32;
@@ -3026,25 +3117,11 @@ impl From<usize> for Pixels {
 /// interfacing with hardware that operates on the pixel level. Unlike logical pixels that may be
 /// affected by the device's scale factor, `DevicePixels` always correspond to real pixels on the
 /// display.
-#[derive(
-    Add,
-    AddAssign,
-    Clone,
-    Copy,
-    Default,
-    Div,
-    Eq,
-    Hash,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Sub,
-    SubAssign,
-    Serialize,
-    Deserialize,
-)]
+#[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct DevicePixels(pub i32);
+
+impl_newtype_ops!(DevicePixels(i32): Add, AddAssign, Sub, SubAssign, Div);
 
 impl DevicePixels {
     /// Converts the `DevicePixels` value to the number of bytes needed to represent it in memory.
@@ -3135,9 +3212,11 @@ impl From<usize> for DevicePixels {
 /// a single logical pixel may correspond to multiple physical pixels. By using `ScaledPixels`,
 /// dimensions and positions can be specified in a way that scales appropriately across different
 /// display resolutions.
-#[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 #[repr(transparent)]
 pub struct ScaledPixels(pub f32);
+
+impl_newtype_ops!(ScaledPixels(f32): Add, AddAssign, Sub, SubAssign, Div, DivAssign);
 
 impl ScaledPixels {
     /// Returns the raw `f32` value of this `ScaledPixels`.
@@ -3299,8 +3378,10 @@ impl MulAssign<f32> for ScaledPixels {
 /// For example, if the root element's font-size is `16px`, then `1rem` equals `16px`. A length of `2rems` would then be `32px`.
 ///
 /// [set_rem_size]: crate::Window::set_rem_size
-#[derive(Clone, Copy, Default, Add, Sub, Mul, Div, Neg, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub struct Rems(pub f32);
+
+impl_newtype_ops!(Rems(f32): Add, Sub, Mul, Div, Neg);
 
 impl Rems {
     /// A length of zero.
@@ -3359,12 +3440,22 @@ impl TryFrom<&'_ str> for Rems {
 /// affected by the current font size, or a number of rems, which is relative to the font size of
 /// the root element. It is used for specifying dimensions that are either independent of or
 /// related to the typographic scale.
-#[derive(Clone, Copy, Neg, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum AbsoluteLength {
     /// A length in pixels.
     Pixels(Pixels),
     /// A length in rems.
     Rems(Rems),
+}
+
+impl Neg for AbsoluteLength {
+    type Output = Self;
+    fn neg(self) -> Self {
+        match self {
+            Self::Pixels(pixels) => Self::Pixels(-pixels),
+            Self::Rems(rems) => Self::Rems(-rems),
+        }
+    }
 }
 
 impl AbsoluteLength {
@@ -3474,6 +3565,7 @@ impl TryFrom<&'_ str> for AbsoluteLength {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for AbsoluteLength {
     fn schema_name() -> Cow<'static, str> {
         "AbsoluteLength".into()
@@ -3521,7 +3613,7 @@ impl Serialize for AbsoluteLength {
 /// This enum represents lengths that have a specific value, as opposed to lengths that are automatically
 /// determined by the context. It includes absolute lengths in pixels or rems, and relative lengths as a
 /// fraction of the parent's size.
-#[derive(Clone, Copy, Neg, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum DefiniteLength {
     /// An absolute length specified in pixels or rems.
     Absolute(AbsoluteLength),
@@ -3539,6 +3631,20 @@ pub enum DefiniteLength {
         /// The absolute half.
         pixels: Pixels,
     },
+}
+
+impl Neg for DefiniteLength {
+    type Output = Self;
+    fn neg(self) -> Self {
+        match self {
+            Self::Absolute(length) => Self::Absolute(-length),
+            Self::Fraction(fraction) => Self::Fraction(-fraction),
+            Self::Calc { fraction, pixels } => Self::Calc {
+                fraction: -fraction,
+                pixels: -pixels,
+            },
+        }
+    }
 }
 
 impl DefiniteLength {
@@ -3623,6 +3729,7 @@ impl TryFrom<&'_ str> for DefiniteLength {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for DefiniteLength {
     fn schema_name() -> Cow<'static, str> {
         "DefiniteLength".into()
@@ -3731,6 +3838,7 @@ impl TryFrom<&'_ str> for Length {
     }
 }
 
+#[cfg(feature = "schemars")]
 impl JsonSchema for Length {
     fn schema_name() -> Cow<'static, str> {
         "Length".into()
@@ -3872,7 +3980,8 @@ impl From<()> for Length {
 }
 
 /// A location in a grid layout.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct GridLocation {
     /// The rows this item uses within the grid.
     pub row: Range<GridPlacement>,
@@ -3881,7 +3990,8 @@ pub struct GridLocation {
 }
 
 /// The placement of an item within a grid layout's column or row.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum GridPlacement {
     /// The grid line index to place this item.
     Line(i16),

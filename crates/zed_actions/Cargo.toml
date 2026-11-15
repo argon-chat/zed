@@ -13,7 +13,7 @@ test = false
 doctest = false
 
 [dependencies]
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 schemars.workspace = true
 serde.workspace = true
 util.workspace = true

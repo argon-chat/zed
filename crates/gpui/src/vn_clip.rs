@@ -19,12 +19,14 @@
 //!   the geometry is exact under rotation and skew too.
 
 use crate::{Bounds, ScaledPixels, TransformationMatrix, point, px, size};
+#[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// vue-native fork: the `<fill-rule>` of a `polygon()` or `path()`.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum VnFillRule {
     /// `nonzero`, the default: inside where the winding number is not zero.
     #[default]
@@ -37,7 +39,8 @@ pub enum VnFillRule {
 /// reference box's top left corner. A parser resolves the relative commands,
 /// the `H`/`V` lines, the `S`/`T` reflections and the arcs
 /// ([`VnPathVerb::push_arc`]) into these five.
-#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum VnPathVerb {
     /// `M`: starts a subpath.
     MoveTo([f32; 2]),
@@ -258,7 +261,8 @@ impl VnClipGeometry {
 }
 
 /// An SVG feColorMatrix over unpremultiplied RGBA components.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct VnColorMatrix {
     /// Stable identity of the filtered element within this window's scene.
     /// Zero keeps independently composited layers for callers without an ID.

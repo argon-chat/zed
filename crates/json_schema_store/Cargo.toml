@@ -29,7 +29,7 @@ dap.workspace = true
 parking_lot.workspace = true
 extension.workspace = true
 feature_flags.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 language.workspace = true
 paths.workspace = true
 project.workspace = true

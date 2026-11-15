@@ -107,6 +107,7 @@ pub mod private {
     pub use anyhow;
     pub use inventory;
     pub use rand;
+    #[cfg(feature = "schemars")]
     pub use schemars;
     pub use serde;
     pub use serde_json;

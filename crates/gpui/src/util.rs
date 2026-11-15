@@ -7,6 +7,32 @@ use std::{
     time::Duration,
 };
 
+/// `Deref` to one field of a struct, and `DerefMut` too when the field is marked `mut`.
+macro_rules! impl_deref {
+    ([$($generics:tt)*] $ty:ty => mut $field:tt: $target:ty) => {
+        impl<$($generics)*> ::std::ops::Deref for $ty {
+            type Target = $target;
+            fn deref(&self) -> &$target {
+                &self.$field
+            }
+        }
+        impl<$($generics)*> ::std::ops::DerefMut for $ty {
+            fn deref_mut(&mut self) -> &mut $target {
+                &mut self.$field
+            }
+        }
+    };
+    ([$($generics:tt)*] $ty:ty => $field:tt: $target:ty) => {
+        impl<$($generics)*> ::std::ops::Deref for $ty {
+            type Target = $target;
+            fn deref(&self) -> &$target {
+                &self.$field
+            }
+        }
+    };
+}
+pub(crate) use impl_deref;
+
 /// A helper trait for building complex objects with imperative conditionals in a fluent style.
 pub trait FluentBuilder {
     /// Imperatively modify self with the given closure.
@@ -81,12 +107,13 @@ impl<T: Future> FutureExt for T {
     }
 }
 
-#[pin_project::pin_project]
-pub struct WithTimeout<T> {
-    #[pin]
-    future: T,
-    #[pin]
-    timer: Task<()>,
+pin_project_lite::pin_project! {
+    pub struct WithTimeout<T> {
+        #[pin]
+        future: T,
+        #[pin]
+        timer: Task<()>,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

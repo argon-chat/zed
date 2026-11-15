@@ -58,6 +58,7 @@ use image::{DynamicImage, Frame, Rgba};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
+#[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use strum::EnumIter;
 use uuid::Uuid;
 
 pub use app_menu::*;
@@ -3279,7 +3279,8 @@ impl From<&str> for PromptButton {
 }
 
 /// The style of the cursor (pointer)
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum CursorStyle {
     /// The default cursor
     #[default]
@@ -3542,7 +3543,7 @@ impl From<Image> for ClipboardItem {
 }
 
 /// One of the editor's supported image formats (e.g. PNG, JPEG) - used when dealing with images in the clipboard
-#[derive(Clone, Copy, Debug, Eq, PartialEq, EnumIter, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ImageFormat {
     // Sorted from most to least likely to be pasted into an editor,
     // which matters when we iterate through them trying to see if
@@ -3568,6 +3569,24 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
+    /// Every format, in the order clipboard readers should try them.
+    pub const ALL: [Self; 9] = [
+        Self::Png,
+        Self::Jpeg,
+        Self::Webp,
+        Self::Gif,
+        Self::Svg,
+        Self::Bmp,
+        Self::Tiff,
+        Self::Ico,
+        Self::Pnm,
+    ];
+
+    /// Iterates over [`Self::ALL`].
+    pub fn iter() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
+
     /// Returns the mime type for the ImageFormat
     pub const fn mime_type(self) -> &'static str {
         match self {
@@ -3600,7 +3619,6 @@ impl ImageFormat {
 
     /// Returns the ImageFormat for the given mime type, including known aliases.
     pub fn from_mime_type(mime_type: &str) -> Option<Self> {
-        use strum::IntoEnumIterator;
         Self::iter()
             .find(|format| format.mime_type() == mime_type)
             .or_else(|| Self::from_mime_type_alias(mime_type))

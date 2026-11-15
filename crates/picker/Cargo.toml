@@ -19,7 +19,7 @@ test-support = []
 anyhow.workspace = true
 db.workspace = true
 language.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 menu.workspace = true
 project.workspace = true
 schemars.workspace = true

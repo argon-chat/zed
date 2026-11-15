@@ -60,7 +60,7 @@ futures.workspace = true
 fuzzy.workspace = true
 fuzzy_nucleo.workspace = true
 git.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 gpui_tokio.workspace = true
 html_to_markdown.workspace = true
 http_client.workspace = true

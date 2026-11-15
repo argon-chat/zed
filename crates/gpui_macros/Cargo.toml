@@ -11,6 +11,7 @@ workspace = true
 
 [features]
 inspector = []
+schemars = []
 
 [lib]
 path = "src/gpui_macros.rs"

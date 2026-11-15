@@ -1,6 +1,7 @@
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
+#[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -1403,7 +1404,8 @@ pub const EFFECT_FLAG_NEEDS_BACKDROP: u32 = 1;
 /// output and its whole subtree**, and changes no layout at all. `translate`
 /// here is therefore *not* the same thing as a margin offset — siblings do not
 /// move out of the way.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct TransformSpec {
     /// `translate()`, per axis, in the unit it was authored in — see
     /// [`TransformLength`]. Kept unresolved because a percentage resolves
@@ -1437,7 +1439,8 @@ pub struct TransformSpec {
 }
 
 /// One axis of a [`TransformSpec`]'s `translate()`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum TransformLength {
     /// An absolute length in LOGICAL (CSS) pixels.
     Pixels(f32),
@@ -1611,7 +1614,8 @@ impl TransformSpec {
 /// else is schema metadata the *painter* needs and gpui must not have to look
 /// up: which params are lengths (so they scale with the device factor), which
 /// one drives the backdrop blur, and which one dilates the quad.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct EffectSpec {
     /// One of [`effect_id`].
     pub id: u32,
@@ -1836,7 +1840,8 @@ impl From<Shadow> for Primitive {
 }
 
 /// The style of a border.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[repr(C)]
 pub enum BorderStyle {
     /// A solid border.

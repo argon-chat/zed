@@ -6,7 +6,6 @@ use std::{
 
 use calloop::{LoopHandle, PostAction};
 use filedescriptor::Pipe;
-use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 

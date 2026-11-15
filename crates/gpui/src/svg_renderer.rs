@@ -33,10 +33,7 @@ const EMOJI_FONT_FAMILIES: &[&str] = &[
 const EMOJI_FONT_FAMILIES: &[&str] = &[];
 
 fn is_emoji_presentation(c: char) -> bool {
-    static EMOJI_PRESENTATION_REGEX: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new("\\p{Emoji_Presentation}").unwrap());
-    let mut buf = [0u8; 4];
-    EMOJI_PRESENTATION_REGEX.is_match(c.encode_utf8(&mut buf))
+    icu_properties::CodePointSetData::new::<icu_properties::props::EmojiPresentation>().contains(c)
 }
 
 fn font_has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, ch: char) -> bool {

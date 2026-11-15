@@ -136,6 +136,7 @@ pub trait Action: Any + Send {
         Self: Sized;
 
     /// Optional JSON schema for the action's input data.
+    #[cfg(feature = "schemars")]
     fn action_json_schema(_: &mut schemars::SchemaGenerator) -> Option<schemars::Schema>
     where
         Self: Sized,
@@ -258,6 +259,7 @@ impl Default for ActionRegistry {
 
 struct ActionData {
     pub build: ActionBuilder,
+    #[cfg(feature = "schemars")]
     pub json_schema: fn(&mut schemars::SchemaGenerator) -> Option<schemars::Schema>,
 }
 
@@ -273,6 +275,7 @@ pub struct MacroActionData {
     pub name: &'static str,
     pub type_id: TypeId,
     pub build: ActionBuilder,
+    #[cfg(feature = "schemars")]
     pub json_schema: fn(&mut schemars::SchemaGenerator) -> Option<schemars::Schema>,
     pub deprecated_aliases: &'static [&'static str],
     pub deprecation_message: Option<&'static str>,
@@ -302,6 +305,7 @@ impl ActionRegistry {
             name,
             ActionData {
                 build: action.build,
+                #[cfg(feature = "schemars")]
                 json_schema: action.json_schema,
             },
         );
@@ -316,6 +320,7 @@ impl ActionRegistry {
                 alias,
                 ActionData {
                     build: action.build,
+                    #[cfg(feature = "schemars")]
                     json_schema: action.json_schema,
                 },
             );
@@ -370,6 +375,7 @@ impl ActionRegistry {
         self.all_names.as_slice()
     }
 
+    #[cfg(feature = "schemars")]
     pub fn action_schemas(
         &self,
         generator: &mut schemars::SchemaGenerator,
@@ -387,6 +393,7 @@ impl ActionRegistry {
             .collect::<Vec<_>>()
     }
 
+    #[cfg(feature = "schemars")]
     pub fn action_schema_by_name(
         &self,
         name: &str,
@@ -422,6 +429,7 @@ pub fn generate_list_of_all_registered_actions() -> impl Iterator<Item = MacroAc
 
 mod no_action {
     use crate as gpui;
+    #[cfg(feature = "schemars")]
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -440,7 +448,8 @@ mod no_action {
     /// In keymap JSON this is written as:
     ///
     /// `["zed::Unbind", "editor::NewLine"]`
-    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, gpui::Action)]
+    #[derive(Clone, Debug, PartialEq, Deserialize, gpui::Action)]
+    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
     #[action(namespace = zed)]
     pub struct Unbind(pub gpui::SharedString);
 

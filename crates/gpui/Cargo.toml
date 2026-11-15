@@ -34,6 +34,8 @@ bench-support = ["profiler", "dep:criterion", "dep:bench_metrics"]
 # Preserve the published feature name while consumers migrate to `bench-support`.
 bench = ["bench-support"]
 inspector = ["gpui_macros/inspector"]
+# JSON schemas for actions and the style/geometry types, for Zed's settings and keymap.
+schemars = ["dep:schemars", "gpui_macros/schemars", "gpui_shared_string/schemars"]
 # Tracks every entity handle so tests can assert nothing leaked. Also enabled
 # by setting `GPUI_LEAK_DETECTION` when building; see `build.rs`.
 leak-detection = []
@@ -69,13 +71,13 @@ bitflags.workspace = true
 collections.workspace = true
 bench_metrics = { workspace = true, optional = true }
 criterion = { workspace = true, optional = true }
-derive_more = { workspace = true, features = ["add", "add_assign", "mul", "mul_assign", "not"] }
 etagere.workspace = true
 futures.workspace = true
 futures-concurrency = { workspace = true, optional = true }
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 http_client.workspace = true
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_segmenter.workspace = true
 # vue-native: not `image.workspace = true`. The workspace entry turns on every
 # decoder Zed's image viewer can open (exr, hdr, dds, farbfeld, qoi, tga, plus
@@ -107,20 +109,18 @@ chrono = { workspace = true, default-features = true }
 profiling.workspace = true
 rand = { workspace = true, features = ["small_rng", "thread_rng"] }
 raw-window-handle.workspace = true
-regex = { workspace = true, default-features = true }
 refineable.workspace = true
 scheduler.workspace = true
 resvg.workspace = true
 usvg.workspace = true
 ttf-parser = "0.25"
-schemars = { workspace = true, features = ["derive"] }
+schemars = { workspace = true, features = ["derive"], optional = true }
 seahash = "4.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 stacksafe = { workspace = true, optional = true }
-strum.workspace = true
 sum_tree.workspace = true
 taffy = { workspace = true, features = [
     "std",
@@ -139,7 +139,7 @@ gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
 waker-fn = "1.2.0"
 lyon = "1.0"
-pin-project = "1.1.10"
+pin-project-lite = "0.2"
 spin.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
@@ -225,6 +225,10 @@ ignored = [
     "objc2-metal",
 ]
 ignored-paths = ["src/_ownership_and_data_flow.rs", "benches/focus_cleanup.rs"]
+
+[[test]]
+name = "action_macros"
+required-features = ["schemars"]
 
 [[example]]
 name = "hello_world"

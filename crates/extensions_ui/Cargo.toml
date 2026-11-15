@@ -26,7 +26,7 @@ extension_suggest.workspace = true
 fs.workspace = true
 fuzzy.workspace = true
 git.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 language.workspace = true
 log.workspace = true
 markdown.workspace = true

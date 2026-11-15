@@ -21,7 +21,7 @@ collections.workspace = true
 ec4rs.workspace = true
 fs.workspace = true
 futures.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["schemars"] }
 inventory.workspace = true
 log = { workspace = true, features = ["kv_unstable_std"] }
 migrator.workspace = true
