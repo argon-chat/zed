@@ -66,9 +66,19 @@ struct PipelineKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PipelineKind {
     Primitive(ShaderModule),
-    DynamicEffect(usize),
+    /// vue-native: an app effect, by [`AppFragment::id`].
+    AppEffect(u64),
     /// vue-native: `gpui::effect_id::PUNCH` — erases its quad (see [`PUNCH_FRAGMENT`]).
     Punch,
+}
+
+/// vue-native: an app effect's fragment stage, compiled when the app's effects
+/// are installed or reloaded. A reload that changes the effect makes a new one,
+/// so pipelines cached under the old `id` are never served for the new source.
+struct AppFragment {
+    id: u64,
+    bytecode: Vec<u8>,
+    needs_backdrop: bool,
 }
 
 /// vue-native: the fragment stage of the punch. It shares the effects' vertex
@@ -158,7 +168,9 @@ pub(super) struct Pipelines {
     cache: Vec<CachedPipeline>,
     /// Pipelines a background thread created ahead of their first use.
     warmed: Arc<Mutex<Vec<CachedPipeline>>>,
-    dynamic_effects: Vec<shader_resources::DynamicEffect>,
+    /// Built at the first frame that draws an app effect.
+    app_effects: gpui::AppEffectPipelines<AppFragment>,
+    app_fragments_made: u64,
     timings: bool,
 }
 
@@ -190,7 +202,8 @@ impl Pipelines {
             device: device.clone(),
             cache: Vec::new(),
             warmed: Arc::default(),
-            dynamic_effects: shader_resources::dynamic_effects(),
+            app_effects: Default::default(),
+            app_fragments_made: 0,
             timings: std::env::var_os("SK_DX12_TIMINGS").is_some_and(|value| value == "1"),
         })
     }
@@ -240,41 +253,100 @@ impl Pipelines {
         })
     }
 
+    /// The pipeline for `EffectQuad::effect_id` `index` and whether it reads the
+    /// backdrop; None for an app effect that never built or an id past the
+    /// app's effects, whose quads draw nothing.
     pub fn effect(
         &mut self,
         index: u32,
         format: DXGI_FORMAT,
         sample_count: u32,
-    ) -> Result<(ID3D12PipelineState, bool)> {
-        let backdrop = self.needs_backdrop(index)?;
-        let kind = if index == gpui::effect_id::PUNCH {
-            PipelineKind::Punch
+    ) -> Result<Option<(ID3D12PipelineState, bool)>> {
+        let (kind, backdrop) = if index == gpui::effect_id::PUNCH {
+            (PipelineKind::Punch, false)
         } else if let Some(effect) = EffectShader::ALL.get(index as usize) {
-            PipelineKind::Primitive(ShaderModule::Effect(*effect))
+            (
+                PipelineKind::Primitive(ShaderModule::Effect(*effect)),
+                effect.needs_backdrop(),
+            )
         } else {
-            PipelineKind::DynamicEffect(index as usize - EffectShader::ALL.len())
+            self.sync_app_effects(format);
+            let Some(fragment) = self
+                .app_effects
+                .get(index as usize - EffectShader::ALL.len())
+            else {
+                return Ok(None);
+            };
+            (
+                PipelineKind::AppEffect(fragment.id),
+                fragment.needs_backdrop,
+            )
         };
-        Ok((
-            self.get(PipelineKey {
-                kind,
-                format,
-                samples: sample_count,
-            })?,
-            backdrop,
-        ))
+        let state = self.get(PipelineKey {
+            kind,
+            format,
+            samples: sample_count,
+        })?;
+        Ok(Some((state, backdrop)))
     }
 
-    pub fn needs_backdrop(&self, index: u32) -> Result<bool> {
-        if index == gpui::effect_id::PUNCH {
-            return Ok(false);
+    /// Catches up with `gpui::reload_app_effects`. Each changed effect is
+    /// compiled and its pipeline for `format` created here, so a shader that
+    /// fails either step keeps the effect's previous pipeline.
+    fn sync_app_effects(&mut self, format: DXGI_FORMAT) {
+        let Self {
+            device,
+            root_signature,
+            cache,
+            app_effects,
+            app_fragments_made,
+            ..
+        } = self;
+        let synced = app_effects.sync(|effect| {
+            let (file, source) = effect.hlsl.get("HLSL")?;
+            let fragment = shader_resources::compile_hlsl_source(
+                source,
+                file,
+                "effect_fragment\0",
+                "ps_5_1\0",
+            )
+            .with_context(|| format!("compiling {file} failed"))?;
+            let bytecode = bytes(&fragment).to_vec();
+            let state = create_pipeline(
+                device,
+                root_signature,
+                embedded::effect_vertex(),
+                &bytecode,
+                format,
+                1,
+                app_effect_blend(effect.needs_backdrop),
+            )?;
+            *app_fragments_made += 1;
+            let id = *app_fragments_made;
+            cache.push(CachedPipeline {
+                key: PipelineKey {
+                    kind: PipelineKind::AppEffect(id),
+                    format,
+                    samples: 1,
+                },
+                state,
+            });
+            Ok(AppFragment {
+                id,
+                bytecode,
+                needs_backdrop: effect.needs_backdrop,
+            })
+        });
+        if synced {
+            let live: Vec<u64> = app_effects
+                .pipelines()
+                .map(|fragment| fragment.id)
+                .collect();
+            cache.retain(|cached| match cached.key.kind {
+                PipelineKind::AppEffect(id) => live.contains(&id),
+                _ => true,
+            });
         }
-        if let Some(effect) = EffectShader::ALL.get(index as usize) {
-            return Ok(effect.needs_backdrop());
-        }
-        self.dynamic_effects
-            .get(index as usize - EffectShader::ALL.len())
-            .map(|effect| effect.needs_backdrop)
-            .with_context(|| format!("Unknown D3D12 effect id {index}"))
     }
 
     fn get(&mut self, key: PipelineKey) -> Result<ID3D12PipelineState> {
@@ -313,30 +385,16 @@ impl Pipelines {
                 Cow::Owned(compile_punch()?),
                 Blend::DestinationOut,
             ),
-            PipelineKind::DynamicEffect(index) => {
-                let effect = self
-                    .dynamic_effects
-                    .get(index)
-                    .context("D3D12 dynamic effect index is out of bounds")?;
-                let vertex = embedded::effect_vertex();
-                let source = effect
-                    .hlsl
-                    .with_context(|| format!("the app's effects have no {}", effect.file))?;
-                let fragment = shader_resources::compile_hlsl_source(
-                    source,
-                    &effect.file,
-                    "effect_fragment\0",
-                    "ps_5_1\0",
-                )
-                .with_context(|| format!("Compiling D3D12 effect {}", effect.name))?;
+            PipelineKind::AppEffect(id) => {
+                let fragment = self
+                    .app_effects
+                    .pipelines()
+                    .find(|fragment| fragment.id == id)
+                    .context("D3D12 app effect was replaced")?;
                 (
-                    Cow::Borrowed(vertex),
-                    Cow::Owned(bytes(&fragment).to_vec()),
-                    if effect.needs_backdrop {
-                        Blend::Replace
-                    } else {
-                        Blend::Premultiplied
-                    },
+                    Cow::Borrowed(embedded::effect_vertex()),
+                    Cow::Borrowed(fragment.bytecode.as_slice()),
+                    app_effect_blend(fragment.needs_backdrop),
                 )
             }
         };
@@ -478,6 +536,14 @@ enum Blend {
     Premultiplied,
     Replace,
     Subpixel,
+}
+
+fn app_effect_blend(needs_backdrop: bool) -> Blend {
+    if needs_backdrop {
+        Blend::Replace
+    } else {
+        Blend::Premultiplied
+    }
 }
 
 fn module_blend(module: ShaderModule) -> Blend {

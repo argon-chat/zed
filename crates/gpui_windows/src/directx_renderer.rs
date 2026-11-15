@@ -125,6 +125,8 @@ struct DirectXRenderPipelines {
     /// its shading", never to a dead window, so this is fallible per entry and
     /// the whole renderer still comes up.
     effect_pipelines: Vec<Option<PipelineState<EffectQuad>>>,
+    /// The app's own effects, `effect_id::COUNT` on.
+    app_effect_pipelines: AppEffectPipelines<PipelineState<EffectQuad>>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -449,6 +451,9 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        if let Some(devices) = &self.devices {
+            self.pipelines.sync_app_effects(&devices.device);
+        }
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -799,19 +804,17 @@ impl DirectXRenderer {
             // pipeline owns its own buffer, so upload to the ones this frame
             // actually uses and no further: a window with one frost panel must
             // not pay to upload the array three times.
-            // One flag per pipeline, not a `u64` of them: the table is as long
-            // as the app's effect manifest, and `1 << id` past 63 overflowed.
-            let mut used = vec![false; self.pipelines.effect_pipelines.len()];
-            for quad in &scene.effect_quads {
-                if let Some(slot) = used.get_mut(quad.effect_id as usize) {
-                    *slot = true;
-                }
-            }
-            for (id, pipeline) in self.pipelines.effect_pipelines.iter_mut().enumerate() {
-                let Some(pipeline) = pipeline else { continue };
-                if !used.get(id).copied().unwrap_or(false) {
+            let mut used: Vec<u32> = scene
+                .effect_quads
+                .iter()
+                .map(|quad| quad.effect_id)
+                .collect();
+            used.sort_unstable();
+            used.dedup();
+            for id in used {
+                let Some(pipeline) = self.pipelines.effect_mut(id) else {
                     continue;
-                }
+                };
                 pipeline.update_buffer(
                     &devices.device,
                     &devices.device_context,
@@ -981,24 +984,15 @@ impl DirectXRenderer {
         if effect_quads.is_empty() {
             return Ok(());
         }
-        if self
-            .pipelines
-            .effect_pipelines
-            .get(effect_id as usize)
-            .and_then(|pipeline| pipeline.as_ref())
-            .is_none()
-        {
-            // `build_effect_pipelines` already explained why, once. Silently
-            // skipping the draw here is the *documented* degradation: every
-            // other style on the element still renders.
+        let Some(pipeline) = self.pipelines.effect(effect_id) else {
+            // Building the pipeline already explained why, once. Skipping the
+            // draw is the documented degradation: every other style on the
+            // element still renders.
             return Ok(());
-        }
+        };
 
         if !effect_quads[0].needs_backdrop() {
             let devices = self.devices.as_ref().context("devices missing")?;
-            let pipeline = self.pipelines.effect_pipelines[effect_id as usize]
-                .as_ref()
-                .expect("checked above");
             return pipeline.draw_range_with_texture_resources(
                 &devices.device_context,
                 None,
@@ -1084,8 +1078,8 @@ impl DirectXRenderer {
                 .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
         }
 
-        self.pipelines.effect_pipelines[effect_id as usize]
-            .as_ref()
+        self.pipelines
+            .effect(effect_id)
             .context("effect pipeline missing")?
             .draw_range_with_texture_resources(
                 &devices.device_context,
@@ -1644,7 +1638,7 @@ impl DirectXRenderPipelines {
             8,
             create_blend_state_for_replace(device)?,
         )?;
-        let effect_pipelines = build_effect_pipelines(device);
+        let effect_pipelines = build_builtin_effect_pipelines(device);
         let path_rasterization_pipeline = PipelineState::new(
             device,
             "path_rasterization_pipeline",
@@ -1698,13 +1692,14 @@ impl DirectXRenderPipelines {
         let vn_clip_segments = VnStructuredBuffer::new(device, 64, std::mem::size_of::<[f32; 4]>())?;
         let vn_text_backgrounds = VnStructuredBuffer::new(device, 16, std::mem::size_of::<VnTextBackground>())?;
 
-        Ok(Self {
+        let mut pipelines = Self {
             shadow_pipeline,
             quad_pipeline,
             blur_downsample_pipeline,
             blur_upsample_pipeline,
             blur_rect_pipeline,
             effect_pipelines,
+            app_effect_pipelines: AppEffectPipelines::default(),
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1714,22 +1709,88 @@ impl DirectXRenderPipelines {
             vn_layer_pipeline,
             vn_clip_segments,
             vn_text_backgrounds,
-        })
+        };
+        pipelines.sync_app_effects(device);
+        Ok(pipelines)
+    }
+
+    /// Rebuilds the app's effect pipelines after `gpui::reload_app_effects`.
+    fn sync_app_effects(&mut self, device: &ID3D11Device) {
+        // Empty only below feature level 11, where no effect can run.
+        if self.effect_pipelines.is_empty() {
+            return;
+        }
+        self.app_effect_pipelines
+            .sync(|effect| app_effect_pipeline(device, effect));
+    }
+
+    /// The pipeline `EffectQuad::effect_id` names: a built-in, then the app's.
+    fn effect(&self, effect_id: u32) -> Option<&PipelineState<EffectQuad>> {
+        match effect_id.checked_sub(effect_id::COUNT) {
+            None => self.effect_pipelines.get(effect_id as usize)?.as_ref(),
+            Some(index) => self.app_effect_pipelines.get(index as usize),
+        }
+    }
+
+    fn effect_mut(&mut self, effect_id: u32) -> Option<&mut PipelineState<EffectQuad>> {
+        match effect_id.checked_sub(effect_id::COUNT) {
+            None => self.effect_pipelines.get_mut(effect_id as usize)?.as_mut(),
+            Some(index) => self.app_effect_pipelines.get_mut(index as usize),
+        }
     }
 }
 
-/// Builds the `--shading` pipeline table: the built-in effects first, in
-/// `gpui::effect_id` order, then whatever the running app contributed through
-/// `$SK_EFFECTS_DIR`. The index into this table IS the `EffectQuad::effect_id`
-/// the CSS layer wrote, and `crates/sk-effects` numbers app effects from the
-/// same manifest in the same order, which is what keeps the two in step
-/// without either one knowing about the other.
+fn effect_blend_state(device: &ID3D11Device, needs_backdrop: bool) -> Result<ID3D11BlendState> {
+    if needs_backdrop {
+        // A backdrop effect rewrites every pixel of its quad from its own
+        // snapshot — the same reason blur_rect disables blending.
+        create_blend_state_for_replace(device)
+    } else {
+        // `sk_finish` outputs premultiplied colour: premultiplied over
+        // premultiplied, as a path sprite.
+        create_blend_state_for_path_sprite(device)
+    }
+}
+
+/// An app's effect: its fragment stage is compiled from HLSL here, in debug and
+/// release alike, since an app is not part of the Rust build. The vertex stage
+/// is the one every effect shares.
+fn app_effect_pipeline(
+    device: &ID3D11Device,
+    effect: &gpui::AppEffect,
+) -> Result<PipelineState<EffectQuad>> {
+    let (file, source) = effect.hlsl.get("HLSL")?;
+    let blend = effect_blend_state(device, effect.needs_backdrop)?;
+    let vertex = RawShaderBytes::new(
+        ShaderModule::Effect(EffectShader::ALL[0]),
+        ShaderTarget::Vertex,
+    )?;
+    let fragment_blob =
+        shader_resources::compile_hlsl_source(source, file, "effect_fragment\0", "ps_5_0\0")
+            .with_context(|| format!("compiling {file} failed"))?;
+    // SAFETY: the blob owns this buffer and outlives the borrow.
+    let fragment = unsafe {
+        slice::from_raw_parts(
+            fragment_blob.GetBufferPointer() as *const u8,
+            fragment_blob.GetBufferSize(),
+        )
+    };
+    PipelineState::from_shaders(
+        device,
+        "app_effect_pipeline",
+        vertex.as_bytes(),
+        fragment,
+        8,
+        blend,
+    )
+}
+
+/// The built-in `--shading` pipelines in `gpui::effect_id` order; the index IS
+/// the `EffectQuad::effect_id` the CSS layer wrote.
 ///
-/// Deliberately infallible as a whole: an effect whose HLSL is missing or does
-/// not compile leaves a `None` in the table and the app comes up without that
-/// effect, with a one-shot advisory. The alternative — propagating the error —
-/// would turn a typo in a shader into a window that never opens.
-fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<EffectQuad>>> {
+/// Deliberately infallible as a whole: an effect that does not build leaves a
+/// `None` and a one-shot advisory, rather than a window that never opens.
+fn build_builtin_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<EffectQuad>>> {
     // Below feature level 11 the effect fragment shaders (ps_5_0) cannot be
     // created at all, so do not even try — and say so exactly once. Everything
     // else in gpui stays at 4_1 and renders normally.
@@ -1741,22 +1802,10 @@ fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<Eff
         return Vec::new();
     }
 
-    let blend_for = |needs_backdrop: bool| {
-        if needs_backdrop {
-            // A backdrop effect rewrites every pixel of its quad from its own
-            // snapshot — the same reason blur_rect disables blending.
-            create_blend_state_for_replace(device)
-        } else {
-            // `sk_finish` outputs premultiplied colour: premultiplied over
-            // premultiplied, as a path sprite.
-            create_blend_state_for_path_sprite(device)
-        }
-    };
-
-    let mut pipelines: Vec<Option<PipelineState<EffectQuad>>> = EffectShader::ALL
+    EffectShader::ALL
         .iter()
         .map(|effect| {
-            let pipeline = blend_for(effect.needs_backdrop()).and_then(|blend| {
+            let pipeline = effect_blend_state(device, effect.needs_backdrop()).and_then(|blend| {
                 PipelineState::new(
                     device,
                     effect.pipeline_label(),
@@ -1777,57 +1826,7 @@ fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<Eff
                 }
             }
         })
-        .collect();
-
-    // App-supplied effects. Their fragment stage is compiled from HLSL HERE, at
-    // startup, in BOTH debug and release — an app is not part of the Rust
-    // build, so there is no build.rs step that could have pre-compiled it. The
-    // vertex stage is the same engine-owned one every effect shares.
-    for effect in shader_resources::dynamic_effects() {
-        let pipeline = blend_for(effect.needs_backdrop).and_then(|blend| {
-            let vertex = RawShaderBytes::new(
-                ShaderModule::Effect(EffectShader::ALL[0]),
-                ShaderTarget::Vertex,
-            )?;
-            let source = effect
-                .hlsl
-                .with_context(|| format!("the app's effects have no {}", effect.file))?;
-            let fragment_blob = shader_resources::compile_hlsl_source(
-                source,
-                &effect.file,
-                "effect_fragment\0",
-                "ps_5_0\0",
-            )?;
-            let fragment = unsafe {
-                slice::from_raw_parts(
-                    fragment_blob.GetBufferPointer() as *const u8,
-                    fragment_blob.GetBufferSize(),
-                )
-            };
-            PipelineState::from_shaders(
-                device,
-                effect.label,
-                vertex.as_bytes(),
-                fragment,
-                8,
-                blend,
-            )
-        });
-        match pipeline {
-            Ok(pipeline) => pipelines.push(Some(pipeline)),
-            Err(error) => {
-                effects_advisory(&format!(
-                    "`--shading: {}(…)` is unavailable — compiling {} failed: {error:#}",
-                    effect.name, effect.file
-                ));
-                // Still push a hole: the index has to keep matching the
-                // manifest, or every effect after this one would shift.
-                pipelines.push(None);
-            }
-        }
-    }
-
-    pipelines
+        .collect()
 }
 
 /// One-shot advisory channel for the effect system.
@@ -2899,7 +2898,7 @@ pub(crate) mod shader_resources {
         /// tied together by `crates/sk-effects/generated/effects.json`, whose
         /// `backdrop` field comes from slangc's reflection of the `[VnBackdrop]`
         /// / `[VnBackdropRadius]` attributes on the effect struct. An APP effect
-        /// reads that field at runtime instead — see `dynamic_effects`.
+        /// reads that field at runtime instead — see `gpui::AppEffect`.
         pub(crate) fn needs_backdrop(self) -> bool {
             matches!(self, EffectShader::Frost)
         }
@@ -2927,101 +2926,6 @@ pub(crate) mod shader_resources {
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../crates/sk-effects/generated")
-    }
-
-    // -----------------------------------------------------------------------
-    //  App-supplied effects
-    // -----------------------------------------------------------------------
-    //
-    // An app's `--shading` effects are not part of the Rust build, so nothing
-    // could have pre-compiled them: `sk build` puts their HLSL and an
-    // `effects.json` schema into the app's payload, the host hands them to
-    // `gpui::set_app_effects` ($SK_EFFECTS_DIR overrides), and the fragment
-    // stage is compiled here at renderer construction — in release as well as
-    // debug.
-    //
-    // `crates/sk-effects` reads the SAME manifest for the CSS schema and
-    // numbers the effects the same way (after the built-ins, in manifest
-    // order), which is what keeps `EffectQuad::effect_id` and this pipeline
-    // table in agreement without either side importing the other.
-
-    /// One app-supplied effect, as far as the renderer is concerned. Everything
-    /// else about it — parameter names, defaults, ranges — belongs to the CSS
-    /// layer and never reaches gpui.
-    pub(crate) struct DynamicEffect {
-        pub(crate) name: String,
-        /// `"effect_<name>_pipeline"`, leaked because `PipelineState` labels are
-        /// `&'static str` and there are at most a handful, once per process.
-        pub(crate) label: &'static str,
-        /// Decides the blend state (replace vs source-over) and whether the
-        /// renderer has to break the pass for a render-target snapshot.
-        pub(crate) needs_backdrop: bool,
-        /// The file name `effects.json` gives the HLSL, for messages.
-        pub(crate) file: String,
-        /// None when the manifest names no HLSL or the file is missing.
-        pub(crate) hlsl: Option<&'static str>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct DynamicManifest {
-        schema: u32,
-        effects: Vec<DynamicManifestEffect>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct DynamicManifestEffect {
-        name: String,
-        backdrop: bool,
-        hlsl: String,
-    }
-
-    /// Must match `sk_effects::MANIFEST_SCHEMA`. Both sides refuse a manifest
-    /// they do not recognise rather than half-reading it.
-    const DYNAMIC_MANIFEST_SCHEMA: u32 = 7;
-
-    /// The effects of [`gpui::app_effects`]. No effects and an unreadable
-    /// manifest both mean "this app has no effects of its own" — the built-ins
-    /// are unaffected either way.
-    pub(crate) fn dynamic_effects() -> Vec<DynamicEffect> {
-        gpui::app_effects()
-            .map(parse_dynamic_effects)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn parse_dynamic_effects(app: &'static gpui::AppEffects) -> Vec<DynamicEffect> {
-        let manifest: DynamicManifest = match serde_json::from_str(&app.manifest) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                super::effects_advisory(&format!(
-                    "{}: effects.json is not readable ({error}) — the app's own `--shading` \
-                     effects are unavailable",
-                    app.origin
-                ));
-                return Vec::new();
-            }
-        };
-        if manifest.schema != DYNAMIC_MANIFEST_SCHEMA {
-            super::effects_advisory(&format!(
-                "{}: effects.json is schema {} but this build understands \
-                 {DYNAMIC_MANIFEST_SCHEMA} — rebuild the app with the sk that matches this host",
-                app.origin, manifest.schema
-            ));
-            return Vec::new();
-        }
-
-        manifest
-            .effects
-            .into_iter()
-            .map(|effect| DynamicEffect {
-                label: Box::leak(
-                    format!("effect_{}_pipeline", effect.name).into_boxed_str(),
-                ),
-                hlsl: app.file(&effect.hlsl),
-                file: effect.hlsl,
-                needs_backdrop: effect.backdrop,
-                name: effect.name,
-            })
-            .collect()
     }
 
     fn compile_flags() -> u32 {
@@ -3493,7 +3397,7 @@ mod dxgi {
 
 #[cfg(test)]
 mod app_effect_tests {
-    use super::shader_resources::{compile_hlsl_source, parse_dynamic_effects};
+    use super::shader_resources::compile_hlsl_source;
 
     /// An app's effects reach fxc from memory, as from a payload; the built-ins' generated HLSL
     /// stands in for an app's, since the compiler makes both the same way.
@@ -3502,14 +3406,14 @@ mod app_effect_tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../crates/sk-effects/generated");
         let app = gpui::AppEffects::from_dir(&dir).map_err(anyhow::Error::msg)?;
-        let effects = parse_dynamic_effects(Box::leak(Box::new(app)));
+        let effects = app.effects();
         let names: Vec<_> = effects.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["frost", "noise", "glow"]);
         assert!(effects[0].needs_backdrop && !effects[1].needs_backdrop);
-        for effect in &effects {
-            let source = effect.hlsl.expect("the HLSL rides beside effects.json");
+        for effect in effects {
+            let (file, source) = effect.hlsl.get("HLSL")?;
             for target in ["ps_5_0\0", "ps_5_1\0"] {
-                compile_hlsl_source(source, &effect.file, "effect_fragment\0", target)?;
+                compile_hlsl_source(source, file, "effect_fragment\0", target)?;
             }
         }
         Ok(())

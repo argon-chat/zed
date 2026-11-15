@@ -89,9 +89,12 @@ pub(super) struct MetalBackdrop {
     blur_upsample: Pipeline,
     blur_rect: Pipeline,
     frame_copy: Pipeline,
-    /// Indexed by `EffectQuad::effect_id`: the built-ins, then the app's own.
-    /// A hole keeps the numbering when one failed to build.
+    /// The built-ins, indexed by `EffectQuad::effect_id`. A hole keeps the
+    /// numbering when one failed to build.
     effects: Vec<Option<Pipeline>>,
+    /// The app's own, `effect_id::COUNT` on.
+    app_effects: gpui::AppEffectPipelines<Pipeline>,
+    effect_vertex: Retained<ProtocolObject<dyn MTLFunction>>,
     /// `gpui::effect_id::PUNCH`.
     punch: Option<Pipeline>,
     clamp_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
@@ -156,6 +159,7 @@ impl MetalRenderer {
         let snapshots = !scene.backdrop_blur_rects.is_empty()
             || scene.effect_quads.iter().any(EffectQuad::needs_backdrop);
         if let BackdropState::Ready(state) = &mut self.backdrop {
+            state.sync_app_effects(&self.device);
             let kernel_levels = scene
                 .backdrop_blur_rects
                 .iter()
@@ -692,7 +696,7 @@ impl MetalBackdrop {
         )?;
 
         let effect_vertex = function("effect_vertex")?;
-        let effects = build_effect_pipelines(device, &effect_vertex);
+        let effects = build_builtin_effect_pipelines(device, &effect_vertex);
         let punch = function("punch_fragment")
             .and_then(|fragment| {
                 backdrop_pipeline(
@@ -727,18 +731,30 @@ impl MetalBackdrop {
             MTLTextureUsage::ShaderRead,
         )?;
 
-        Ok(Self {
+        let mut backdrop = Self {
             blur_downsample,
             blur_upsample,
             blur_rect,
             frame_copy,
             effects,
+            app_effects: Default::default(),
+            effect_vertex,
             punch,
             clamp_sampler,
             placeholder,
             targets: None,
             idle_frames: 0,
-        })
+        };
+        backdrop.sync_app_effects(device);
+        Ok(backdrop)
+    }
+
+    fn sync_app_effects(&mut self, device: &ProtocolObject<dyn MTLDevice>) {
+        let vertex = &self.effect_vertex;
+        self.app_effects.sync(|effect| {
+            let (_, msl) = effect.metal.get("Metal shader")?;
+            effect_pipeline(device, vertex, &effect.name, msl, effect.needs_backdrop)
+        });
     }
 
     /// `needed` counts the snapshot as one more level below the pyramid.
@@ -764,10 +780,11 @@ impl MetalBackdrop {
     }
 
     fn effect(&self, effect_id: u32) -> Option<&Pipeline> {
-        if effect_id == effect_id::PUNCH {
-            return self.punch.as_ref();
+        match effect_id {
+            effect_id::PUNCH => self.punch.as_ref(),
+            id if id < effect_id::COUNT => self.effects.get(id as usize)?.as_ref(),
+            id => self.app_effects.get((id - effect_id::COUNT) as usize),
         }
-        self.effects.get(effect_id as usize)?.as_ref()
     }
 
     fn ensure_targets(
@@ -910,13 +927,10 @@ impl MetalBackdrop {
     }
 }
 
-/// The `--shading` pipeline table: the built-ins in `gpui::effect_id` order,
-/// then the app's effects in `gpui::app_effects` manifest order, the order
-/// `crates/sk-effects` numbers them in.
-///
-/// Infallible as a whole, as on DirectX: an effect whose shader is missing or
-/// does not compile leaves a hole and a one-shot advisory.
-fn build_effect_pipelines(
+/// The built-in `--shading` pipelines in `gpui::effect_id` order. Infallible as
+/// a whole, as on DirectX: one that does not build leaves a hole and a one-shot
+/// advisory.
+fn build_builtin_effect_pipelines(
     device: &ProtocolObject<dyn MTLDevice>,
     vertex: &ProtocolObject<dyn MTLFunction>,
 ) -> Vec<Option<Pipeline>> {
@@ -932,30 +946,6 @@ fn build_effect_pipelines(
             Err(error) => {
                 effects_advisory(&format!(
                     "`--shading: {name}(…)` is unavailable — its pipeline failed to build: {error:#}"
-                ));
-                None
-            }
-        });
-    }
-
-    for effect in app_effects() {
-        let pipeline = effect
-            .msl
-            .as_deref()
-            .with_context(|| match &effect.file {
-                Some(file) => format!("the app's effects have no {file}"),
-                None => "effects.json lists no Metal shader for it; rebuild the app with sk build"
-                    .to_string(),
-            })
-            .and_then(|msl| {
-                effect_pipeline(device, vertex, &effect.name, msl, effect.needs_backdrop)
-            });
-        pipelines.push(match pipeline {
-            Ok(pipeline) => Some(pipeline),
-            Err(error) => {
-                effects_advisory(&format!(
-                    "`--shading: {}(…)` is unavailable — {error:#}",
-                    effect.name
                 ));
                 None
             }
@@ -1046,74 +1036,6 @@ fn create_target_texture(
         .with_context(|| format!("allocating {label}"))?;
     texture.setLabel(Some(&NSString::from_str(label)));
     Ok(texture)
-}
-
-/// One app-supplied effect, as far as the renderer is concerned. Parameter
-/// names, defaults and ranges belong to the CSS layer.
-struct AppEffect {
-    name: String,
-    needs_backdrop: bool,
-    /// The Metal file `effects.json` names, for messages.
-    file: Option<String>,
-    msl: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct AppManifest {
-    schema: u32,
-    effects: Vec<AppManifestEffect>,
-}
-
-#[derive(serde::Deserialize)]
-struct AppManifestEffect {
-    name: String,
-    backdrop: bool,
-    #[serde(default)]
-    metal: Option<String>,
-}
-
-/// Must match `sk_effects::MANIFEST_SCHEMA`.
-const APP_MANIFEST_SCHEMA: u32 = 7;
-
-/// The effects of [`gpui::app_effects`], as gpui_windows reads them. No
-/// effects and an unreadable manifest both mean "this app has no effects of
-/// its own".
-fn app_effects() -> Vec<AppEffect> {
-    let Some(app) = gpui::app_effects() else {
-        return Vec::new();
-    };
-    parse_app_manifest(app).unwrap_or_else(|error| {
-        effects_advisory(&format!(
-            "{}: {error:#} — the app's own `--shading` effects are unavailable",
-            app.origin
-        ));
-        Vec::new()
-    })
-}
-
-fn parse_app_manifest(app: &gpui::AppEffects) -> Result<Vec<AppEffect>> {
-    let manifest: AppManifest =
-        serde_json::from_str(&app.manifest).context("not a readable effects.json")?;
-    anyhow::ensure!(
-        manifest.schema == APP_MANIFEST_SCHEMA,
-        "effects.json is schema {} but this build understands {APP_MANIFEST_SCHEMA}; rebuild \
-         the app with the sk that matches this host",
-        manifest.schema
-    );
-    Ok(manifest
-        .effects
-        .into_iter()
-        .map(|effect| AppEffect {
-            msl: effect
-                .metal
-                .as_deref()
-                .and_then(|file| app.file(file))
-                .map(str::to_owned),
-            file: effect.metal,
-            needs_backdrop: effect.backdrop,
-            name: effect.name,
-        })
-        .collect())
 }
 
 /// Degraded behaviour is announced, never silent, and each distinct message
@@ -1857,13 +1779,80 @@ mod tests {
         Ok(())
     }
 
+    /// The app's effects are process-wide; tests that install them take turns.
+    static APP_EFFECTS: Mutex<()> = Mutex::new(());
+
+    fn install_app_effect(msl: &str) -> Result<()> {
+        gpui::reload_app_effects(
+            gpui::AppEffects::new(
+                "test",
+                r#"{"schema": 7, "effects": [
+                    {"name": "tint", "backdrop": false, "metal": "tint.metal"}
+                ]}"#,
+                [("tint.metal".to_string(), msl.to_string())],
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
+        Ok(())
+    }
+
+    fn solid(rgb: &str) -> String {
+        format!(
+            "#include <metal_stdlib>\nusing namespace metal;\n\
+             fragment float4 effect_fragment() {{ return float4({rgb}, 1.0); }}"
+        )
+    }
+
+    #[test]
+    fn a_reloaded_app_effect_draws_on_the_next_frame_and_a_broken_one_keeps_the_last() -> Result<()>
+    {
+        let _app_effects = APP_EFFECTS.lock();
+        let scene = || {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x000000)));
+            scene.insert_primitive(EffectQuad {
+                effect_id: effect_id::COUNT,
+                bounds: bounds(8., 8., 48., 48.),
+                content_mask: mask(SIDE, SIDE),
+                opacity: 1.,
+                scale: 1.,
+                ..Default::default()
+            });
+            scene
+        };
+        let mut renderer = renderer()?;
+        install_app_effect(&solid("1.0, 0.0, 0.0"))?;
+        assert_eq!(
+            pixel(&render(&mut renderer, scene())?, 32, 32),
+            [255, 0, 0, 255]
+        );
+
+        install_app_effect(&solid("0.0, 1.0, 0.0"))?;
+        let image = render(&mut renderer, scene())?;
+        assert_eq!(pixel(&image, 32, 32), [0, 255, 0, 255]);
+        assert_eq!(pixel(&image, 2, 2), [0, 0, 0, 255]);
+
+        install_app_effect("fragment float4 effect_fragment() { return oops; }")?;
+        assert_eq!(
+            pixel(&render(&mut renderer, scene())?, 32, 32),
+            [0, 255, 0, 255],
+            "a replacement that does not compile keeps the last good pipeline"
+        );
+        Ok(())
+    }
+
     /// The app-effect path end to end: point `SK_EFFECTS_DIR` at an app's
     /// compiled effects (`crates/sk-effects/generated` serves).
     #[test]
     #[ignore = "needs SK_EFFECTS_DIR pointing at an app's compiled effects"]
     fn app_effects_from_the_effects_dir_compile_and_draw() -> Result<()> {
-        let app = gpui::app_effects().context("SK_EFFECTS_DIR did not yield effects")?;
-        let effects = parse_app_manifest(app)?;
+        let _app_effects = APP_EFFECTS.lock();
+        let dir =
+            std::env::var_os(gpui::APP_EFFECTS_DIR_ENV).context("SK_EFFECTS_DIR is not set")?;
+        let app =
+            gpui::AppEffects::from_dir(std::path::Path::new(&dir)).map_err(anyhow::Error::msg)?;
+        let effects = app.effects().to_vec();
+        gpui::reload_app_effects(app);
         anyhow::ensure!(!effects.is_empty(), "the manifest lists no effects");
 
         let mut renderer = renderer()?;
@@ -1888,10 +1877,7 @@ mod tests {
             });
             let image = render(&mut renderer, scene)?;
             assert!(
-                backdrop(&renderer)?
-                    .effects
-                    .get(effect_id::COUNT as usize + index)
-                    .is_some_and(Option::is_some),
+                backdrop(&renderer)?.app_effects.get(index).is_some(),
                 "{} must build",
                 effect.name
             );

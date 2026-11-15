@@ -1135,8 +1135,9 @@ impl DirectXRenderer {
         let mut needs_backdrop = !scene.backdrop_blur_rects.is_empty();
         let mut effects = HashSet::new();
         for effect in &scene.effect_quads {
-            if effects.insert(effect.effect_id) {
-                let (_, backdrop) = self.pipelines.effect(effect.effect_id, FORMAT, 1)?;
+            if effects.insert(effect.effect_id)
+                && let Some((_, backdrop)) = self.pipelines.effect(effect.effect_id, FORMAT, 1)?
+            {
                 needs_backdrop |= backdrop;
             }
         }
@@ -2183,7 +2184,9 @@ impl Encoding<'_> {
         Ok(())
     }
     fn effects(&mut self, effect: u32, start: usize, end: usize) -> Result<()> {
-        let (pipeline, needs_backdrop) = self.pipelines.effect(effect, FORMAT, 1)?;
+        let Some((pipeline, needs_backdrop)) = self.pipelines.effect(effect, FORMAT, 1)? else {
+            return Ok(());
+        };
         let buffer = self.data.effects;
         if !needs_backdrop {
             return self.draw_pipeline(
@@ -2715,6 +2718,60 @@ mod tests {
             mean < 0.5 && outliers * 200 < differences.len() && largest <= 16,
             "wgpu must match D3D12: mean {mean:.3}, {outliers} channels off by more than 4, \
              largest {largest}"
+        );
+        Ok(())
+    }
+
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_reloaded_app_effect_draws_on_the_next_frame_and_a_broken_one_keeps_the_last()
+    -> Result<()> {
+        let install = |hlsl: &str| -> Result<()> {
+            reload_app_effects(
+                AppEffects::new(
+                    "test",
+                    r#"{"schema": 7, "effects": [
+                        {"name": "tint", "backdrop": false, "hlsl": "tint.hlsl"}
+                    ]}"#,
+                    [("tint.hlsl".to_string(), hlsl.to_string())],
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            Ok(())
+        };
+        let solid = |rgb: &str| {
+            format!("float4 effect_fragment() : SV_Target {{ return float4({rgb}, 1.0); }}")
+        };
+        let content_mask = mask(64., 64.);
+        let scene = || {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., 64., 64.), rgb(0x000000), content_mask));
+            scene.insert_primitive(EffectQuad {
+                effect_id: effect_id::COUNT,
+                bounds: bounds(8., 8., 48., 48.),
+                content_mask,
+                opacity: 1.,
+                scale: 1.,
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let mut renderer = offscreen(64, 64)?;
+        let center = |renderer: &mut DirectXRenderer| -> Result<[u8; 4]> {
+            let image = renderer.render_to_image(&scene(), WindowBackgroundAppearance::Opaque)?;
+            assert_eq!(image.get_pixel(2, 2).0, [0, 0, 0, 255]);
+            Ok(image.get_pixel(32, 32).0)
+        };
+        install(&solid("1.0, 0.0, 0.0"))?;
+        assert_eq!(center(&mut renderer)?, [255, 0, 0, 255]);
+        install(&solid("0.0, 1.0, 0.0"))?;
+        assert_eq!(center(&mut renderer)?, [0, 255, 0, 255]);
+        install("float4 effect_fragment() : SV_Target { return oops; }")?;
+        assert_eq!(
+            center(&mut renderer)?,
+            [0, 255, 0, 255],
+            "a replacement that does not compile keeps the last good pipeline"
         );
         Ok(())
     }

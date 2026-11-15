@@ -27,6 +27,7 @@ pub mod profiler;
 #[macro_use]
 mod action;
 mod app;
+mod app_effects;
 mod arena;
 mod asset_cache;
 mod assets;
@@ -118,6 +119,7 @@ pub use accesskit::{Action as AccessibleAction, Orientation, Role, Toggled};
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
+pub use app_effects::*;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
