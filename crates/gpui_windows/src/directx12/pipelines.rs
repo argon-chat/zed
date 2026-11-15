@@ -319,8 +319,12 @@ impl Pipelines {
                     .get(index)
                     .context("D3D12 dynamic effect index is out of bounds")?;
                 let vertex = embedded::effect_vertex();
-                let fragment = shader_resources::compile_hlsl_file(
-                    &effect.hlsl,
+                let source = effect
+                    .hlsl
+                    .with_context(|| format!("the app's effects have no {}", effect.file))?;
+                let fragment = shader_resources::compile_hlsl_source(
+                    source,
+                    &effect.file,
                     "effect_fragment\0",
                     "ps_5_1\0",
                 )

@@ -11,7 +11,6 @@ use bytemuck::{Pod, Zeroable};
 use gpui::{BackdropBlurRect, EffectQuad, MAX_BACKDROP_BLUR_KERNEL_LEVELS, Scene, effect_id};
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::path::PathBuf;
 
 include!(concat!(env!("OUT_DIR"), "/builtin_effects.rs"));
 
@@ -938,7 +937,7 @@ impl WgpuBackdrop {
 }
 
 /// The `--shading` pipeline table: the built-ins in `gpui::effect_id` order,
-/// then the app's effects in `$SK_EFFECTS_DIR/effects.json` order, the order
+/// then the app's effects in `gpui::app_effects` manifest order, the order
 /// `crates/sk-effects` numbers them in.
 ///
 /// Infallible as a whole, as on DirectX: an effect whose shader is missing or
@@ -978,12 +977,23 @@ fn build_effect_pipelines(
     for effect in app_effects() {
         let pipeline = effect
             .wgsl
-            .as_ref()
-            .context("effects.json lists no WGSL for it; re-run `bun shaders.ts --app <app> --out <dir>`")
-            .and_then(|path| {
-                let wgsl = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                effect_pipeline(device, layout, vertex, &effect.name, &wgsl, format, effect.needs_backdrop)
+            .as_deref()
+            .with_context(|| match &effect.file {
+                Some(file) => format!("the app's effects have no {file}"),
+                None => {
+                    "effects.json lists no WGSL for it; rebuild the app with sk build".to_string()
+                }
+            })
+            .and_then(|wgsl| {
+                effect_pipeline(
+                    device,
+                    layout,
+                    vertex,
+                    &effect.name,
+                    wgsl,
+                    format,
+                    effect.needs_backdrop,
+                )
             });
         pipelines.push(match pipeline {
             Ok(pipeline) => Some(pipeline),
@@ -1150,7 +1160,9 @@ fn capture_validation<T>(_device: &wgpu::Device, build: impl FnOnce() -> T) -> R
 struct AppEffect {
     name: String,
     needs_backdrop: bool,
-    wgsl: Option<PathBuf>,
+    /// The WGSL file `effects.json` names, for messages.
+    file: Option<String>,
+    wgsl: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1168,55 +1180,43 @@ struct AppManifestEffect {
 }
 
 /// Must match `sk_effects::MANIFEST_SCHEMA`.
-const APP_MANIFEST_SCHEMA: u32 = 6;
+const APP_MANIFEST_SCHEMA: u32 = 7;
 
-const EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
-
-/// Reads `$SK_EFFECTS_DIR/effects.json`, as gpui_windows does. Absent
-/// variable, absent file and unreadable file all mean "this app has no effects
-/// of its own".
+/// The effects of [`gpui::app_effects`], as gpui_windows reads them. No
+/// effects and an unreadable manifest both mean "this app has no effects of
+/// its own".
 fn app_effects() -> Vec<AppEffect> {
-    let Some(dir) = std::env::var_os(EFFECTS_DIR_ENV).filter(|dir| !dir.is_empty()) else {
+    let Some(app) = gpui::app_effects() else {
         return Vec::new();
     };
-    let dir = PathBuf::from(dir);
-    let path = dir.join("effects.json");
-    let json = match std::fs::read_to_string(&path) {
-        Ok(json) => json,
-        Err(error) => {
-            effects_advisory(&format!(
-                "{EFFECTS_DIR_ENV} is set to `{}` but {} could not be read ({error}) — the \
-                 app's own `--shading` effects are unavailable",
-                dir.display(),
-                path.display()
-            ));
-            return Vec::new();
-        }
-    };
-    parse_app_manifest(&json, &dir).unwrap_or_else(|error| {
+    parse_app_manifest(app).unwrap_or_else(|error| {
         effects_advisory(&format!(
             "{}: {error:#} — the app's own `--shading` effects are unavailable",
-            path.display()
+            app.origin
         ));
         Vec::new()
     })
 }
 
-fn parse_app_manifest(json: &str, dir: &std::path::Path) -> Result<Vec<AppEffect>> {
+fn parse_app_manifest(app: &gpui::AppEffects) -> Result<Vec<AppEffect>> {
     let manifest: AppManifest =
-        serde_json::from_str(json).context("not a readable effects.json")?;
+        serde_json::from_str(&app.manifest).context("not a readable effects.json")?;
     anyhow::ensure!(
         manifest.schema == APP_MANIFEST_SCHEMA,
-        "effects.json is schema {} but this build understands {APP_MANIFEST_SCHEMA}; re-run \
-         `bun shaders.ts --app <app> --out {}`",
-        manifest.schema,
-        dir.display()
+        "effects.json is schema {} but this build understands {APP_MANIFEST_SCHEMA}; rebuild \
+         the app with the sk that matches this host",
+        manifest.schema
     );
     Ok(manifest
         .effects
         .into_iter()
         .map(|effect| AppEffect {
-            wgsl: effect.wgsl.map(|file| dir.join(file)),
+            wgsl: effect
+                .wgsl
+                .as_deref()
+                .and_then(|file| app.file(file))
+                .map(str::to_owned),
+            file: effect.wgsl,
             needs_backdrop: effect.backdrop,
             name: effect.name,
         })
@@ -1415,30 +1415,27 @@ mod tests {
     }
 
     #[test]
-    fn app_manifest_resolves_shaders_and_rejects_other_schemas() -> Result<()> {
-        let dir = std::path::Path::new("effects");
-        let effects = parse_app_manifest(
-            r#"{"schema": 6, "kind": "app", "effects": [
+    fn app_manifest_resolves_each_effect_to_its_wgsl() -> Result<()> {
+        let app = |manifest: &str| {
+            gpui::AppEffects::new(
+                "test",
+                manifest,
+                [("ripple.wgsl".to_string(), "// ripple".to_string())],
+            )
+        };
+        let effects = parse_app_manifest(&app(r#"{"schema": 7, "kind": "user", "effects": [
                 {"name": "ripple", "backdrop": true, "hlsl": "ripple.hlsl", "wgsl": "ripple.wgsl"},
-                {"name": "aurora", "backdrop": false, "hlsl": "aurora.hlsl"}
-            ]}"#,
-            dir,
-        )?;
-        assert_eq!(effects.len(), 2);
+                {"name": "aurora", "backdrop": false, "hlsl": "aurora.hlsl", "wgsl": "aurora.wgsl"},
+                {"name": "plain", "backdrop": false, "hlsl": "plain.hlsl"}
+            ]}"#))?;
+        assert_eq!(effects.len(), 3);
         assert_eq!(effects[0].name, "ripple");
         assert!(effects[0].needs_backdrop);
-        assert_eq!(
-            effects[0].wgsl.as_deref(),
-            Some(dir.join("ripple.wgsl").as_path())
-        );
+        assert_eq!(effects[0].wgsl.as_deref(), Some("// ripple"));
         assert!(!effects[1].needs_backdrop);
+        assert_eq!(effects[1].file.as_deref(), Some("aurora.wgsl"));
         assert!(effects[1].wgsl.is_none());
-
-        let error = parse_app_manifest(r#"{"schema": 5, "effects": []}"#, dir)
-            .err()
-            .context("schema 5 must be refused")?;
-        assert!(format!("{error:#}").contains("schema 5"), "{error:#}");
-        assert!(parse_app_manifest("not json", dir).is_err());
+        assert!(effects[2].file.is_none());
         Ok(())
     }
 
@@ -2150,14 +2147,15 @@ mod tests {
         #[test]
         #[ignore = "needs SK_EFFECTS_DIR pointing at an app's compiled effects"]
         fn app_effects_from_the_effects_dir_validate_and_draw() -> Result<()> {
-            let dir = std::env::var_os(EFFECTS_DIR_ENV).context("SK_EFFECTS_DIR is not set")?;
-            let dir = PathBuf::from(dir);
-            let effects =
-                parse_app_manifest(&std::fs::read_to_string(dir.join("effects.json"))?, &dir)?;
+            let dir =
+                std::env::var_os(gpui::APP_EFFECTS_DIR_ENV).context("SK_EFFECTS_DIR is not set")?;
+            let app = gpui::AppEffects::from_dir(std::path::Path::new(&dir))
+                .map_err(anyhow::Error::msg)?;
+            let effects = parse_app_manifest(&app)?;
             anyhow::ensure!(!effects.is_empty(), "the manifest lists no effects");
             for effect in &effects {
-                let path = effect.wgsl.as_ref().context("an effect without WGSL")?;
-                let fragment = module(&std::fs::read_to_string(path)?);
+                let wgsl = effect.wgsl.as_deref().context("an effect without WGSL")?;
+                let fragment = module(wgsl);
                 assert_eq!(
                     struct_layout(&fragment, "SkEffectQuad_std430_0"),
                     (effect_quad_offsets(), 128),

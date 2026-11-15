@@ -1388,6 +1388,101 @@ pub mod effect_id {
 /// and draw with blending disabled.
 pub const EFFECT_FLAG_NEEDS_BACKDROP: u32 = 1;
 
+/// vue-native: names a directory of compiled app effects (`effects.json` and the shaders beside it).
+/// A developer override: it wins over what the host installs with [`set_app_effects`].
+pub const APP_EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
+
+/// vue-native: an app's own `--shading` effects, read once per process by every renderer and by the
+/// CSS registry, so the pipeline table and the effect ids come from the same manifest.
+#[derive(Debug, Clone)]
+pub struct AppEffects {
+    /// Where they came from, for messages.
+    pub origin: String,
+    /// The `effects.json` text.
+    pub manifest: String,
+    files: std::collections::HashMap<String, String>,
+}
+
+impl AppEffects {
+    /// `files` maps the names `manifest` gives the generated shaders to their source.
+    pub fn new(
+        origin: impl Into<String>,
+        manifest: impl Into<String>,
+        files: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self {
+            origin: origin.into(),
+            manifest: manifest.into(),
+            files: files.into_iter().collect(),
+        }
+    }
+
+    /// A generated shader by the name `effects.json` gives it.
+    pub fn file(&self, name: &str) -> Option<&str> {
+        self.files.get(name).map(String::as_str)
+    }
+
+    /// `<dir>/effects.json` and the `.hlsl`, `.wgsl` and `.metal` files beside it.
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self, String> {
+        let manifest_path = dir.join("effects.json");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("{} could not be read ({e})", manifest_path.display()))?;
+        let mut files = Vec::new();
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("{} could not be listed ({e})", dir.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let shader = path
+                .extension()
+                .is_some_and(|ext| ext == "hlsl" || ext == "wgsl" || ext == "metal");
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if shader {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("{} could not be read ({e})", path.display()))?;
+                files.push((name.to_string(), text));
+            }
+        }
+        Ok(Self::new(dir.display().to_string(), manifest, files))
+    }
+}
+
+static APP_EFFECTS: std::sync::OnceLock<Option<AppEffects>> = std::sync::OnceLock::new();
+
+fn app_effects_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os(APP_EFFECTS_DIR_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// vue-native: hands the renderers and the CSS registry the app's effects (from its payload). Call it
+/// before the first window; false when [`APP_EFFECTS_DIR_ENV`] is set, which wins, or when the effects
+/// were already read.
+pub fn set_app_effects(effects: AppEffects) -> bool {
+    app_effects_dir().is_none() && APP_EFFECTS.set(Some(effects)).is_ok()
+}
+
+/// vue-native: the app's effects: `$SK_EFFECTS_DIR` when set, else what the host installed, else none.
+pub fn app_effects() -> Option<&'static AppEffects> {
+    APP_EFFECTS
+        .get_or_init(|| {
+            let dir = app_effects_dir()?;
+            AppEffects::from_dir(&dir)
+                .map_err(|error| {
+                    let message = format!(
+                        "{APP_EFFECTS_DIR_ENV} is set to `{}` but {error} — the app's own `--shading` \
+                         effects are unavailable",
+                        dir.display()
+                    );
+                    log::warn!("{message}");
+                    eprintln!("skathi: {message}");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
 /// CSS `transform`, as the cascade computed it, carried on [`crate::Style`]
 /// and turned into a [`TransformationMatrix`] at paint time by
 /// [`crate::Style::paint`].

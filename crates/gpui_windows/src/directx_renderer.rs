@@ -1789,8 +1789,12 @@ fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<Eff
                 ShaderModule::Effect(EffectShader::ALL[0]),
                 ShaderTarget::Vertex,
             )?;
-            let fragment_blob = shader_resources::compile_hlsl_file(
-                &effect.hlsl,
+            let source = effect
+                .hlsl
+                .with_context(|| format!("the app's effects have no {}", effect.file))?;
+            let fragment_blob = shader_resources::compile_hlsl_source(
+                source,
+                &effect.file,
                 "effect_fragment\0",
                 "ps_5_0\0",
             )?;
@@ -1814,8 +1818,7 @@ fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<Eff
             Err(error) => {
                 effects_advisory(&format!(
                     "`--shading: {}(…)` is unavailable — compiling {} failed: {error:#}",
-                    effect.name,
-                    effect.hlsl.display()
+                    effect.name, effect.file
                 ));
                 // Still push a hole: the index has to keep matching the
                 // manifest, or every effect after this one would shift.
@@ -1974,7 +1977,7 @@ impl<T> PipelineState<T> {
 
     /// The half of [`Self::new`] that does not care where the bytecode came
     /// from. An app-supplied `--shading` effect has no `ShaderModule` — its
-    /// fragment stage is HLSL compiled at startup from `$SK_EFFECTS_DIR` — so
+    /// fragment stage is HLSL compiled at startup from `gpui::app_effects` — so
     /// it enters here instead.
     fn from_shaders(
         device: &ID3D11Device,
@@ -2822,14 +2825,16 @@ const BUFFER_COUNT: usize = 3;
 
 pub(crate) mod shader_resources {
     use anyhow::{Context, Result};
-    use std::path::{Path, PathBuf};
 
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
+            Fxc::{
+                D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION,
+                D3DCompile,
+            },
             ID3DBlob,
         },
-        core::{HSTRING, PCSTR},
+        core::PCSTR,
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2929,10 +2934,11 @@ pub(crate) mod shader_resources {
     // -----------------------------------------------------------------------
     //
     // An app's `--shading` effects are not part of the Rust build, so nothing
-    // could have pre-compiled them: `bun shaders.ts --app <app> --out <dir>`
-    // leaves HLSL plus an `effects.json` schema in <dir>, the host is run with
-    // SK_EFFECTS_DIR=<dir>, and the fragment stage is compiled here at renderer
-    // construction — in release as well as debug.
+    // could have pre-compiled them: `sk build` puts their HLSL and an
+    // `effects.json` schema into the app's payload, the host hands them to
+    // `gpui::set_app_effects` ($SK_EFFECTS_DIR overrides), and the fragment
+    // stage is compiled here at renderer construction — in release as well as
+    // debug.
     //
     // `crates/sk-effects` reads the SAME manifest for the CSS schema and
     // numbers the effects the same way (after the built-ins, in manifest
@@ -2950,7 +2956,10 @@ pub(crate) mod shader_resources {
         /// Decides the blend state (replace vs source-over) and whether the
         /// renderer has to break the pass for a render-target snapshot.
         pub(crate) needs_backdrop: bool,
-        pub(crate) hlsl: PathBuf,
+        /// The file name `effects.json` gives the HLSL, for messages.
+        pub(crate) file: String,
+        /// None when the manifest names no HLSL or the file is missing.
+        pub(crate) hlsl: Option<&'static str>,
     }
 
     #[derive(serde::Deserialize)]
@@ -2968,49 +2977,34 @@ pub(crate) mod shader_resources {
 
     /// Must match `sk_effects::MANIFEST_SCHEMA`. Both sides refuse a manifest
     /// they do not recognise rather than half-reading it.
-    const DYNAMIC_MANIFEST_SCHEMA: u32 = 6;
+    const DYNAMIC_MANIFEST_SCHEMA: u32 = 7;
 
-    pub(crate) const EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
-
-    /// Reads `$SK_EFFECTS_DIR/effects.json`. Absent variable, absent file and
-    /// unreadable file all mean "this app has no effects of its own" — the
-    /// built-ins are unaffected either way.
+    /// The effects of [`gpui::app_effects`]. No effects and an unreadable
+    /// manifest both mean "this app has no effects of its own" — the built-ins
+    /// are unaffected either way.
     pub(crate) fn dynamic_effects() -> Vec<DynamicEffect> {
-        let Some(dir) = std::env::var_os(EFFECTS_DIR_ENV).filter(|d| !d.is_empty()) else {
-            return Vec::new();
-        };
-        let dir = PathBuf::from(dir);
-        let path = dir.join("effects.json");
-        let json = match std::fs::read_to_string(&path) {
-            Ok(json) => json,
-            Err(error) => {
-                super::effects_advisory(&format!(
-                    "{EFFECTS_DIR_ENV} is set to `{}` but {} could not be read ({error}) — the \
-                     app's own `--shading` effects are unavailable",
-                    dir.display(),
-                    path.display()
-                ));
-                return Vec::new();
-            }
-        };
-        let manifest: DynamicManifest = match serde_json::from_str(&json) {
+        gpui::app_effects()
+            .map(parse_dynamic_effects)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn parse_dynamic_effects(app: &'static gpui::AppEffects) -> Vec<DynamicEffect> {
+        let manifest: DynamicManifest = match serde_json::from_str(&app.manifest) {
             Ok(manifest) => manifest,
             Err(error) => {
                 super::effects_advisory(&format!(
-                    "{} is not a readable effects.json ({error}) — the app's own `--shading` \
+                    "{}: effects.json is not readable ({error}) — the app's own `--shading` \
                      effects are unavailable",
-                    path.display()
+                    app.origin
                 ));
                 return Vec::new();
             }
         };
         if manifest.schema != DYNAMIC_MANIFEST_SCHEMA {
             super::effects_advisory(&format!(
-                "{} is schema {} but this build understands {DYNAMIC_MANIFEST_SCHEMA} — re-run \
-                 `bun shaders.ts --app <app> --out {}`",
-                path.display(),
-                manifest.schema,
-                dir.display()
+                "{}: effects.json is schema {} but this build understands \
+                 {DYNAMIC_MANIFEST_SCHEMA} — rebuild the app with the sk that matches this host",
+                app.origin, manifest.schema
             ));
             return Vec::new();
         }
@@ -3022,26 +3016,88 @@ pub(crate) mod shader_resources {
                 label: Box::leak(
                     format!("effect_{}_pipeline", effect.name).into_boxed_str(),
                 ),
-                hlsl: dir.join(&effect.hlsl),
+                hlsl: app.file(&effect.hlsl),
+                file: effect.hlsl,
                 needs_backdrop: effect.backdrop,
                 name: effect.name,
             })
             .collect()
     }
 
-    /// Compiles one HLSL file at runtime.
+    fn compile_flags() -> u32 {
+        if cfg!(debug_assertions) {
+            D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+        } else {
+            D3DCOMPILE_OPTIMIZATION_LEVEL3
+        }
+    }
+
+    fn compile_error(result: windows::core::Result<()>, error_blob: Option<ID3DBlob>) -> anyhow::Error {
+        let Some(error_blob) = error_blob else {
+            return anyhow::anyhow!("{result:?}");
+        };
+        // SAFETY: fxc's error blob is a NUL-terminated string it owns until the blob drops.
+        let message = unsafe {
+            std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const i8)
+                .to_string_lossy()
+                .into_owned()
+        };
+        anyhow::anyhow!("{}", message.trim())
+    }
+
+    /// Compiles HLSL source at runtime; `name` is what fxc's messages call it.
     ///
     /// `entry` and `target` must be NUL-terminated. Optimisation follows the
     /// build profile: a debug build keeps the shader debuggable (and matches
     /// what the built-in hot-reload path does), a release build optimises.
     ///
     /// `#line` directives in the generated HLSL name the author's `.slang`, so
-    /// an fxc diagnostic here points at their source, not at slangc's output.
-    pub(crate) fn compile_hlsl_file(path: &Path, entry: &str, target: &str) -> Result<ID3DBlob> {
+    /// an fxc diagnostic here points at their source, not at Slang's output.
+    pub(crate) fn compile_hlsl_source(
+        source: &str,
+        name: &str,
+        entry: &str,
+        target: &str,
+    ) -> Result<ID3DBlob> {
+        let name = std::ffi::CString::new(name).context("shader name contains NUL")?;
+        let mut compile_blob = None;
+        let mut error_blob = None;
+        // SAFETY: every pointer outlives the call; entry and target are NUL-terminated.
+        let result = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR::from_raw(name.as_ptr().cast()),
+                None,
+                None,
+                PCSTR::from_raw(entry.as_ptr()),
+                PCSTR::from_raw(target.as_ptr()),
+                compile_flags(),
+                0,
+                &mut compile_blob,
+                Some(&mut error_blob),
+            )
+        };
+        if result.is_err() {
+            return Err(compile_error(result, error_blob));
+        }
+        compile_blob.context("D3DCompile returned no bytecode")
+    }
+
+    /// Compiles one HLSL file at runtime, resolving its `#include`s beside it:
+    /// the debug build's hot-reload path for gpui's own shaders.
+    #[cfg(debug_assertions)]
+    pub(crate) fn compile_hlsl_file(
+        path: &std::path::Path,
+        entry: &str,
+        target: &str,
+    ) -> Result<ID3DBlob> {
         unsafe {
             use windows::Win32::Graphics::{
-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                Direct3D::{Fxc::D3DCompileFromFile, ID3DInclude},
+                Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
+            use windows::core::HSTRING;
 
             let path = path
                 .canonicalize()
@@ -3053,11 +3109,6 @@ pub(crate) mod shader_resources {
             let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
                 D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
             );
-            let flags = if cfg!(debug_assertions) {
-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
-            } else {
-                D3DCOMPILE_OPTIMIZATION_LEVEL3
-            };
 
             let result = D3DCompileFromFile(
                 &HSTRING::from(path.to_str().context("shader path is not UTF-8")?),
@@ -3065,19 +3116,13 @@ pub(crate) mod shader_resources {
                 include_handler,
                 PCSTR::from_raw(entry.as_ptr()),
                 PCSTR::from_raw(target.as_ptr()),
-                flags,
+                compile_flags(),
                 0,
                 &mut compile_blob,
                 Some(&mut error_blob),
             );
             if result.is_err() {
-                let Some(error_blob) = error_blob else {
-                    anyhow::bail!("{result:?}");
-                };
-                let message = std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const i8)
-                    .to_string_lossy()
-                    .into_owned();
-                anyhow::bail!("{}", message.trim());
+                return Err(compile_error(result, error_blob));
             }
             compile_blob.context("D3DCompileFromFile returned no bytecode")
         }
@@ -3443,5 +3488,30 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(test)]
+mod app_effect_tests {
+    use super::shader_resources::{compile_hlsl_source, parse_dynamic_effects};
+
+    /// An app's effects reach fxc from memory, as from a payload; the built-ins' generated HLSL
+    /// stands in for an app's, since the compiler makes both the same way.
+    #[test]
+    fn app_effects_compile_from_memory_for_d3d11_and_d3d12() -> anyhow::Result<()> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../crates/sk-effects/generated");
+        let app = gpui::AppEffects::from_dir(&dir).map_err(anyhow::Error::msg)?;
+        let effects = parse_dynamic_effects(Box::leak(Box::new(app)));
+        let names: Vec<_> = effects.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["frost", "noise", "glow"]);
+        assert!(effects[0].needs_backdrop && !effects[1].needs_backdrop);
+        for effect in &effects {
+            let source = effect.hlsl.expect("the HLSL rides beside effects.json");
+            for target in ["ps_5_0\0", "ps_5_1\0"] {
+                compile_hlsl_source(source, &effect.file, "effect_fragment\0", target)?;
+            }
+        }
+        Ok(())
     }
 }
