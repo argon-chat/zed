@@ -3157,3 +3157,73 @@ mod tests {
         assert_eq!(words, expected.as_slice());
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod text_shadow_tests {
+    use super::*;
+    use gpui::{
+        AtlasKey, MonochromeSprite, PlatformHeadlessRenderer, Quad, RenderSvgParams,
+        TransformationMatrix, blur_glyph_coverage, point, rgb, size,
+    };
+    use std::borrow::Cow;
+
+    /// A blurred `text-shadow` tile is linear coverage and composites as it is: the glyph contrast
+    /// and gamma correction would darken its tail.
+    #[test]
+    fn a_blurred_text_shadow_composites_its_coverage_unaltered() -> Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let glyph = size(DevicePixels(6), DevicePixels(6));
+        let (tile_size, coverage) = blur_glyph_coverage(glyph, &[255; 36], 2.5);
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "text-shadow-coverage".into(),
+                    size: tile_size,
+                }),
+                &mut || Ok(Some((tile_size, Cow::Borrowed(coverage.as_slice())))),
+            )?
+            .context("shadow tile was not allocated")?;
+        let frame = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(32.), ScaledPixels(32.)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: frame,
+            background: rgb(0xffffff).into(),
+            content_mask: ContentMask::rect(frame),
+            ..Default::default()
+        });
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            raw_coverage: true.into(),
+            tile,
+            bounds: Bounds::new(
+                point(ScaledPixels(5.), ScaledPixels(5.)),
+                tile_size.map(|side| ScaledPixels(side.0 as f32)),
+            ),
+            content_mask: ContentMask::rect(frame),
+            color: rgb(0x000000).into(),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))?;
+
+        let width = tile_size.width.0 as u32;
+        for y in 0..tile_size.height.0 as u32 {
+            for x in 0..width {
+                let expected = 255 - coverage[(y * width + x) as usize];
+                let actual = image.get_pixel(x + 5, y + 5).0;
+                assert!(
+                    actual[..3]
+                        .iter()
+                        .all(|channel| channel.abs_diff(expected) <= 2),
+                    "({x}, {y}): {actual:?}, expected {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+}

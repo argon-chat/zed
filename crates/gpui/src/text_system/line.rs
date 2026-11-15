@@ -1,7 +1,7 @@
 use crate::util::impl_deref;
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    SharedString, StrikethroughStyle, TextAlign, TextShadow, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use smallvec::SmallVec;
@@ -36,6 +36,9 @@ pub struct DecorationRun {
 
     /// The strikethrough style for this run
     pub strikethrough: Option<StrikethroughStyle>,
+
+    /// vue-native fork: CSS `text-shadow` for this run, first on top.
+    pub text_shadow: Vec<TextShadow>,
 }
 
 /// A line of text that has been shaped and decorated.
@@ -215,17 +218,11 @@ impl ShapedLine {
                 let right_len = run_end - split_point;
                 left_decorations.push(DecorationRun {
                     len: left_len,
-                    color: decoration.color,
-                    background_color: decoration.background_color,
-                    underline: decoration.underline,
-                    strikethrough: decoration.strikethrough,
+                    ..decoration.clone()
                 });
                 right_decorations.push(DecorationRun {
                     len: right_len,
-                    color: decoration.color,
-                    background_color: decoration.background_color,
-                    underline: decoration.underline,
-                    strikethrough: decoration.strikethrough,
+                    ..decoration.clone()
                 });
             }
 
@@ -348,10 +345,7 @@ impl<'a> ShapedLineCursor<'a> {
             if len > 0 || decoration.len == 0 {
                 decorations.push(DecorationRun {
                     len,
-                    color: decoration.color,
-                    background_color: decoration.background_color,
-                    underline: decoration.underline,
-                    strikethrough: decoration.strikethrough,
+                    ..decoration.clone()
                 });
             }
             if end <= byte_index as u32 {
@@ -557,7 +551,9 @@ fn paint_line(
         align_width,
         wrap_boundaries,
     );
-    window.paint_layer(line_bounds, |window| {
+    // vue-native fork: each `text-shadow` is a pass of its own beneath the text, last first, in a
+    // layer of its own so its sprites order below the glyphs they shadow.
+    let mut paint_pass = |shadow_ix: Option<usize>, window: &mut Window| -> Result<()> {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
@@ -565,6 +561,7 @@ fn paint_line(
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut color = black();
+        let mut shadow: Option<TextShadow> = None;
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let text_system = cx.text_system().clone();
@@ -605,14 +602,20 @@ fn paint_line(
                         && let Some(hyphen) =
                             text_system.platform_text_system.glyph_for_char(font_id, '-')
                     {
-                        let text_paint = window.text_style().vn_text_paint.clone()
-                            .filter(|paint| !paint.fill.backgrounds.is_empty());
-                        if let Some(text_paint) = text_paint {
-                            window.vn_with_text_mask(text_paint, |window| window.paint_glyph(
-                                glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, crate::white()))?;
-                        }
-                        if color.a > 0. {
-                            window.paint_glyph(glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, color)?;
+                        if shadow_ix.is_some() {
+                            if let Some(shadow) = shadow {
+                                paint_shadow_glyph(window, shadow, color, glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, false)?;
+                            }
+                        } else {
+                            let text_paint = window.text_style().vn_text_paint.clone()
+                                .filter(|paint| !paint.fill.backgrounds.is_empty());
+                            if let Some(text_paint) = text_paint {
+                                window.vn_with_text_mask(text_paint, |window| window.paint_glyph(
+                                    glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, crate::white()))?;
+                            }
+                            if color.a > 0. {
+                                window.paint_glyph(glyph_origin + baseline_offset, font_id, hyphen, layout.font_size, color)?;
+                            }
                         }
                     }
                     wrap_ix += 1;
@@ -622,13 +625,15 @@ fn paint_line(
                         if glyph_origin.x == underline_origin.x {
                             underline_origin.x -= max_glyph_size.width.half();
                         };
-                        paint_underline(
-                            underline_range.clone(),
-                            *underline_origin,
-                            glyph_origin.x - underline_origin.x,
-                            underline_style,
-                            window,
-                        );
+                        if shadow_ix.is_none() {
+                            paint_underline(
+                                underline_range.clone(),
+                                *underline_origin,
+                                glyph_origin.x - underline_origin.x,
+                                underline_style,
+                                window,
+                            );
+                        }
                         if glyph.index < run_end {
                             underline_origin.x = origin.x;
                             underline_origin.y += line_height;
@@ -642,11 +647,13 @@ fn paint_line(
                         if glyph_origin.x == strikethrough_origin.x {
                             strikethrough_origin.x -= max_glyph_size.width.half();
                         };
-                        window.paint_strikethrough(
-                            *strikethrough_origin,
-                            glyph_origin.x - strikethrough_origin.x,
-                            strikethrough_style,
-                        );
+                        if shadow_ix.is_none() {
+                            window.paint_strikethrough(
+                                *strikethrough_origin,
+                                glyph_origin.x - strikethrough_origin.x,
+                                strikethrough_style,
+                            );
+                        }
                         if glyph.index < run_end {
                             strikethrough_origin.x = origin.x;
                             strikethrough_origin.y += line_height;
@@ -732,7 +739,9 @@ fn paint_line(
 
                         run_end += style_run.len as usize;
                         color = style_run.color;
+                        shadow = shadow_ix.and_then(|ix| style_run.text_shadow.get(ix).copied());
                     } else {
+                        shadow = None;
                         run_end = layout.len;
                         finished_underline = current_underline.take();
                         finished_strikethrough = current_strikethrough.take();
@@ -740,7 +749,7 @@ fn paint_line(
                 }
 
                 if let Some((mut underline_origin, underline_style, underline_range)) =
-                    finished_underline
+                    finished_underline.filter(|_| shadow_ix.is_none())
                 {
                     if underline_origin.x == glyph_origin.x {
                         underline_origin.x -= max_glyph_size.width.half();
@@ -755,7 +764,7 @@ fn paint_line(
                 }
 
                 if let Some((mut strikethrough_origin, strikethrough_style)) =
-                    finished_strikethrough
+                    finished_strikethrough.filter(|_| shadow_ix.is_none())
                 {
                     if strikethrough_origin.x == glyph_origin.x {
                         strikethrough_origin.x -= max_glyph_size.width.half();
@@ -777,6 +786,23 @@ fn paint_line(
                 // different frames, and comparing them culls the glyphs of a
                 // transformed element against a region it does not live in.
                 let content_mask = window.content_mask_in_element_space();
+                if shadow_ix.is_some() {
+                    if let Some(shadow) = shadow
+                        && shadow_glyph_bounds(max_glyph_bounds, shadow).intersects(&content_mask.bounds)
+                    {
+                        paint_shadow_glyph(
+                            window,
+                            shadow,
+                            color,
+                            glyph_origin + baseline_offset + point(px(0.0), glyph.position.y),
+                            run.font_id,
+                            glyph.id,
+                            layout.font_size,
+                            glyph.is_emoji,
+                        )?;
+                    }
+                    continue;
+                }
                 let text_paint = window.text_style().vn_text_paint.clone()
                             .filter(|paint| !paint.fill.backgrounds.is_empty());
                 if (color.a > 0. || text_paint.is_some()) && max_glyph_bounds.intersects(&content_mask.bounds) {
@@ -816,6 +842,10 @@ fn paint_line(
             }
         }
 
+        if shadow_ix.is_some() {
+            return Ok(());
+        }
+
         let mut last_line_end_x = first_glyph_x + layout.width;
         if let Some(boundary) = wrap_boundaries.last() {
             let run = &layout.runs[boundary.run_ix];
@@ -850,7 +880,59 @@ fn paint_line(
         }
 
         Ok(())
-    })
+    };
+    let shadow_count = decoration_runs
+        .iter()
+        .map(|run| run.text_shadow.len())
+        .max()
+        .unwrap_or(0);
+    for shadow_ix in (0..shadow_count).rev() {
+        let bounds = decoration_runs
+            .iter()
+            .filter_map(|run| run.text_shadow.get(shadow_ix))
+            .fold(line_bounds, |bounds, shadow| {
+                bounds.union(&shadow_glyph_bounds(line_bounds, *shadow))
+            });
+        window.paint_layer(bounds, |window| paint_pass(Some(shadow_ix), window))?;
+    }
+    window.paint_layer(line_bounds, |window| paint_pass(None, window))
+}
+
+/// Where a shadow of glyphs within `bounds` can reach: three standard deviations of its blur.
+fn shadow_glyph_bounds(bounds: Bounds<Pixels>, shadow: TextShadow) -> Bounds<Pixels> {
+    let reach = shadow.blur_radius.max(px(0.)) * 1.5 + px(1.);
+    Bounds {
+        origin: bounds.origin + shadow.offset - point(reach, reach),
+        size: size(
+            bounds.size.width + reach * 2.,
+            bounds.size.height + reach * 2.,
+        ),
+    }
+}
+
+fn paint_shadow_glyph(
+    window: &mut Window,
+    shadow: TextShadow,
+    text_color: Hsla,
+    origin: Point<Pixels>,
+    font_id: crate::FontId,
+    glyph_id: crate::GlyphId,
+    font_size: Pixels,
+    is_emoji: bool,
+) -> Result<()> {
+    let color = shadow.color.unwrap_or(text_color);
+    if color.a <= 0. {
+        return Ok(());
+    }
+    window.paint_glyph_shadow(
+        origin + shadow.offset,
+        font_id,
+        glyph_id,
+        font_size,
+        is_emoji,
+        color,
+        shadow.blur_radius,
+    )
 }
 
 /// Painting backgrounds walks every glyph and opens a layer, so callers skip it when there's
@@ -1343,6 +1425,79 @@ mod tests {
     }
 
     #[test]
+    fn text_shadows_paint_under_their_glyphs_last_first_and_blurred_ones_spread() {
+        let mut context = TestAppContext::build_with_text_system(
+            crate::TestDispatcher::new(0),
+            None,
+            Arc::new(ColorGlyphTextSystem),
+        );
+        let window = context.add_window(|_, _| {
+            UnderlineHandlerTestView(Rc::new(|window, cx| {
+                let text_color = hsla(0.6, 1., 0.5, 1.);
+                let hard = TextShadow {
+                    color: Some(crate::red()),
+                    offset: point(px(3.), px(4.)),
+                    blur_radius: px(0.),
+                };
+                let soft = TextShadow {
+                    color: None,
+                    offset: point(px(-2.), px(1.)),
+                    blur_radius: px(4.),
+                };
+                let line = window.text_system().shape_line(
+                    "xy".into(),
+                    px(16.),
+                    &[TextRun {
+                        len: 2,
+                        color: text_color,
+                        text_shadow: vec![hard, soft],
+                        ..TextRun::default()
+                    }],
+                    None,
+                );
+                window.next_frame.scene.clear();
+                line.paint(point(px(20.), px(20.)), px(20.), TextAlign::Left, None, window, cx)
+                    .unwrap();
+                let scale = window.scale_factor();
+                let scene = &mut window.next_frame.scene;
+                scene.finish();
+                let sprites = &scene.monochrome_sprites;
+                assert_eq!(sprites.len(), 6, "two glyphs, each with two shadows");
+                let of = |pick: &dyn Fn(&crate::MonochromeSprite) -> bool| {
+                    let mut picked: Vec<_> = sprites.iter().filter(|s| pick(s)).copied().collect();
+                    picked.sort_by(|a, b| a.bounds.origin.x.0.total_cmp(&b.bounds.origin.x.0));
+                    assert_eq!(picked.len(), 2);
+                    picked
+                };
+                let text = of(&|s| s.color.h == text_color.h && s.raw_coverage == false.into());
+                let hard_shadows = of(&|s| s.color.h == crate::red().h);
+                let soft_shadows = of(&|s| s.raw_coverage == true.into());
+                let padding = (3. * 2. * scale).ceil();
+                for glyph in 0..2 {
+                    let (text, hard_shadow, soft_shadow) =
+                        (text[glyph], hard_shadows[glyph], soft_shadows[glyph]);
+                    assert_eq!(hard_shadow.tile.tile_id, text.tile.tile_id, "a hard shadow is the glyph itself");
+                    assert_eq!(hard_shadow.bounds.size, text.bounds.size);
+                    assert_eq!(hard_shadow.bounds.origin.x.0, text.bounds.origin.x.0 + 3. * scale);
+                    assert_eq!(hard_shadow.bounds.origin.y.0, text.bounds.origin.y.0 + 4. * scale);
+                    assert_eq!(hard_shadow.color.a, 0.5, "the shadow keeps ancestor opacity");
+                    assert_eq!(soft_shadow.color.h, text_color.h, "no color is currentColor");
+                    assert_eq!(soft_shadow.bounds.origin.x.0, text.bounds.origin.x.0 - 2. * scale - padding);
+                    assert_eq!(soft_shadow.bounds.origin.y.0, text.bounds.origin.y.0 + scale - padding);
+                    assert_eq!(soft_shadow.bounds.size.width.0, text.bounds.size.width.0 + 2. * padding);
+                    assert!(
+                        soft_shadow.order < hard_shadow.order && hard_shadow.order < text.order,
+                        "the first shadow is on top, all under the text"
+                    );
+                }
+            }))
+        });
+        context
+            .update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+
+    #[test]
     fn test_aligned_line_paint_bounds() {
         let line = make_shaped_line("abcd", &[(0, 0.), (1, 10.), (2, 20.), (3, 30.)], 40., &[]);
         let origin = point(px(10.), px(20.));
@@ -1428,6 +1583,7 @@ mod tests {
                 background_color: None,
                 underline: Some(first_style),
                 strikethrough: None,
+                text_shadow: Vec::new(),
             };
             let line = underline_test_line(
                 "aébcde",
@@ -1572,6 +1728,7 @@ mod tests {
                 background_color: None,
                 underline: Some(first_style),
                 strikethrough: None,
+                text_shadow: Vec::new(),
             };
             let line = underline_test_line(
                 "ab",
@@ -1651,6 +1808,7 @@ mod tests {
                         background_color: None,
                         underline: Some(style),
                         strikethrough: None,
+                        text_shadow: Vec::new(),
                     }],
                     zero_advance,
                     window,
@@ -1908,6 +2066,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: Vec::new(),
                 },
                 DecorationRun {
                     len: 3,
@@ -1915,6 +2074,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: Vec::new(),
                 },
                 DecorationRun {
                     len: 1,
@@ -1922,6 +2082,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    text_shadow: Vec::new(),
                 },
             ],
         );
@@ -2158,6 +2319,7 @@ mod tests {
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                text_shadow: Vec::new(),
             }],
         );
         let mut cursor = line.cursor();
@@ -2181,6 +2343,7 @@ mod tests {
                 background_color: Some(black()),
                 underline: None,
                 strikethrough: None,
+                text_shadow: Vec::new(),
             })
             .collect();
         let line = make_shaped_line(

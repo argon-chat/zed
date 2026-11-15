@@ -856,6 +856,18 @@ pub struct BoxShadow {
     pub inset: bool,
 }
 
+/// One CSS `text-shadow`, painted beneath the glyphs it is attached to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct TextShadow {
+    /// `None` is CSS `currentColor`: the color of the text it shadows.
+    pub color: Option<Hsla>,
+    /// The offset from the glyphs.
+    pub offset: Point<Pixels>,
+    /// The CSS blur radius: a Gaussian blur with a standard deviation of half of it.
+    pub blur_radius: Pixels,
+}
+
 impl BoxShadow {
     /// Creates a new [`BoxShadow`] with the given offset and color, matching the order
     /// of the CSS `box-shadow` property. Use the builder methods to set blur radius,
@@ -1115,6 +1127,9 @@ pub struct TextStyle {
 
     /// vue-native fork: CSS `hyphens`.
     pub hyphens: Hyphens,
+
+    /// vue-native fork: CSS `text-shadow`, first on top.
+    pub text_shadow: Vec<TextShadow>,
 }
 
 impl Default for TextStyle {
@@ -1142,6 +1157,7 @@ impl Default for TextStyle {
             overflow_wrap: OverflowWrap::default(),
             word_break: WordBreak::default(),
             hyphens: Hyphens::default(),
+            text_shadow: Vec::new(),
         }
     }
 }
@@ -1222,6 +1238,7 @@ impl TextStyle {
             strikethrough: self.strikethrough,
             tracking: self.letter_spacing,
             word_spacing: self.word_spacing,
+            text_shadow: self.text_shadow.clone(),
         }
     }
 }

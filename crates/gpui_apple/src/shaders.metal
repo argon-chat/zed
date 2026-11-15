@@ -783,7 +783,10 @@ fragment float4 monochrome_sprite_fragment(
   float4 color = input.color;
   // vue-native fork: the content mask's rounded corners, in screen space.
   MonochromeSprite sprite = sprites[input.sprite_id];
-  color.a *= glyph_alpha_correction(sample.a, color.rgb, gamma_params) *
+  float coverage = sprite.raw_coverage
+                       ? sample.a
+                       : glyph_alpha_correction(sample.a, color.rgb, gamma_params);
+  color.a *= coverage *
              content_mask_coverage(input.position.xy,
                                               sprite.content_mask.bounds,
                                               sprite.content_mask.corner_radii);

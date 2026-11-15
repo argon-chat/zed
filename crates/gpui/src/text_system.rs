@@ -19,7 +19,7 @@ use crate::geometry::impl_newtype_ops;
 use crate::util::impl_deref;
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, TextWrap, UnderlineStyle, px,
+    StrikethroughStyle, TextRenderingMode, TextShadow, TextWrap, UnderlineStyle, px,
 };
 use anyhow::Context as _;
 use collections::{FxHashMap, FxHashSet};
@@ -739,6 +739,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.background_color == run.background_color
+                && last_run.text_shadow == run.text_shadow
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -749,6 +750,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                text_shadow: run.text_shadow.clone(),
             });
         }
 
@@ -819,6 +821,7 @@ impl WindowTextSystem {
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
+                    && last_run.text_shadow == run.text_shadow
                 {
                     last_run.len += run_len_within_line as u32;
                     false
@@ -829,6 +832,7 @@ impl WindowTextSystem {
                         background_color: run.background_color,
                         underline: run.underline,
                         strikethrough: run.strikethrough,
+                        text_shadow: run.text_shadow.clone(),
                     });
                     true
                 };
@@ -1193,6 +1197,8 @@ pub struct TextRun {
     pub tracking: Pixels,
     /// Extra space after each word separator — CSS `word-spacing`.
     pub word_spacing: Pixels,
+    /// CSS `text-shadow`, first on top.
+    pub text_shadow: Vec<TextShadow>,
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1240,6 +1246,132 @@ impl Hash for RenderGlyphParams {
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
     }
+}
+
+/// vue-native fork: identifies a glyph's `text-shadow` coverage, blurred, in the sprite atlas.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GlyphShadowParams {
+    /// The glyph, rasterized without subpixel antialiasing.
+    pub glyph: RenderGlyphParams,
+    /// The blur's standard deviation in quarters of a device pixel.
+    pub sigma_quarters: u16,
+}
+
+/// The largest shadow blur, as a standard deviation in device pixels; a larger one is drawn at it.
+pub const MAX_GLYPH_SHADOW_SIGMA: f32 = 32.;
+
+impl GlyphShadowParams {
+    /// Quantizes a standard deviation in device pixels: finely where a step would show, by whole
+    /// pixels above, so an animated blur radius adds few atlas tiles.
+    pub fn quantize_sigma(sigma: f32) -> u16 {
+        let sigma = sigma.clamp(0., MAX_GLYPH_SHADOW_SIGMA);
+        if sigma < 4. {
+            (sigma * 4.).round() as u16
+        } else {
+            sigma.round() as u16 * 4
+        }
+    }
+
+    /// The standard deviation in device pixels.
+    pub fn sigma(&self) -> f32 {
+        f32::from(self.sigma_quarters) / 4.
+    }
+
+    /// How far the blurred coverage reaches past the glyph's raster bounds on each side.
+    pub fn padding(&self) -> i32 {
+        glyph_shadow_padding(self.sigma())
+    }
+}
+
+fn glyph_shadow_padding(sigma: f32) -> i32 {
+    (3. * sigma).ceil() as i32
+}
+
+/// vue-native fork: blurs single-channel coverage (or the alpha of 4-channel color glyphs) with a
+/// Gaussian of standard deviation `sigma` device pixels, grown by its reach on every side.
+pub fn blur_glyph_coverage(
+    size: Size<DevicePixels>,
+    pixels: &[u8],
+    sigma: f32,
+) -> (Size<DevicePixels>, Vec<u8>) {
+    let width = size.width.0.max(0) as usize;
+    let height = size.height.0.max(0) as usize;
+    let count = width * height;
+    let channels = if count > 0 && pixels.len() >= count * 4 { 4 } else { 1 };
+    let coverage = |x: usize, y: usize| -> f32 {
+        let index = (y * width + x) * channels + channels - 1;
+        f32::from(pixels.get(index).copied().unwrap_or(0))
+    };
+    let padding = glyph_shadow_padding(sigma) as usize;
+    let out_width = width + 2 * padding;
+    let out_height = height + 2 * padding;
+    let kernel = gaussian_kernel(sigma, padding);
+
+    let mut rows = vec![0f32; out_width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let value = coverage(x, y);
+            if value == 0. {
+                continue;
+            }
+            let row = &mut rows[y * out_width + x..y * out_width + x + kernel.len()];
+            for (target, weight) in row.iter_mut().zip(&kernel) {
+                *target += value * weight;
+            }
+        }
+    }
+    let mut columns = vec![0f32; out_width * out_height];
+    for y in 0..height {
+        for x in 0..out_width {
+            let value = rows[y * out_width + x];
+            if value == 0. {
+                continue;
+            }
+            for (offset, weight) in kernel.iter().enumerate() {
+                columns[(y + offset) * out_width + x] += value * weight;
+            }
+        }
+    }
+    let bytes = columns
+        .into_iter()
+        .map(|value| value.round().clamp(0., 255.) as u8)
+        .collect();
+    (
+        Size {
+            width: DevicePixels(out_width as i32),
+            height: DevicePixels(out_height as i32),
+        },
+        bytes,
+    )
+}
+
+/// Each tap is the Gaussian integrated over its pixel, so a blur below a pixel stays centred and
+/// keeps the coverage's total.
+fn gaussian_kernel(sigma: f32, radius: usize) -> Vec<f32> {
+    if sigma <= 0. || radius == 0 {
+        return vec![1.];
+    }
+    let cumulative = |x: f32| 0.5 * (1. + erf(x / (sigma * std::f32::consts::SQRT_2)));
+    let mut kernel: Vec<f32> = (0..=2 * radius)
+        .map(|tap| {
+            let center = tap as f32 - radius as f32;
+            cumulative(center + 0.5) - cumulative(center - 0.5)
+        })
+        .collect();
+    let total: f32 = kernel.iter().sum();
+    for weight in &mut kernel {
+        *weight /= total;
+    }
+    kernel
+}
+
+/// Abramowitz and Stegun 7.1.26, within 1.5e-7.
+fn erf(x: f32) -> f32 {
+    let t = 1. / (1. + 0.327_591_1 * x.abs());
+    let polynomial = t
+        * (0.254_829_6
+            + t * (-0.284_496_74 + t * (1.421_413_7 + t * (-1.453_152_1 + t * 1.061_405_4))));
+    (1. - polynomial * (-x * x).exp()).copysign(x)
 }
 
 /// The configuration details for identifying a specific font.
@@ -1425,6 +1557,58 @@ mod font_resolution_tests {
 
         text_system.fallback_font_stack.clear();
         assert_eq!(text_system.resolve_font(&requested), FontId(42));
+    }
+}
+
+#[cfg(test)]
+mod glyph_shadow_tests {
+    use super::*;
+
+    fn gaussian_square(x: f32, y: f32, side: f32, sigma: f32) -> f32 {
+        let cumulative = |t: f32| 0.5 * (1. + erf(t / (sigma * std::f32::consts::SQRT_2)));
+        let axis = |t: f32| cumulative(t + 0.5) - cumulative(t + 0.5 - side);
+        axis(x) * axis(y)
+    }
+
+    #[test]
+    fn blurred_coverage_is_the_gaussian_of_the_glyph_centred_on_it() {
+        let side = 6;
+        let sigma = 2.5;
+        let size = Size {
+            width: DevicePixels(side),
+            height: DevicePixels(side),
+        };
+        let (blurred_size, blurred) = blur_glyph_coverage(size, &vec![255; 36], sigma);
+        let padding = glyph_shadow_padding(sigma);
+        assert_eq!(blurred_size.width.0, side + 2 * padding);
+        assert_eq!(blurred_size.height.0, side + 2 * padding);
+        let width = blurred_size.width.0 as usize;
+        for y in 0..blurred_size.height.0 {
+            for x in 0..blurred_size.width.0 {
+                let actual = f32::from(blurred[y as usize * width + x as usize]);
+                let expected = 255.
+                    * gaussian_square(
+                        (x - padding) as f32,
+                        (y - padding) as f32,
+                        side as f32,
+                        sigma,
+                    );
+                assert!(
+                    (actual - expected).abs() <= 1.5,
+                    "({x}, {y}): {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn color_glyphs_cast_the_shadow_of_their_alpha() {
+        let size = Size {
+            width: DevicePixels(2),
+            height: DevicePixels(1),
+        };
+        let (_, shadow) = blur_glyph_coverage(size, &[255, 255, 255, 64, 0, 0, 0, 255], 0.);
+        assert_eq!(shadow, vec![64, 255]);
     }
 }
 

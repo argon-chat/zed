@@ -148,7 +148,7 @@ impl PlatformAtlas for Atlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
         let name = match &key {
-            AtlasKey::Glyph(_) => "D3D12 build glyph tile",
+            AtlasKey::Glyph(_) | AtlasKey::GlyphShadow(_) => "D3D12 build glyph tile",
             AtlasKey::Svg(_) => "D3D12 build SVG tile",
             AtlasKey::Image(_) => "D3D12 build image tile",
         };

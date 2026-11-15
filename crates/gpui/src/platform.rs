@@ -39,7 +39,8 @@ pub(crate) type PlatformScreenCaptureFrame =
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds, Corners,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
+    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GlyphShadowParams, GpuSpecs, Hsla,
+    ImageSource, Keymap,
     LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
     ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
@@ -1845,6 +1846,7 @@ pub fn get_gamma_correction_ratios(gamma: f32) -> [f32; 4] {
 #[expect(missing_docs)]
 pub enum AtlasKey {
     Glyph(RenderGlyphParams),
+    GlyphShadow(GlyphShadowParams),
     Svg(RenderSvgParams),
     Image(RenderImageParams),
 }
@@ -1862,7 +1864,7 @@ impl AtlasKey {
                     AtlasTextureKind::Monochrome
                 }
             }
-            AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
+            AtlasKey::GlyphShadow(_) | AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
         }
     }

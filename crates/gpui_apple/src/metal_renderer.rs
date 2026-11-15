@@ -2172,7 +2172,7 @@ mod tests {
             });
             scene.insert_primitive(MonochromeSprite {
                 order: 0,
-                pad: 0,
+                raw_coverage: false.into(),
                 tile,
                 bounds,
                 content_mask: ContentMask::rect(bounds),
@@ -2193,6 +2193,70 @@ mod tests {
             black_on_white.abs_diff(137) <= 3,
             "black on white: {black_on_white}"
         );
+        Ok(())
+    }
+
+    /// gpui_wgpu's `a_blurred_text_shadow_composites_its_coverage_unaltered`.
+    #[test]
+    fn a_blurred_text_shadow_composites_its_coverage_unaltered() -> Result<()> {
+        use gpui::{AtlasKey, MonochromeSprite, PlatformAtlas as _, Quad, RenderSvgParams, rgb};
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        renderer.sprite_gamma = SpriteGammaParams {
+            gamma_ratios: gpui::get_gamma_correction_ratios(1.8),
+            grayscale_enhanced_contrast: 1.0,
+            _pad: [0.0; 3],
+        };
+        let glyph = size(DevicePixels(6), DevicePixels(6));
+        let (tile_size, coverage) = gpui::blur_glyph_coverage(glyph, &[255; 36], 2.5);
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "text-shadow-coverage".into(),
+                    size: tile_size,
+                }),
+                &mut || Ok(Some((tile_size, std::borrow::Cow::Borrowed(coverage.as_slice())))),
+            )?
+            .context("shadow tile was not allocated")?;
+        let frame = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(32.0), ScaledPixels(32.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: frame,
+            background: rgb(0xffffff).into(),
+            content_mask: ContentMask::rect(frame),
+            ..Default::default()
+        });
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            raw_coverage: true.into(),
+            tile,
+            bounds: Bounds::new(
+                point(ScaledPixels(5.0), ScaledPixels(5.0)),
+                tile_size.map(|side| ScaledPixels(side.0 as f32)),
+            ),
+            content_mask: ContentMask::rect(frame),
+            color: rgb(0x000000).into(),
+            transformation: gpui::TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image =
+            renderer.render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(32)))?;
+        let width = tile_size.width.0 as u32;
+        for y in 0..tile_size.height.0 as u32 {
+            for x in 0..width {
+                let expected = 255 - coverage[(y * width + x) as usize];
+                let actual = image.get_pixel(x + 5, y + 5).0;
+                assert!(
+                    actual[..3]
+                        .iter()
+                        .all(|channel| channel.abs_diff(expected) <= 2),
+                    "({x}, {y}): {actual:?}, expected {expected}"
+                );
+            }
+        }
         Ok(())
     }
 

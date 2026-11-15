@@ -14,7 +14,7 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    GpuTextureHandle,
+    GlyphShadowParams, GpuTextureHandle,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
@@ -27,7 +27,8 @@ use crate::{
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TileSource, TileWrite,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    WindowTextSystem, WindowVisibility, blur_glyph_coverage, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -6728,7 +6729,7 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    pad: 0,
+                    raw_coverage: false.into(),
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),
@@ -6737,6 +6738,99 @@ impl Window {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// vue-native fork: paints a glyph's CSS `text-shadow`, its coverage in `color` blurred by
+    /// `blur_radius`. `origin` is the shadow's baseline origin, offset included.
+    pub fn paint_glyph_shadow(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        is_emoji: bool,
+        color: Hsla,
+        blur_radius: Pixels,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        if blur_radius <= px(0.) && !is_emoji {
+            return self.paint_glyph(origin, font_id, glyph_id, font_size, color);
+        }
+
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let (integer_origin, subpixel_variant) = if is_emoji {
+            (
+                glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0))),
+                Point::default(),
+            )
+        } else {
+            let quantized_origin = Point::new(
+                round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                    / SUBPIXEL_VARIANTS_X as f32,
+                round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                    / SUBPIXEL_VARIANTS_Y as f32,
+            );
+            (
+                quantized_origin.map(|c| ScaledPixels(c.trunc())),
+                Point::new(
+                    (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+                    (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+                ),
+            )
+        };
+        let glyph = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji,
+            subpixel_rendering: false,
+            dilation: if is_emoji {
+                0
+            } else {
+                self.text_system().glyph_dilation_for_color(color)
+            },
+        };
+        let raster_bounds = self.text_system().raster_bounds(&glyph)?;
+        if raster_bounds.is_zero() {
+            return Ok(());
+        }
+        let params = GlyphShadowParams {
+            sigma_quarters: GlyphShadowParams::quantize_sigma(blur_radius.0 / 2. * scale_factor),
+            glyph,
+        };
+        let padding = params.padding();
+        let sigma = params.sigma();
+        let Some(tile) = self.sprite_atlas.get_or_insert_with(
+            AtlasKey::GlyphShadow(params.clone()),
+            &mut || {
+                let (size, coverage) = self.text_system().rasterize_glyph(&params.glyph)?;
+                let (size, blurred) = blur_glyph_coverage(size, &coverage, sigma);
+                Ok(Some((size, Cow::Owned(blurred))))
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        let bounds = Bounds {
+            origin: integer_origin
+                + raster_bounds.origin.map(Into::into)
+                - point(ScaledPixels(padding as f32), ScaledPixels(padding as f32)),
+            size: tile.bounds.size.map(Into::into),
+        };
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            raw_coverage: true.into(),
+            bounds,
+            content_mask,
+            color: color.opacity(self.element_opacity()),
+            tile,
+            transformation: self.element_transform,
+        });
         Ok(())
     }
 
@@ -6885,7 +6979,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            raw_coverage: false.into(),
             bounds: final_bounds,
             content_mask,
             color: color.opacity(element_opacity),

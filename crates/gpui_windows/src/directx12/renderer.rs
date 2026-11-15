@@ -2639,6 +2639,47 @@ mod tests {
         );
     }
 
+    /// gpui_wgpu's `a_blurred_text_shadow_composites_its_coverage_unaltered`.
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_blurred_text_shadow_composites_its_coverage_unaltered() -> Result<()> {
+        let mut renderer = offscreen(32, 32)?;
+        let content_mask = mask(32., 32.);
+        let glyph = size(DevicePixels(6), DevicePixels(6));
+        let (tile_size, coverage) = gpui::blur_glyph_coverage(glyph, &[255; 36], 2.5);
+        let key = AtlasKey::Svg(RenderSvgParams {
+            path: "native-text-shadow-coverage".into(),
+            size: tile_size,
+        });
+        let tile = renderer
+            .atlas
+            .write_bytes(&key, tile_size, &coverage)?
+            .context("shadow tile was not allocated")?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 32., 32.), rgb(0xffffff), content_mask));
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            raw_coverage: true.into(),
+            tile,
+            bounds: bounds(5., 5., tile_size.width.0 as f32, tile_size.height.0 as f32),
+            content_mask,
+            color: rgb(0x000000).into(),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        let width = tile_size.width.0 as u32;
+        for y in 0..tile_size.height.0 as u32 {
+            for x in 0..width {
+                let expected = 255 - coverage[(y * width + x) as usize];
+                for channel in &image.get_pixel(x + 5, y + 5).0[..3] {
+                    close_channel(*channel, expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[::core::prelude::v1::test]
     #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
     fn native_quads_preserve_premultiplied_alpha_and_paths_resolve_antialiasing() -> Result<()> {
@@ -2761,7 +2802,7 @@ mod tests {
         });
         scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            raw_coverage: false.into(),
             tile,
             bounds: bounds(0., 0., 64., 64.),
             content_mask,

@@ -2394,7 +2394,8 @@ mod vn_axis_aligned_tests {
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
     pub order: DrawOrder,
-    pub pad: u32,
+    /// Skips the glyph contrast and gamma correction: the tile is linear coverage (a blurred shadow).
+    pub raw_coverage: PaddedBool32,
     pub tile: AtlasTile,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,

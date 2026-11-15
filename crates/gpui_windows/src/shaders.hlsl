@@ -1561,7 +1561,7 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 
 struct MonochromeSprite {
     uint order;
-    uint pad;
+    uint raw_coverage;
     AtlasTile tile;
     Bounds bounds;
     Bounds content_mask;
@@ -1579,6 +1579,7 @@ struct MonochromeSpriteVertexOutput {
     nointerpolation float4 color: COLOR;
     nointerpolation float4 mask_bounds: TEXCOORD1;
     nointerpolation float4 mask_radii: TEXCOORD2;
+    nointerpolation uint raw_coverage: TEXCOORD3;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1588,6 +1589,7 @@ struct MonochromeSpriteFragmentInput {
     nointerpolation float4 color: COLOR;
     nointerpolation float4 mask_bounds: TEXCOORD1;
     nointerpolation float4 mask_radii: TEXCOORD2;
+    nointerpolation uint raw_coverage: TEXCOORD3;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1623,13 +1625,16 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.mask_bounds = float4(sprite.content_mask.origin, sprite.content_mask.size);
     output.mask_radii = float4(sprite.content_mask_radii.top_left, sprite.content_mask_radii.top_right,
                                sprite.content_mask_radii.bottom_right, sprite.content_mask_radii.bottom_left);
+    output.raw_coverage = sprite.raw_coverage;
     output.clip_distance = clip_distance;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+    float alpha_corrected = input.raw_coverage != 0u
+        ? sample
+        : apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
     float mask = sprite_mask_coverage(input.position.xy, input.mask_bounds, input.mask_radii);
     return float4(input.color.rgb, input.color.a * alpha_corrected * mask);
 }

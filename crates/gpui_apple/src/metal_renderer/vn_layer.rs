@@ -551,7 +551,7 @@ mod tests {
         });
         scene.insert_primitive(MonochromeSprite {
             order: 0,
-            pad: 0,
+            raw_coverage: false.into(),
             tile,
             bounds: bounds(0., 0., SIDE, SIDE),
             content_mask: mask(),
