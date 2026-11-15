@@ -924,16 +924,17 @@ fn read_clock(clock: libc::clockid_t) -> Option<Duration> {
 
 #[cfg(target_os = "windows")]
 fn system_suspended_time() -> Option<Duration> {
-    use windows::Win32::System::WindowsProgramming::{
+    use windows_sys::Win32::System::WindowsProgramming::{
         QueryInterruptTime, QueryUnbiasedInterruptTime,
     };
     let mut awake = 0;
     // SAFETY: `awake` is a valid, writable u64.
-    if !unsafe { QueryUnbiasedInterruptTime(&mut awake) }.as_bool() {
+    if unsafe { QueryUnbiasedInterruptTime(&mut awake) } == 0 {
         return None;
     }
-    // SAFETY: no preconditions.
-    let total = unsafe { QueryInterruptTime() };
+    let mut total = 0;
+    // SAFETY: `total` is a valid, writable u64.
+    unsafe { QueryInterruptTime(&mut total) };
     // Both count 100 ns units; unbiased interrupt time excludes sleep and
     // hibernation:
     // https://learn.microsoft.com/en-us/windows/win32/sysinfo/interrupt-time

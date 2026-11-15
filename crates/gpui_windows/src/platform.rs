@@ -1523,14 +1523,14 @@ struct PlatformWindowCreateContext {
 fn has_package_identity() -> bool {
     let mut package_full_name_length = 0;
     let result = unsafe {
-        windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName(
+        windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName(
             &mut package_full_name_length,
-            None,
+            std::ptr::null_mut(),
         )
     };
-    if result == ERROR_INSUFFICIENT_BUFFER {
+    if result == ERROR_INSUFFICIENT_BUFFER.0 {
         true
-    } else if result == APPMODEL_ERROR_NO_PACKAGE {
+    } else if result == APPMODEL_ERROR_NO_PACKAGE.0 {
         false
     } else {
         log::warn!("failed to determine whether the process has package identity: {result:?}");

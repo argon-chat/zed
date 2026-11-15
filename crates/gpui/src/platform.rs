@@ -264,13 +264,13 @@ impl GraphicalEnvironment {
         let mut session_id = 0;
         // SAFETY: `session_id` is a valid pointer for the call's duration.
         let result = unsafe {
-            windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
-                windows::Win32::System::Threading::GetCurrentProcessId(),
+            windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                windows_sys::Win32::System::Threading::GetCurrentProcessId(),
                 &mut session_id,
             )
         };
         Self {
-            session_id: result.is_ok().then_some(session_id),
+            session_id: (result != 0).then_some(session_id),
         }
     }
 
@@ -1421,9 +1421,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
     fn restore_native_window_state(&self, _state: &[u8]) {}
-
-    #[cfg(target_os = "windows")]
-    fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
 
     /// vue-native: Windows' composition device and the container visual drawn
     /// UNDER the app's surface, as owned `IDCompositionDevice` /

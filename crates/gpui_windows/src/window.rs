@@ -617,6 +617,10 @@ impl WindowsWindow {
 
         Ok(Self(this))
     }
+
+    pub(crate) fn get_raw_handle(&self) -> HWND {
+        self.0.hwnd
+    }
 }
 
 impl rwh::HasWindowHandle for WindowsWindow {
@@ -1194,10 +1198,6 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().sprite_atlas()
     }
 
-    fn get_raw_handle(&self) -> HWND {
-        self.0.hwnd
-    }
-
     #[cfg(feature = "native-dx12")]
     fn vn_composition_underlay(&self) -> Option<(usize, usize)> {
         self.state.renderer.borrow().vn_composition_underlay()
@@ -1772,11 +1772,13 @@ fn retrieve_window_placement(
 /// Windows 11 22H2, build 22621.
 fn has_system_backdrop() -> bool {
     static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HAS.get_or_init(|| {
-        let mut version = unsafe { std::mem::zeroed() };
-        let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
-        status.is_ok() && version.dwBuildNumber >= 22621
-    })
+    *HAS.get_or_init(|| windows_build().is_some_and(|build| build >= 22621))
+}
+
+fn windows_build() -> Option<u32> {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows_sys::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    (status >= 0).then_some(version.dwBuildNumber)
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
@@ -1801,10 +1803,7 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
 }
 
 fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
-    let mut version = unsafe { std::mem::zeroed() };
-    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
-
-    if !status.is_ok() || version.dwBuildNumber < 17763 {
+    if windows_build().is_none_or(|build| build < 17763) {
         return;
     }
 

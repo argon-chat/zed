@@ -7440,7 +7440,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "web-time",
- "windows 0.62.2",
+ "windows-sys 0.61.2",
  "zed-scap",
 ]
 
@@ -7727,6 +7727,7 @@ dependencies = [
  "windows-core 0.62.2",
  "windows-numerics 0.3.1",
  "windows-registry 0.6.1",
+ "windows-sys 0.61.2",
  "zed-scap",
 ]
 
