@@ -164,14 +164,16 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
-// Convert linear RGB to sRGB
+// The exact sRGB curves, as browsers and gpui_wgpu use for Oklab gradients.
+// Oklab can hand back slightly negative channels; abs() keeps pow() off NaN
+// on the branch lerp() discards.
 float3 linear_to_srgb(float3 color) {
-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    return lerp(color * 12.92, 1.055 * pow(abs(color), 1.0 / 2.4) - 0.055,
+        step(0.0031308, color));
 }
 
-// Convert sRGB to linear RGB
 float3 srgb_to_linear(float3 color) {
-    return pow(color, float3(2.2, 2.2, 2.2));
+    return lerp(color / 12.92, pow((color + 0.055) / 1.055, 2.4), step(0.04045, color));
 }
 
 /// Hsla to linear RGBA conversion.

@@ -1112,12 +1112,15 @@ float4 hsla_to_rgba(Hsla hsla) {
   return rgba;
 }
 
+// The exact sRGB curves, as browsers and gpui_wgpu use for Oklab gradients.
 float3 srgb_to_linear(float3 color) {
-  return pow(color, float3(2.2));
+  return select(pow((color + 0.055) / 1.055, float3(2.4)), color / 12.92,
+                color < 0.04045);
 }
 
 float3 linear_to_srgb(float3 color) {
-  return pow(color, float3(1.0 / 2.2));
+  return select(1.055 * pow(abs(color), float3(1.0 / 2.4)) - 0.055,
+                color * 12.92, color < 0.0031308);
 }
 
 // Converts a sRGB color to the Oklab color space.
@@ -1872,7 +1875,7 @@ float vn_clip_coverage(float2 p, constant float4 *segments, uint start,
 }
 
 // The exact sRGB curves, as DirectX and wgpu apply a color matrix in
-// linearRGB; `srgb_to_linear` above is a 2.2 power.
+// linearRGB.
 float3 vn_srgb_to_linear(float3 c) {
   return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c < 0.04045);
 }
