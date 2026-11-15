@@ -96,8 +96,7 @@ struct EffectQuad {
     Bounds content_mask;
     Corners content_mask_radii;
     Corners corner_radii;
-    float4 params0;
-    float4 params1;
+    float params[32];
     float opacity;
     float time;
     float bleed;

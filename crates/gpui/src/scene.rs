@@ -1606,14 +1606,19 @@ impl TransformSpec {
     }
 }
 
+/// How many floats an effect's parameter block holds ([`EffectSpec::params`],
+/// [`EffectQuad::params`]).
+pub const EFFECT_PARAM_SLOTS: usize = 32;
+
 /// The `--shading` value that came out of the cascade, carried on
 /// [`crate::Style`] and painted by [`crate::Style::paint`].
 ///
-/// The eight `params` are the effect's positional CSS arguments, already
-/// converted to floats (a colour occupies four consecutive slots). Everything
-/// else is schema metadata the *painter* needs and gpui must not have to look
-/// up: which params are lengths (so they scale with the device factor), which
-/// one drives the backdrop blur, and which one dilates the quad.
+/// The `params` are the effect's positional CSS arguments, already
+/// converted to floats (a colour occupies four consecutive slots), plus the
+/// slots the host fills at paint time. Everything else is schema metadata the
+/// *painter* needs and gpui must not have to look up: which params are lengths
+/// (so they scale with the device factor), which one drives the backdrop blur,
+/// which one dilates the quad, and which ones the host writes.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct EffectSpec {
@@ -1633,8 +1638,19 @@ pub struct EffectSpec {
     /// Whether this effect's output depends on `time`, i.e. whether the window
     /// must keep repainting for it to animate.
     pub animated: bool,
+    /// `Some(i)`: the painter writes the pointer's position in the element's
+    /// 0..1 box units into `params[i..i + 2]`.
+    pub pointer_param: Option<u8>,
+    /// `Some(i)`: the painter writes the pointer's last move, entry into the
+    /// window and exit from it, on the effect clock, into `params[i..i + 3]`.
+    pub pointer_times_param: Option<u8>,
+    /// Bit *i* set means `params[i]` is a time on the effect clock; the
+    /// element keeps repainting until `clock_window` seconds after the latest.
+    pub clock_mask: u32,
+    /// Seconds an effect keeps repainting after the times in `clock_mask`.
+    pub clock_window: f32,
     /// The positional parameters, in schema order.
-    pub params: [f32; 8],
+    pub params: [f32; EFFECT_PARAM_SLOTS],
 }
 
 impl EffectSpec {
@@ -1647,12 +1663,35 @@ impl EffectSpec {
         backdrop_radius_param: None,
         bleed_param: None,
         animated: false,
-        params: [0.; 8],
+        pointer_param: None,
+        pointer_times_param: None,
+        clock_mask: 0,
+        clock_window: 0.,
+        params: [0.; EFFECT_PARAM_SLOTS],
     };
 
     /// Whether this spec actually paints anything.
     pub fn is_some(&self) -> bool {
         self.id != effect_id::NONE
+    }
+
+    /// Whether the painter fills a pointer parameter, so the element repaints
+    /// when the pointer moves.
+    pub fn follows_pointer(&self) -> bool {
+        self.pointer_param.is_some() || self.pointer_times_param.is_some()
+    }
+
+    /// Whether `now` (effect-clock seconds) is within `clock_window` of the
+    /// latest time in a `clock_mask` slot.
+    pub fn clock_running(&self, now: f32) -> bool {
+        if self.clock_mask == 0 {
+            return false;
+        }
+        self.params
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| self.clock_mask & (1 << slot) != 0)
+            .any(|(_, start)| now < start + self.clock_window)
     }
 
     fn param(&self, index: Option<u8>) -> f32 {
@@ -1673,6 +1712,17 @@ impl EffectSpec {
     }
 }
 
+/// A `--shading` transition between two different effects: `from` paints at
+/// `1 - progress` beneath the style's own effect at `progress`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct EffectCrossFade {
+    /// The effect being faded out.
+    pub from: EffectSpec,
+    /// 0 shows only `from`, 1 only the style's effect.
+    pub progress: f32,
+}
+
 /// A rounded rect shaded by a custom fragment pipeline — the primitive behind
 /// the `--shading` CSS property.
 ///
@@ -1690,8 +1740,7 @@ impl EffectSpec {
 /// Keep the field order in sync with `struct EffectQuad` in
 /// `gpui_windows/src/effects.hlsl` and with `struct VnEffectQuad` in the
 /// generated wrapper (`scripts/shaders.ts`).
-/// 32 words / 128 bytes. (vue-native fork: the content mask's corner radii
-/// took the four words of padding that closed it.)
+/// 56 words / 224 bytes.
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1704,12 +1753,11 @@ pub struct EffectQuad {
     pub content_mask: ContentMask<ScaledPixels>,
     /// The element's corner radii, dilated by `bleed`.
     pub corner_radii: Corners<ScaledPixels>,
-    /// Effect parameters 0..3.
-    pub params0: [f32; 4],
-    /// Effect parameters 4..7.
-    pub params1: [f32; 4],
+    /// The effect's parameter block, [`EFFECT_PARAM_SLOTS`] long (a literal for
+    /// the Metal header cbindgen writes).
+    pub params: [f32; 32],
     pub opacity: f32,
-    /// Seconds since the process started.
+    /// Seconds on [`effect_clock_seconds`].
     pub time: f32,
     /// How far outside the element's border box this quad reaches.
     pub bleed: ScaledPixels,
@@ -1722,6 +1770,13 @@ pub struct EffectQuad {
 }
 
 impl EffectQuad {
+    /// A parameter block holding `head` in its first slots and zeros after.
+    pub fn params_from(head: &[f32]) -> [f32; EFFECT_PARAM_SLOTS] {
+        let mut params = [0.; EFFECT_PARAM_SLOTS];
+        params[..head.len()].copy_from_slice(head);
+        params
+    }
+
     /// Whether this quad reads the render-target snapshot, which decides both
     /// its draw ordering and whether the renderer has to break the pass.
     pub fn needs_backdrop(&self) -> bool {
@@ -1750,7 +1805,8 @@ impl From<EffectQuad> for Primitive {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<EffectQuad>() == 128);
+const _: () = assert!(std::mem::size_of::<EffectQuad>() == 224);
+const _: () = assert!(EFFECT_PARAM_SLOTS == 32);
 
 // The four primitives that carry a CSS `transform`. Their Rust layout IS the
 // shader layout on every backend — the DirectX renderer uses
@@ -1775,19 +1831,26 @@ const _: () = assert!(std::mem::size_of::<Underline>() == 26 * 4);
 const _: () = assert!(std::mem::size_of::<PolychromeSprite>() == 38 * 4);
 const _: () = assert!(std::mem::size_of::<TransformationMatrix>() == 6 * 4);
 
-/// Seconds since the first effect was painted — the clock [`EffectQuad::time`]
-/// carries.
+static EFFECT_CLOCK_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Seconds since the effect clock's origin — the clock [`EffectQuad::time`]
+/// carries. The origin is [`set_effect_clock_origin`]'s, or the first read.
 ///
 /// Deliberately process-wide and monotonic rather than per-window: an f32 has
 /// ~7 significant digits, so anchoring at zero keeps sub-millisecond precision
 /// for the first couple of hours instead of quantising to ~64 ms the way a
 /// UNIX-epoch value would.
 pub fn effect_clock_seconds() -> f32 {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH
+    EFFECT_CLOCK_ORIGIN
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_secs_f32()
+}
+
+/// Anchors the effect clock, so an embedder can make it share a zero with its
+/// own (a JS `performance.now()`). Returns `false` once the clock has been read.
+pub fn set_effect_clock_origin(origin: std::time::Instant) -> bool {
+    EFFECT_CLOCK_ORIGIN.set(origin).is_ok()
 }
 
 #[derive(Debug, Copy, Clone)]

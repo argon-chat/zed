@@ -1558,6 +1558,55 @@ enum InputModality {
     Touch,
 }
 
+/// vue-native fork: what an effect's host-filled pointer parameters read, and
+/// the views whose effects read them.
+struct VnEffectPointer {
+    /// Effect-clock seconds of the last move, entry and exit; the pointer is
+    /// inside while `entered > left`.
+    moved: f32,
+    entered: f32,
+    left: f32,
+    /// Notified on the next pointer change, and re-registered when they paint.
+    views: FxHashSet<EntityId>,
+}
+
+impl VnEffectPointer {
+    /// Long enough ago for any fade an effect keys off these times to be over.
+    const NEVER: f32 = -1.0e4;
+
+    fn new(inside: bool) -> Self {
+        let (entered, left) = if inside {
+            (Self::NEVER, Self::NEVER - 1.)
+        } else {
+            (Self::NEVER - 1., Self::NEVER)
+        };
+        Self {
+            moved: Self::NEVER,
+            entered,
+            left,
+            views: FxHashSet::default(),
+        }
+    }
+
+    fn update(&mut self, was_inside: bool, inside: bool, moved: bool, cx: &mut App) {
+        if was_inside == inside && !moved {
+            return;
+        }
+        let now = crate::effect_clock_seconds();
+        if moved {
+            self.moved = now;
+        }
+        if inside && !was_inside {
+            self.entered = now;
+        } else if was_inside && !inside {
+            self.left = now;
+        }
+        for view in self.views.drain() {
+            cx.notify(view);
+        }
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1677,6 +1726,7 @@ pub struct Window {
     /// `MouseExited`, a file drag leaving, and the platform's hover-status
     /// change to false clear it. It starts as the platform's `is_hovered()`.
     pointer_inside: bool,
+    vn_effect_pointer: VnEffectPointer,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -2653,9 +2703,12 @@ impl Window {
             let mut cx = cx.to_async();
             move |active| {
                 handle
-                    .update(&mut cx, |_, window, _| {
+                    .update(&mut cx, |_, window, cx| {
                         window.hovered.set(active);
-                        window.pointer_inside = active;
+                        let was_inside = std::mem::replace(&mut window.pointer_inside, active);
+                        window
+                            .vn_effect_pointer
+                            .update(was_inside, active, false, cx);
                         window.refresh();
                     })
                     .with_context(|| {
@@ -2839,6 +2892,7 @@ impl Window {
             assume_active: false,
             visibility,
             visibility_observers: SingleSubscriberSet::new(),
+            vn_effect_pointer: VnEffectPointer::new(hovered.get()),
             pointer_inside: hovered.get(),
             hovered,
             needs_present,
@@ -6279,11 +6333,6 @@ impl Window {
             }
         }
 
-        if spec.animated {
-            // Nothing else in the frame is going to ask for the next one.
-            self.request_animation_frame();
-        }
-
         // vue-native fork: as for the backdrop blur — no `transformation`
         // field, so the element transform is folded into the rect, and a
         // rotated effect is not drawn rather than drawn unrotated elsewhere.
@@ -6293,17 +6342,47 @@ impl Window {
         ) else {
             return;
         };
+        let bleed = bleed.scale(scale_factor);
+        let now = crate::effect_clock_seconds();
+
+        if let Some(slot) = spec.pointer_param.map(usize::from)
+            && slot + 2 <= params.len()
+        {
+            // The element box as the shader recovers it from the drawn quad.
+            let origin = draw_bounds.origin.map(|c| c.0 + bleed.0);
+            let size = draw_bounds.size.map(|c| (c.0 - 2. * bleed.0).max(1.));
+            let pointer = self.mouse_position.map(|c| c.0 * scale_factor);
+            params[slot] = (pointer.x - origin.x) / size.width;
+            params[slot + 1] = (pointer.y - origin.y) / size.height;
+        }
+        if let Some(slot) = spec.pointer_times_param.map(usize::from)
+            && slot + 3 <= params.len()
+        {
+            let times = &self.vn_effect_pointer;
+            params[slot..slot + 3].copy_from_slice(&[times.moved, times.entered, times.left]);
+        }
+        if spec.follows_pointer() {
+            let view = self.current_view();
+            self.vn_effect_pointer.views.insert(view);
+        }
+
+        let mut clocked = spec;
+        clocked.params = params;
+        if spec.animated || clocked.clock_running(now) {
+            // Nothing else in the frame is going to ask for the next one.
+            self.request_animation_frame();
+        }
+
         self.next_frame.scene.insert_primitive(EffectQuad {
             order: 0,
             effect_id: spec.id,
             bounds: draw_bounds,
             content_mask: self.snapped_content_mask(),
             corner_radii: draw_radii.scale(scale_factor * k),
-            params0: [params[0], params[1], params[2], params[3]],
-            params1: [params[4], params[5], params[6], params[7]],
+            params,
             opacity,
-            time: crate::effect_clock_seconds(),
-            bleed: bleed.scale(scale_factor),
+            time: now,
+            bleed,
             backdrop_blur_radius: px(spec.backdrop_blur_radius()).scale(scale_factor),
             scale: scale_factor,
             flags: spec.flags,
@@ -6338,8 +6417,7 @@ impl Window {
             bounds: draw_bounds,
             content_mask: self.snapped_content_mask(),
             corner_radii: corner_radii.scale(scale_factor * k),
-            params0: [0.; 4],
-            params1: [0.; 4],
+            params: [0.; crate::EFFECT_PARAM_SLOTS],
             opacity,
             time: 0.,
             bleed: ScaledPixels(0.),
@@ -7789,6 +7867,8 @@ impl Window {
         if self.last_input_modality != old_modality {
             self.refresh();
         }
+        let was_inside = self.pointer_inside;
+        let pointer_moved = matches!(event, PlatformInput::MouseMove(_));
         // vue-native fork: [`Window::pointer_inside`]. Exhaustive on purpose,
         // so a new kind of input has to say which side it is on. A leave
         // applies AFTER the event is dispatched, so the listeners that handle
@@ -7965,6 +8045,8 @@ impl Window {
         if pointer_leaves && std::mem::replace(&mut self.pointer_inside, false) {
             self.refresh();
         }
+        self.vn_effect_pointer
+            .update(was_inside, self.pointer_inside, pointer_moved, cx);
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
@@ -13131,6 +13213,68 @@ mod vn_pointer_inside_tests {
         }));
         draw(cx);
         assert!(!hovered.get(), "MouseExited");
+    }
+
+    struct Shaded {
+        effect: bool,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Shaded {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let mut element = div().size_full();
+            if self.effect {
+                let mut spec = crate::EffectSpec::NONE;
+                spec.id = 0;
+                spec.pointer_param = Some(4);
+                element.style().vn_effect = Some(spec);
+            }
+            element
+        }
+    }
+
+    #[gpui::test]
+    fn only_a_pointer_effect_repaints_when_the_pointer_moves(cx: &mut TestAppContext) {
+        let open = |cx: &mut TestAppContext, effect: bool| {
+            let renders = Rc::new(Cell::new(0));
+            let counted = renders.clone();
+            let window = cx.open_window(size(px(200.), px(100.)), move |_, _| Shaded {
+                effect,
+                renders: counted,
+            });
+            cx.run_until_parked();
+            (window, cx.test_window(window.into()), renders)
+        };
+        let moved = |x: f32, y: f32| {
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: point(px(x), px(y)),
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            })
+        };
+
+        let (_, mut platform, renders) = open(cx, false);
+        platform.simulate_input(moved(10., 10.));
+        cx.run_until_parked();
+        let before = renders.get();
+        platform.simulate_input(moved(20., 20.));
+        cx.run_until_parked();
+        assert_eq!(renders.get(), before, "no pointer effect, no repaint");
+
+        let (shaded, mut platform, renders) = open(cx, true);
+        platform.simulate_input(moved(10., 10.));
+        cx.run_until_parked();
+        let before = renders.get();
+        platform.simulate_input(moved(150., 25.));
+        cx.run_until_parked();
+        assert!(renders.get() > before, "a pointer effect repaints");
+        let params = shaded
+            .update(cx, |_, window, _| {
+                window.rendered_frame.scene.effect_quads[0].params
+            })
+            .unwrap();
+        assert!((params[4] - 0.75).abs() < 1e-4 && (params[5] - 0.25).abs() < 1e-4);
     }
 }
 

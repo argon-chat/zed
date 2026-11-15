@@ -29,8 +29,7 @@ struct EffectCorners {
     bottom_left: f32,
 }
 
-// 32 words / 128 bytes, `gpui::EffectQuad`. The parameter banks are arrays
-// because a `vec4` would be 16-byte aligned and land at offset 80.
+// 56 words / 224 bytes, `gpui::EffectQuad`.
 struct EffectQuad {
     order: u32,
     effect_id: u32,
@@ -38,8 +37,7 @@ struct EffectQuad {
     content_mask: EffectBounds,
     content_mask_radii: EffectCorners,
     corner_radii: EffectCorners,
-    params0: array<f32, 4>,
-    params1: array<f32, 4>,
+    params: array<f32, 32>,
     opacity: f32,
     time: f32,
     bleed: f32,

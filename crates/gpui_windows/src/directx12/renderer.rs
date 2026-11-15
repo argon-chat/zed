@@ -2596,8 +2596,7 @@ mod tests {
             effect_id: effect_id::FROST,
             bounds: bounds(8., 8., 48., 48.),
             content_mask,
-            params0: [1., 0., 0., 0.],
-            params1: [0., 0., 1., 1.],
+            params: EffectQuad::params_from(&[1., 0., 0., 0., 0., 0., 1., 1.]),
             opacity: 1.,
             scale: 1.,
             flags: EFFECT_FLAG_NEEDS_BACKDROP,
@@ -2655,8 +2654,7 @@ mod tests {
             bounds: bounds(36., 4., 24., 30.),
             content_mask,
             corner_radii: Corners::all(ScaledPixels(6.)),
-            params0: [0.7, 6., 0., 0.],
-            params1: [1., 1., 1., 0.1],
+            params: EffectQuad::params_from(&[0.7, 6., 0., 0., 1., 1., 1., 0.1]),
             opacity: 1.,
             backdrop_blur_radius: ScaledPixels(6.),
             scale: 1.,
@@ -2667,8 +2665,7 @@ mod tests {
             effect_id: effect_id::GLOW,
             bounds: bounds(6., 34., 28., 28.),
             content_mask,
-            params0: [6., 0.9, 0., 0.],
-            params1: [0.2, 1., 0.4, 1.],
+            params: EffectQuad::params_from(&[6., 0.9, 0., 0., 0.2, 1., 0.4, 1.]),
             opacity: 1.,
             bleed: ScaledPixels(6.),
             scale: 1.,
@@ -2678,7 +2675,7 @@ mod tests {
             effect_id: effect_id::NOISE,
             bounds: bounds(40., 40., 20., 20.),
             content_mask,
-            params0: [0.6, 2., 0., 0.],
+            params: EffectQuad::params_from(&[0.6, 2., 0., 0.]),
             opacity: 1.,
             scale: 1.,
             ..Default::default()
@@ -2730,7 +2727,7 @@ mod tests {
             reload_app_effects(
                 AppEffects::new(
                     "test",
-                    r#"{"schema": 7, "effects": [
+                    r#"{"schema": 8, "effects": [
                         {"name": "tint", "backdrop": false, "hlsl": "tint.hlsl"}
                     ]}"#,
                     [("tint.hlsl".to_string(), hlsl.to_string())],

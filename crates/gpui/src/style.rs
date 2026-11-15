@@ -8,7 +8,7 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement,
-    EffectSpec, Font,
+    EffectCrossFade, EffectSpec, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
     PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
     TransformSpec, TransformationMatrix, VnClipOutline, VnFillRule, VnPathVerb, point, px, quad,
@@ -668,6 +668,10 @@ pub struct Style {
     /// every descendant is never what an author means, and a browser ignores
     /// the property entirely anyway, so nothing renders differently there.
     pub vn_effect: Option<EffectSpec>,
+
+    /// A `--shading` transition between different effects: the outgoing one,
+    /// painted beneath `vn_effect` while they cross-fade.
+    pub vn_effect_fade: Option<EffectCrossFade>,
 
     /// CSS `transform`: rotate, scale and translate this element's PAINTED
     /// output — its background, borders, shadows, text and its whole subtree —
@@ -1724,23 +1728,41 @@ impl Style {
         // `App::reduce_motion` here — clearing the flag stops the repaint
         // request, which freezes the effect on its current frame rather than
         // removing it. Same behaviour vn-css's animator gives transitions.
-        let effect = self
-            .vn_effect
-            .filter(|spec| spec.is_some() && !ring)
-            .map(|mut spec| {
-                spec.animated &= !cx.reduce_motion();
-                spec
-            });
+        // A cross-fade between two effects paints the outgoing one first, each
+        // at its share of the element's opacity.
+        let reduce_motion = cx.reduce_motion();
+        let layer = |mut spec: EffectSpec, weight: f32| {
+            (spec.is_some() && !ring && weight > 0.).then(|| {
+                spec.animated &= !reduce_motion;
+                if reduce_motion {
+                    spec.clock_mask = 0;
+                }
+                (spec, weight)
+            })
+        };
+        let progress = self
+            .vn_effect_fade
+            .map_or(1., |fade| fade.progress.clamp(0., 1.));
+        let effects = [
+            self.vn_effect_fade
+                .and_then(|fade| layer(fade.from, 1. - progress)),
+            self.vn_effect.and_then(|spec| layer(spec, progress)),
+        ];
+        let paint_effects = |window: &mut Window, backdrop: bool| {
+            for (spec, weight) in effects.iter().flatten() {
+                if (spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0) == backdrop {
+                    window.with_element_opacity((*weight < 1.).then_some(*weight), |window| {
+                        window.paint_effect_quad(bounds, corner_radii, *spec)
+                    });
+                }
+            }
+        };
         // The background quads: the whole box, or only the ring.
         let fill = |background: Background| match ring_widths {
             Some(widths) => (background.ring(), widths),
             None => (background, Edges::default()),
         };
-        if let Some(spec) = effect
-            && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0
-        {
-            window.paint_effect_quad(bounds, corner_radii, spec);
-        }
+        paint_effects(window, true);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -1784,11 +1806,7 @@ impl Style {
             window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
         }
 
-        if let Some(spec) = effect
-            && spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP == 0
-        {
-            window.paint_effect_quad(bounds, corner_radii, spec);
-        }
+        paint_effects(window, false);
 
         continuation(window, cx);
 
@@ -1954,6 +1972,7 @@ impl Default for Style {
             vn_shadow_under_box: false,
             backdrop_blur: None,
             vn_effect: None,
+            vn_effect_fade: None,
             vn_transform: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

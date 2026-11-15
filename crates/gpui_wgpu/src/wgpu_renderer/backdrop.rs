@@ -1243,8 +1243,7 @@ mod tests {
             content_mask,
             content_mask + offset_of!(ContentMask<ScaledPixels>, corner_radii),
             offset_of!(EffectQuad, corner_radii),
-            offset_of!(EffectQuad, params0),
-            offset_of!(EffectQuad, params1),
+            offset_of!(EffectQuad, params),
             offset_of!(EffectQuad, opacity),
             offset_of!(EffectQuad, time),
             offset_of!(EffectQuad, bleed),
@@ -1309,7 +1308,10 @@ mod tests {
             let fragment = module(wgsl);
             assert_eq!(
                 struct_layout(&fragment, "SkEffectQuad_std430_0"),
-                (effect_quad_offsets(), 128),
+                (
+                    effect_quad_offsets(),
+                    std::mem::size_of::<EffectQuad>() as u32
+                ),
                 "{name}"
             );
             assert_eq!(
@@ -1529,8 +1531,7 @@ mod tests {
                 effect_id: effect_id::FROST,
                 bounds: bounds(8., 8., 48., 48.),
                 content_mask: mask(SIDE, SIDE),
-                params0: [1., 0., 0., 0.],
-                params1: [0., 0., 1., 1.],
+                params: EffectQuad::params_from(&[1., 0., 0., 0., 0., 0., 1., 1.]),
                 opacity: 1.,
                 scale: 1.,
                 flags: EFFECT_FLAG_NEEDS_BACKDROP,
@@ -1575,8 +1576,7 @@ mod tests {
                 bounds: bounds(8., 8., 48., 48.),
                 content_mask: mask(SIDE, SIDE),
                 corner_radii: Corners::all(ScaledPixels(8.)),
-                params0: [1., 10., 0., 0.],
-                params1: [1., 1., 1., 0.06],
+                params: EffectQuad::params_from(&[1., 10., 0., 0., 1., 1., 1., 0.06]),
                 opacity: 1.,
                 backdrop_blur_radius: ScaledPixels(10.),
                 scale: 1.,
@@ -1629,8 +1629,7 @@ mod tests {
                 // A 16px element at (24, 24), dilated by its 8px bleed.
                 bounds: bounds(16., 16., 32., 32.),
                 content_mask,
-                params0: [8., 1., 0., 0.],
-                params1: [1., 0., 0., 1.],
+                params: EffectQuad::params_from(&[8., 1., 0., 0., 1., 0., 0., 1.]),
                 opacity: 1.,
                 bleed: ScaledPixels(8.),
                 scale: 1.,
@@ -1859,7 +1858,7 @@ mod tests {
                 effect_id: effect_id::FROST,
                 bounds: bounds(8., 8., 48., 48.),
                 content_mask: mask(SIDE, SIDE),
-                params0: [1., 0., 0., 0.],
+                params: EffectQuad::params_from(&[1., 0., 0., 0.]),
                 opacity: 1.,
                 scale: 1.,
                 flags: EFFECT_FLAG_NEEDS_BACKDROP,
@@ -1902,7 +1901,7 @@ mod tests {
                 effect_id: effect_id::NOISE,
                 bounds: bounds(8., 8., 48., 48.),
                 content_mask: mask(SIDE, SIDE),
-                params0: [1., 1., 0., 0.],
+                params: EffectQuad::params_from(&[1., 1., 0., 0.]),
                 opacity: 1.,
                 scale: 1.,
                 ..Default::default()
@@ -1947,8 +1946,7 @@ mod tests {
                     effect_id: effect_id::FROST,
                     bounds: bounds(20., 20., 24., 24.),
                     content_mask: mask(SIDE, SIDE),
-                    params0: [0.8, 4., 0., 0.],
-                    params1: [0., 0., 1., 0.3],
+                    params: EffectQuad::params_from(&[0.8, 4., 0., 0., 0., 0., 1., 0.3]),
                     opacity: 1.,
                     backdrop_blur_radius: ScaledPixels(4.),
                     scale: 1.,
@@ -2050,7 +2048,7 @@ mod tests {
             gpui::reload_app_effects(
                 gpui::AppEffects::new(
                     "test",
-                    r#"{"schema": 7, "effects": [
+                    r#"{"schema": 8, "effects": [
                         {"name": "tint", "backdrop": false, "wgsl": "tint.wgsl"}
                     ]}"#,
                     [("tint.wgsl".to_string(), wgsl.to_string())],
@@ -2126,7 +2124,10 @@ mod tests {
                 let fragment = module(wgsl);
                 assert_eq!(
                     struct_layout(&fragment, "SkEffectQuad_std430_0"),
-                    (effect_quad_offsets(), 128),
+                    (
+                        effect_quad_offsets(),
+                        std::mem::size_of::<EffectQuad>() as u32
+                    ),
                     "{}",
                     effect.name
                 );
@@ -2140,8 +2141,7 @@ mod tests {
                     effect_id: effect_id::COUNT + index as u32,
                     bounds: bounds(8., 8., 48., 48.),
                     content_mask: mask(SIDE, SIDE),
-                    params0: [1., 24., 0.5, 0.5],
-                    params1: [1., 1., 1., 1.],
+                    params: EffectQuad::params_from(&[1., 24., 0.5, 0.5, 1., 1., 1., 1.]),
                     opacity: 1.,
                     time: 0.75,
                     scale: 1.,
