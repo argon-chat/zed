@@ -590,6 +590,9 @@ pub struct Style {
     pub flex_grow: f32,
     /// The relative rate at which this item shrinks when it is contracting to fit into space, 1.0 is the default value, and this value must be positive.
     pub flex_shrink: f32,
+    /// CSS `order`: a flex or grid item is laid out in ascending order, ties in document order.
+    /// Painting, hit-testing and focus order keep document order.
+    pub vn_order: i32,
 
     /// The fill color of this element
     pub background: Option<Fill>,
@@ -2025,6 +2028,7 @@ impl Default for Style {
             flex_wrap: FlexWrap::NoWrap,
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            vn_order: 0,
             flex_basis: Length::Auto,
             background: None,
             background_layers: Vec::new(),

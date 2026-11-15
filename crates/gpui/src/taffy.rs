@@ -5,14 +5,14 @@ pub use retained::VnRetainedLayoutStats;
 use layout_bounds::LayoutIdMap;
 
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Display, Edges, GridTemplate, Length, Pixels,
+    Point, Size, Style, Window, size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
     },
 };
-use collections::FxHashSet;
+use collections::{FxHashMap, FxHashSet};
 use std::{fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -42,6 +42,8 @@ pub struct TaffyLayoutEngine {
     retention: retained::Retention,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// This frame's nonzero `vn_order`s, by node.
+    orders: FxHashMap<LayoutId, i32>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -57,6 +59,7 @@ impl TaffyLayoutEngine {
             retention: retained::Retention::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            orders: FxHashMap::default(),
         }
     }
 
@@ -69,6 +72,7 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.orders.clear();
     }
 
     pub(crate) fn retention_enabled(&self) -> bool {
@@ -113,11 +117,11 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
-        if self.retention.enabled {
-            return retained::request_layout(self, scope, taffy_style, children);
-        }
-
-        if children.is_empty() {
+        let reordered = self.order_modified(&style, children);
+        let children = reordered.as_deref().unwrap_or(children);
+        let id = if self.retention.enabled {
+            retained::request_layout(self, scope, taffy_style, children)
+        } else if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -128,7 +132,30 @@ impl TaffyLayoutEngine {
                 .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
                 .into()
+        };
+        self.note_order(id, &style);
+        id
+    }
+
+    fn note_order(&mut self, id: LayoutId, style: &Style) {
+        if style.vn_order != 0 {
+            self.orders.insert(id, style.vn_order);
         }
+    }
+
+    /// CSS's order-modified document order for a flex or grid container's children; `None` when
+    /// it is document order.
+    fn order_modified(&self, style: &Style, children: &[LayoutId]) -> Option<Vec<LayoutId>> {
+        if self.orders.is_empty() || !matches!(style.display, Display::Flex | Display::Grid) {
+            return None;
+        }
+        let order = |id: &LayoutId| self.orders.get(id).copied().unwrap_or(0);
+        if children.windows(2).all(|w| order(&w[0]) <= order(&w[1])) {
+            return None;
+        }
+        let mut sorted = children.to_vec();
+        sorted.sort_by_key(order);
+        Some(sorted)
     }
 
     pub fn request_measured_layout(
@@ -162,18 +189,20 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
-        if self.retention.enabled {
-            return retained::request_measured_layout(self, scope, taffy_style, measure);
-        }
+        let id = if self.retention.enabled {
+            retained::request_measured_layout(self, scope, taffy_style, measure)
+        } else {
+            let measure = Box::new(measure) as Box<MeasureFn>;
+            #[cfg(feature = "stacker")]
+            let measure = StackSafe::new(measure);
 
-        let measure = Box::new(measure) as Box<MeasureFn>;
-        #[cfg(feature = "stacker")]
-        let measure = StackSafe::new(measure);
-
-        self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+            self.taffy
+                .new_leaf_with_context(taffy_style, NodeContext { measure })
+                .expect(EXPECT_MESSAGE)
+                .into()
+        };
+        self.note_order(id, &style);
+        id
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -1029,6 +1058,29 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flex_and_grid_lay_their_children_out_in_order_modified_document_order() {
+        let mut engine = TaffyLayoutEngine::new();
+        let leaf = |engine: &mut TaffyLayoutEngine, order: i32| {
+            let style = Style { vn_order: order, ..Default::default() };
+            engine.request_layout(style, Pixels(16.0), 1.0, &[])
+        };
+        let kids = [leaf(&mut engine, 2), leaf(&mut engine, -1), leaf(&mut engine, 0), leaf(&mut engine, 2)];
+        let laid_out = |engine: &mut TaffyLayoutEngine, display: Display| {
+            let style = Style { display, ..Default::default() };
+            let root = engine.request_layout(style, Pixels(16.0), 1.0, &kids);
+            engine.taffy.child_ids(root.into()).map(LayoutId::from).collect::<Vec<_>>()
+        };
+        let modified = vec![kids[1], kids[2], kids[0], kids[3]];
+        assert_eq!(laid_out(&mut engine, Display::Flex), modified);
+        assert_eq!(laid_out(&mut engine, Display::Grid), modified);
+        assert_eq!(laid_out(&mut engine, Display::Block), kids.to_vec());
+        engine.clear();
+        let fresh = [leaf(&mut engine, 0), leaf(&mut engine, 0)];
+        let root = engine.request_layout(Style { display: Display::Flex, ..Default::default() }, Pixels(16.0), 1.0, &fresh);
+        assert!(engine.taffy.child_ids(root.into()).map(LayoutId::from).eq(fresh));
+    }
 
     #[test]
     fn implicit_fractional_columns_share_the_container_width() {
