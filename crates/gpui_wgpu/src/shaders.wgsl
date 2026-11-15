@@ -455,24 +455,23 @@ fn prepare_gradient_color(background: Background) -> GradientColor {
     result.solid = hsla_to_rgba(background.solid);
     result.color0 = hsla_to_rgba(stops[0].color);
     result.color1 = hsla_to_rgba(stops[GRADIENT_STOPS - 1u].color);
-    if (background.color_space == 0u) {
-        result.color0 = linear_to_srgba(result.color0);
-        result.color1 = linear_to_srgba(result.color1);
-    } else if (background.color_space == 1u) {
-        result.color0 = linear_srgb_to_oklab(result.color0);
-        result.color1 = linear_srgb_to_oklab(result.color1);
+    if (background.color_space == 1u) {
+        result.color0 = linear_srgb_to_oklab(srgba_to_linear(result.color0));
+        result.color1 = linear_srgb_to_oklab(srgba_to_linear(result.color1));
     }
     return result;
 }
 
-// One colour stop, in the interpolation colour space.
+// One colour stop, in the interpolation colour space. `hsla_to_rgba` yields
+// gamma-encoded sRGB, which is already CSS's default interpolation space and
+// what the UNORM target stores.
 fn gradient_stop_color(background: Background, i: u32) -> vec4<f32> {
     var stops = background.colors;
     var c = hsla_to_rgba(stops[i].color);
     if (background.color_space == 1u) {
-        return linear_srgb_to_oklab(c);
+        return linear_srgb_to_oklab(srgba_to_linear(c));
     }
-    return linear_to_srgba(c);
+    return c;
 }
 
 // One colour stop's position, as a fraction of the gradient line. A stop
@@ -530,9 +529,9 @@ fn gradient_ramp(background: Background, t_in: f32, line_length: f32) -> vec4<f3
     }
 
     if (background.color_space == 1u) {
-        return oklab_to_linear_srgb(color);
+        return linear_to_srgba(oklab_to_linear_srgb(color));
     }
-    return srgba_to_linear(color);
+    return color;
 }
 
 // CSS aims a `to <corner>` gradient's line at the actual corner, so its angle

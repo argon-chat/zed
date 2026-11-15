@@ -2997,6 +2997,45 @@ mod tests {
     }
 
     #[test]
+    fn gradients_interpolate_in_gamma_encoded_srgb_and_in_oklab() -> anyhow::Result<()> {
+        use gpui::{PlatformHeadlessRenderer as _, point, px};
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        for (y, color_space) in [(0.0, ColorSpace::Srgb), (16.0, ColorSpace::Oklab)] {
+            let bounds =
+                Bounds::new(point(px(0.0), px(y)), gpui::size(px(64.0), px(16.0))).scale(1.0);
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: ContentMask::rect(bounds),
+                background: linear_gradient(
+                    90.0,
+                    linear_color_stop(gpui::black(), 0.0),
+                    linear_color_stop(gpui::white(), 1.0),
+                )
+                .color_space(color_space),
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        let image = renderer.render_scene_to_image(
+            &scene,
+            gpui::size(gpui::DevicePixels(64), gpui::DevicePixels(32)),
+        )?;
+        // Column 31 sits at t = 31.5 / 64; averaging the rows cancels the dither.
+        let mean = |rows: std::ops::Range<u32>| {
+            let n = rows.len() as f32;
+            rows.map(|y| image.get_pixel(31, y).0[0] as f32)
+                .sum::<f32>()
+                / n
+        };
+        let srgb = mean(0..16);
+        let oklab = mean(16..32);
+        assert!((srgb - 125.5).abs() <= 2.0, "sRGB midpoint {srgb}");
+        assert!((oklab - 96.9).abs() <= 2.0, "Oklab midpoint {oklab}");
+        Ok(())
+    }
+
+    #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
         assert!(!WEBGL_SHADERS.contains("var<storage"));
         validate_wgsl(WEBGL_SHADERS, naga::valid::Capabilities::empty());
