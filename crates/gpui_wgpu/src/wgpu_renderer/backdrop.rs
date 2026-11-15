@@ -97,9 +97,9 @@ pub(super) struct WgpuBackdrop {
 /// recreating one is a window-sized allocation, so short gaps keep them.
 const SCRATCH_RELEASE_FRAMES: u32 = 90;
 
-struct TargetTexture {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
+pub(super) struct TargetTexture {
+    pub(super) texture: wgpu::Texture,
+    pub(super) view: wgpu::TextureView,
 }
 
 /// Sized to the frame; dropped on resize.
@@ -122,6 +122,17 @@ pub(super) struct FrameTarget {
     copy_to: Option<wgpu::TextureView>,
     /// Whether this frame can draw backdrop blurs and effects at all.
     pub(super) backdrop: bool,
+}
+
+impl FrameTarget {
+    pub(super) fn layer(texture: wgpu::Texture, view: wgpu::TextureView, backdrop: bool) -> Self {
+        Self {
+            texture,
+            view,
+            copy_to: None,
+            backdrop,
+        }
+    }
 }
 
 pub(super) enum EffectPass {
@@ -1045,14 +1056,18 @@ fn effect_pipeline(
     })
 }
 
-fn shader_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
+pub(super) fn shader_module(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     })
 }
 
-fn pipeline_layout(
+pub(super) fn pipeline_layout(
     device: &wgpu::Device,
     label: &str,
     layouts: &[&wgpu::BindGroupLayout],
@@ -1065,7 +1080,7 @@ fn pipeline_layout(
     })
 }
 
-fn render_pipeline(
+pub(super) fn render_pipeline(
     device: &wgpu::Device,
     label: &str,
     layout: &wgpu::PipelineLayout,
@@ -1104,7 +1119,7 @@ fn render_pipeline(
     })
 }
 
-fn create_target_texture(
+pub(super) fn create_target_texture(
     device: &wgpu::Device,
     label: &str,
     format: wgpu::TextureFormat,
@@ -1133,7 +1148,7 @@ fn create_target_texture(
 /// Runs `build` inside a validation error scope, so a shader that does not
 /// compile becomes an error here instead of a failed frame.
 #[cfg(not(target_family = "wasm"))]
-fn capture_validation<T>(device: &wgpu::Device, build: impl FnOnce() -> T) -> Result<T> {
+pub(super) fn capture_validation<T>(device: &wgpu::Device, build: impl FnOnce() -> T) -> Result<T> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let value = build();
     match gpui::block_on(scope.pop()) {
@@ -1145,13 +1160,16 @@ fn capture_validation<T>(device: &wgpu::Device, build: impl FnOnce() -> T) -> Re
 /// A browser resolves error scopes asynchronously; its errors reach the
 /// device's uncaptured-error handler instead.
 #[cfg(target_family = "wasm")]
-fn capture_validation<T>(_device: &wgpu::Device, build: impl FnOnce() -> T) -> Result<T> {
+pub(super) fn capture_validation<T>(
+    _device: &wgpu::Device,
+    build: impl FnOnce() -> T,
+) -> Result<T> {
     Ok(build())
 }
 
 /// Degraded behaviour is announced, never silent, and each distinct message
 /// once per process rather than every frame.
-fn effects_advisory(message: &str) {
+pub(super) fn effects_advisory(message: &str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let mut seen = match SEEN.lock() {

@@ -1,4 +1,5 @@
 mod backdrop;
+mod vn_layer;
 
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
@@ -6,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    PrimitiveBatch, ScaledPixels, Scene, Size, VnBatch, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -56,6 +57,15 @@ const BACKDROP_SHADERS: &str = concat!(
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_decode.wgsl"),
     include_str!("shaders_backdrop.wgsl"),
+);
+
+/// The isolated layers' composite. Storage buffers only: on WebGL2 every group
+/// draws inline.
+const VN_LAYER_SHADERS: &str = concat!(
+    include_str!("shaders.wgsl"),
+    include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_decode.wgsl"),
+    include_str!("shaders_vn_layer.wgsl"),
 );
 
 /// The blur pyramid passes, standalone: their bindings sit in group 0.
@@ -183,6 +193,13 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
+/// What every group of one frame draws from.
+struct GroupDraw<'a> {
+    scene: &'a Scene,
+    instances: &'a InstanceBindings,
+    layers: Option<&'a InstanceBinding>,
+}
+
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
@@ -222,6 +239,7 @@ struct WgpuResources {
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
     backdrop: backdrop::BackdropState,
+    vn_layers: vn_layer::VnLayerState,
 }
 
 struct CachedTextureBindGroup {
@@ -236,6 +254,7 @@ impl WgpuResources {
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.backdrop.invalidate_targets();
+        self.vn_layers.invalidate_targets();
     }
 }
 
@@ -1423,6 +1442,7 @@ impl WgpuRendererCore {
                 path_msaa_texture: None,
                 path_msaa_view: None,
                 backdrop: backdrop::BackdropState::default(),
+                vn_layers: vn_layer::VnLayerState::default(),
             },
             atlas,
             path_globals_offset,
@@ -1570,6 +1590,7 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
+        let layers = self.write_vn_layers(scene, &mut instance_offset)?;
         self.prepare_texture_bind_groups(scene);
         let frame = self.prepare_frame_target(scene, target, target_view);
 
@@ -1580,6 +1601,44 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
+        let draw = GroupDraw {
+            scene,
+            instances: &instance_bindings,
+            layers: layers.as_ref(),
+        };
+        self.draw_group(
+            &draw,
+            0,
+            0,
+            &mut encoder,
+            &frame,
+            Some(clear_color),
+            &mut instance_offset,
+        )?;
+        self.finish_vn_layers();
+        self.finish_frame_target(&mut encoder, &frame);
+
+        let submission = self
+            .resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(submission)
+    }
+
+    /// One group's batches into `frame`, its isolated layers composited
+    /// where they come (`Scene::vn_batches`); group 0 is the root.
+    fn draw_group(
+        &mut self,
+        draw: &GroupDraw<'_>,
+        group: usize,
+        depth: usize,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &backdrop::FrameTarget,
+        clear: Option<wgpu::Color>,
+        instance_offset: &mut u64,
+    ) -> Result<()> {
+        let scene = draw.scene;
+        let instance_bindings = draw.instances;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1587,7 +1646,7 @@ impl WgpuRendererCore {
                     view: &frame.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1596,7 +1655,25 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
-            for batch in scene.batches() {
+            for batch in scene.vn_batches(group) {
+                let batch = match batch {
+                    VnBatch::Primitives(batch) => batch,
+                    VnBatch::Layers(range) => {
+                        drop(pass);
+                        for index in range {
+                            self.draw_vn_layer(
+                                draw,
+                                index,
+                                depth,
+                                encoder,
+                                frame,
+                                instance_offset,
+                            )?;
+                        }
+                        pass = continue_pass(encoder, &frame.view, "main_pass_continued");
+                        continue;
+                    }
+                };
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
@@ -1612,17 +1689,17 @@ impl WgpuRendererCore {
                         }
                         drop(pass);
                         self.draw_backdrop_blur_rects(
-                            &mut encoder,
-                            &frame,
+                            encoder,
+                            frame,
                             &scene.backdrop_blur_rects[range.clone()],
                             range.start,
                             &instance_bindings.backdrop_blur_rects,
                         )?;
-                        pass = continue_pass(&mut encoder, &frame.view, "main_pass_continued");
+                        pass = continue_pass(encoder, &frame.view, "main_pass_continued");
                     }
                     PrimitiveBatch::EffectQuads { effect_id, range } => {
                         let effect_quads = &scene.effect_quads[range.clone()];
-                        match self.effect_pass(&frame, effect_id, effect_quads) {
+                        match self.effect_pass(frame, effect_id, effect_quads) {
                             backdrop::EffectPass::Skip => {}
                             backdrop::EffectPass::Blended => self.draw_blended_effects(
                                 effect_id,
@@ -1633,15 +1710,14 @@ impl WgpuRendererCore {
                             backdrop::EffectPass::Backdrop => {
                                 drop(pass);
                                 self.draw_backdrop_effects(
-                                    &mut encoder,
-                                    &frame,
+                                    encoder,
+                                    frame,
                                     effect_id,
                                     effect_quads,
                                     range.start,
                                     &instance_bindings.effect_quads,
                                 )?;
-                                pass =
-                                    continue_pass(&mut encoder, &frame.view, "main_pass_continued");
+                                pass = continue_pass(encoder, &frame.view, "main_pass_continued");
                             }
                         }
                     }
@@ -1658,20 +1734,13 @@ impl WgpuRendererCore {
                         }
 
                         drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            paths,
-                            &mut instance_offset,
-                        )?;
+                        let rasterized =
+                            self.draw_paths_to_intermediate(encoder, paths, instance_offset)?;
 
-                        pass = continue_pass(&mut encoder, &frame.view, "main_pass_continued");
+                        pass = continue_pass(encoder, &frame.view, "main_pass_continued");
 
                         if rasterized {
-                            self.draw_paths_from_intermediate(
-                                paths,
-                                &mut instance_offset,
-                                &mut pass,
-                            )?;
+                            self.draw_paths_from_intermediate(paths, instance_offset, &mut pass)?;
                         }
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
@@ -1718,13 +1787,7 @@ impl WgpuRendererCore {
                 }
             }
         }
-        self.finish_frame_target(&mut encoder, &frame);
-
-        let submission = self
-            .resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        Ok(submission)
+        Ok(())
     }
 
     fn write_instances(
@@ -2950,6 +3013,11 @@ mod tests {
             SUBPIXEL_SHADERS,
             naga::valid::Capabilities::DUAL_SOURCE_BLENDING,
         );
+    }
+
+    #[test]
+    fn vn_layer_shader_is_valid_wgsl() {
+        validate_wgsl(VN_LAYER_SHADERS, naga::valid::Capabilities::empty());
     }
 
     fn validate_wgsl(source: &str, capabilities: naga::valid::Capabilities) {

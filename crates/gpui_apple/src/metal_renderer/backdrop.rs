@@ -127,6 +127,16 @@ pub(super) struct FrameTarget {
     pub(super) backdrop: bool,
 }
 
+impl FrameTarget {
+    pub(super) fn layer(texture: Texture, backdrop: bool) -> Self {
+        Self {
+            texture,
+            copy_to: None,
+            backdrop,
+        }
+    }
+}
+
 pub(super) enum EffectPass {
     Skip,
     /// Source-over inside the current pass.
@@ -1015,7 +1025,7 @@ fn backdrop_pipeline(
         .with_context(|| format!("creating {label} render pipeline"))
 }
 
-fn create_target_texture(
+pub(super) fn create_target_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     label: &str,
     width: usize,
@@ -1040,7 +1050,7 @@ fn create_target_texture(
 
 /// Degraded behaviour is announced, never silent, and each distinct message
 /// once per process rather than every frame.
-fn effects_advisory(message: &str) {
+pub(super) fn effects_advisory(message: &str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let mut seen = match SEEN.lock() {

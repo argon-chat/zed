@@ -120,6 +120,9 @@ mod apple_build {
             "EffectQuad".into(),
             "BackdropInputIndex".into(),
             "BackdropTextureIndex".into(),
+            "VnLayer".into(),
+            "VnTextBackground".into(),
+            "VnLayerInputIndex".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

@@ -635,7 +635,7 @@ impl Scene {
     /// vue-native fork: an isolated layer's group comes inline where its
     /// composite would draw, unclipped by its shape (cut to the shape's box by
     /// the content mask). That is what a renderer without isolated layers
-    /// (Metal, wgpu) draws; DirectX walks [`Scene::vn_batches`] instead.
+    /// draws; the DirectX, Metal and wgpu renderers walk [`Scene::vn_batches`].
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         let mut out = Vec::new();
         self.vn_flatten_into(0, 0, &mut out);

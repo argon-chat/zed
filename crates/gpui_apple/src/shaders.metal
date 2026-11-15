@@ -1771,3 +1771,121 @@ fragment float4 punch_fragment(
                                                  quad.content_mask.corner_radii));
   return float4(0., 0., 0., inside * unmasked * quad.opacity);
 }
+
+// vue-native: the composite of one isolated layer (`gpui::VnLayer`), a port of
+// `vn_layer_*` in gpui_windows' shaders.hlsl: the group drawn into an
+// offscreen target the size of the frame, put back over its parent through a
+// clip shape, a color matrix and a text background stack.
+
+struct VnLayerVertexOutput {
+  float4 position [[position]];
+  uint layer_id [[flat]];
+};
+
+vertex VnLayerVertexOutput vn_layer_vertex(
+    uint vertex_id [[vertex_id]], uint layer_id [[instance_id]],
+    constant VnLayer *layers [[buffer(VnLayerInputIndex_Layers)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(VnLayerInputIndex_ViewportSize)]]) {
+  // `bounds` is already cut to the content mask's rectangle.
+  float4 position = to_device_position(strip_unit_vertex(vertex_id),
+                                       layers[layer_id].bounds, viewport_size);
+  return VnLayerVertexOutput{position, layer_id};
+}
+
+// Winding number of the edges crossing the ray to the right (half-open in y,
+// so a vertex on the ray counts once), blended across the nearest edge. The
+// CPU twin is `gpui::VnClipGeometry::coverage`.
+float vn_clip_coverage(float2 p, constant float4 *segments, uint start,
+                       uint count, uint fill_rule) {
+  int winding = 0;
+  float nearest = 3.0e38;
+  for (uint i = 0; i < count; i++) {
+    float4 s = segments[start + i];
+    float2 a = s.xy;
+    float2 b = s.zw;
+    if ((a.y <= p.y) != (b.y <= p.y)) {
+      float x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
+      if (p.x < x) {
+        winding += b.y > a.y ? 1 : -1;
+      }
+    }
+    float2 ab = b - a;
+    float2 ap = p - a;
+    float len2 = dot(ab, ab);
+    float t = len2 > 0. ? saturate(dot(ap, ab) / len2) : 0.;
+    float2 q = ap - t * ab;
+    nearest = min(nearest, dot(q, q));
+  }
+  bool inside = fill_rule == 1u ? (winding & 1) != 0 : winding != 0;
+  float d = sqrt(nearest);
+  return saturate(0.5 + (inside ? d : -d));
+}
+
+// The exact sRGB curves, as DirectX and wgpu apply a color matrix in
+// linearRGB; `srgb_to_linear` above is a 2.2 power.
+float3 vn_srgb_to_linear(float3 c) {
+  return select(pow((c + 0.055) / 1.055, float3(2.4)), c / 12.92, c < 0.04045);
+}
+
+float3 vn_linear_to_srgb(float3 c) {
+  return select(1.055 * pow(c, float3(1. / 2.4)) - 0.055, c * 12.92, c < 0.0031308);
+}
+
+fragment float4 vn_layer_fragment(
+    VnLayerVertexOutput input [[stage_in]],
+    constant VnLayer *layers [[buffer(VnLayerInputIndex_Layers)]],
+    constant float4 *segments [[buffer(VnLayerInputIndex_Segments)]],
+    constant VnTextBackground *text_backgrounds
+    [[buffer(VnLayerInputIndex_TextBackgrounds)]],
+    texture2d<float> source [[texture(VnLayerInputIndex_Texture)]]) {
+  VnLayer layer = layers[input.layer_id];
+  float2 p = input.position.xy;
+  float coverage = vn_clip_coverage(p, segments, layer.segment_start,
+                                    layer.segment_count, layer.fill_rule) *
+                   content_mask_coverage(p, layer.content_mask.bounds,
+                                         layer.content_mask.corner_radii);
+  float4 color = source.read(uint2(p));
+  uint matrix_mode = layer.pad[0];
+  uint text_start = layer.pad[1];
+  uint text_count = layer.pad[2];
+  if (text_count != 0u) {
+    float4 fill = float4(0.);
+    for (uint i = 0u; i < text_count; i++) {
+      VnTextBackground text = text_backgrounds[text_start + i];
+      float2 local = float2(
+          p.x * text.inverse.rotation_scale[0][0] + p.y * text.inverse.rotation_scale[0][1],
+          p.x * text.inverse.rotation_scale[1][0] + p.y * text.inverse.rotation_scale[1][1]);
+      local += float2(text.inverse.translation[0], text.inverse.translation[1]);
+      local /= text.scale_factor;
+      Background background = text.background;
+      GradientColor prepared = prepare_fill_color(
+          background.tag, background.color_space, background.solid,
+          background.colors[0].color, background.colors[7].color);
+      float4 layer_color = fill_color(background, local, text.bounds, prepared.solid,
+                                      prepared.color0, prepared.color1);
+      float4 premultiplied = float4(layer_color.rgb * layer_color.a, layer_color.a);
+      fill = premultiplied + fill * (1. - premultiplied.a);
+    }
+    // The whole stack is masked once, which keeps the glyphs' antialiasing.
+    color = fill * color.a;
+  }
+  if (matrix_mode != 0u) {
+    float4 straight = color.a > 0. ? float4(color.rgb / color.a, color.a) : float4(0.);
+    if (matrix_mode == 1u) {
+      straight.rgb = vn_srgb_to_linear(straight.rgb);
+    }
+    thread const float *m = layer.color_matrix;
+    float4 filtered = saturate(
+        float4(dot(float4(m[0], m[1], m[2], m[3]), straight),
+               dot(float4(m[4], m[5], m[6], m[7]), straight),
+               dot(float4(m[8], m[9], m[10], m[11]), straight),
+               dot(float4(m[12], m[13], m[14], m[15]), straight)) +
+        float4(m[16], m[17], m[18], m[19]));
+    if (matrix_mode == 1u) {
+      filtered.rgb = vn_linear_to_srgb(filtered.rgb);
+    }
+    color = float4(filtered.rgb * filtered.a, filtered.a);
+  }
+  return color * coverage;
+}

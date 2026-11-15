@@ -1,11 +1,12 @@
 mod backdrop;
+mod vn_layer;
 
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, ScaledPixels, Scene, Size, VnBatch, point, size,
 };
 use image::RgbaImage;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
@@ -147,6 +148,7 @@ pub struct MetalRenderer {
     /// Kept for the backdrop pipelines, built on the first frame that needs them.
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     backdrop: backdrop::BackdropState,
+    vn_layers: vn_layer::VnLayerState,
     /// Whether this renderer turned the layer's `framebufferOnly` off, so a
     /// backdrop can copy from the drawable; restored with the scratch targets.
     framebuffer_only_lifted: bool,
@@ -447,6 +449,7 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             library,
             backdrop: backdrop::BackdropState::default(),
+            vn_layers: vn_layer::VnLayerState::default(),
             framebuffer_only_lifted: false,
             unit_vertices,
             instance_buffer_pool,
@@ -874,19 +877,79 @@ impl MetalRenderer {
         let alpha = if self.opaque { 1. } else { 0. };
         let frame = self.prepare_frame_target(scene, texture);
 
-        let mut command_encoder = new_command_encoder_for_texture(
-            &command_buffer,
-            &frame.texture,
+        let layers = self.write_vn_layers(scene, writer)?;
+        let draw = GroupDraw {
+            scene,
+            instances: instance_bindings,
+            layers: layers.as_ref(),
             viewport_size,
+        };
+        self.draw_group(
+            &draw,
+            0,
+            0,
+            &command_buffer,
+            &frame,
             Some(MTLClearColor {
                 red: 0.,
                 green: 0.,
                 blue: 0.,
                 alpha,
             }),
+            writer,
+            surface_textures,
         )?;
+        self.finish_vn_layers();
+        self.finish_frame_target(&command_buffer, &frame)?;
 
-        for batch in scene.batches() {
+        Ok(command_buffer)
+    }
+
+    /// One group's batches into `frame`, its isolated layers composited
+    /// where they come (`Scene::vn_batches`); group 0 is the root. Ends every
+    /// encoder it opens.
+    fn draw_group(
+        &mut self,
+        draw: &GroupDraw<'_>,
+        group: usize,
+        depth: usize,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        frame: &backdrop::FrameTarget,
+        clear: Option<MTLClearColor>,
+        writer: &mut InstanceBufferWriter,
+        surface_textures: &mut Vec<CFRetained<CVMetalTexture>>,
+    ) -> Result<()> {
+        let scene = draw.scene;
+        let instance_bindings = draw.instances;
+        let viewport_size = draw.viewport_size;
+        let mut command_encoder =
+            new_command_encoder_for_texture(command_buffer, &frame.texture, viewport_size, clear)?;
+
+        for batch in scene.vn_batches(group) {
+            let batch = match batch {
+                VnBatch::Primitives(batch) => batch,
+                VnBatch::Layers(range) => {
+                    command_encoder.endEncoding();
+                    for index in range {
+                        self.draw_vn_layer(
+                            draw,
+                            index,
+                            depth,
+                            command_buffer,
+                            frame,
+                            writer,
+                            surface_textures,
+                        )?;
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        &frame.texture,
+                        viewport_size,
+                        None,
+                    )?;
+                    continue;
+                }
+            };
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, &command_encoder)
@@ -899,9 +962,9 @@ impl MetalRenderer {
                 PrimitiveBatch::BackdropBlurRects(range) => {
                     if frame.backdrop && !range.is_empty() {
                         command_encoder = self.draw_backdrop_blur_rects(
-                            &command_buffer,
+                            command_buffer,
                             command_encoder,
-                            &frame,
+                            frame,
                             &scene.backdrop_blur_rects[range.clone()],
                             range.start,
                             &instance_bindings.backdrop_blur_rects,
@@ -911,7 +974,7 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::EffectQuads { effect_id, range } => {
                     let effect_quads = &scene.effect_quads[range.clone()];
-                    match self.effect_pass(&frame, effect_id, effect_quads) {
+                    match self.effect_pass(frame, effect_id, effect_quads) {
                         backdrop::EffectPass::Skip => {}
                         backdrop::EffectPass::Blended => self.draw_blended_effects(
                             effect_id,
@@ -922,9 +985,9 @@ impl MetalRenderer {
                         ),
                         backdrop::EffectPass::Backdrop => {
                             command_encoder = self.draw_backdrop_effects(
-                                &command_buffer,
+                                command_buffer,
                                 command_encoder,
-                                &frame,
+                                frame,
                                 effect_id,
                                 effect_quads,
                                 range.start,
@@ -942,11 +1005,11 @@ impl MetalRenderer {
                         paths,
                         writer,
                         viewport_size,
-                        &command_buffer,
+                        command_buffer,
                     )?;
 
                     command_encoder = new_command_encoder_for_texture(
-                        &command_buffer,
+                        command_buffer,
                         &frame.texture,
                         viewport_size,
                         None,
@@ -1001,9 +1064,7 @@ impl MetalRenderer {
         }
 
         command_encoder.endEncoding();
-        self.finish_frame_target(&command_buffer, &frame)?;
-
-        Ok(command_buffer)
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -1726,6 +1787,14 @@ struct InstanceBinding {
     offset: usize,
 }
 
+/// What every group of one frame draws from.
+struct GroupDraw<'a> {
+    scene: &'a Scene,
+    instances: &'a InstanceBindings,
+    layers: Option<&'a vn_layer::VnLayerBindings>,
+    viewport_size: Size<DevicePixels>,
+}
+
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
@@ -1928,6 +1997,15 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+}
+
+#[repr(C)]
+enum VnLayerInputIndex {
+    Layers = 0,
+    Segments = 1,
+    TextBackgrounds = 2,
+    ViewportSize = 3,
+    Texture = 4,
 }
 
 #[repr(C)]
