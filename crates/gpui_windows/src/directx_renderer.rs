@@ -1747,7 +1747,9 @@ fn build_effect_pipelines(device: &ID3D11Device) -> Vec<Option<PipelineState<Eff
             // snapshot — the same reason blur_rect disables blending.
             create_blend_state_for_replace(device)
         } else {
-            create_blend_state(device)
+            // `sk_finish` outputs premultiplied colour: premultiplied over
+            // premultiplied, as a path sprite.
+            create_blend_state_for_path_sprite(device)
         }
     };
 

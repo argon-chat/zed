@@ -82,8 +82,16 @@ pub(super) struct WgpuBackdrop {
     /// Group 2 of an effect that does not read the backdrop: its shader still
     /// declares the textures.
     placeholder_textures: wgpu::BindGroup,
+    /// `gpui::effect_id::PUNCH`.
+    punch: Option<wgpu::RenderPipeline>,
     targets: Option<BackdropTargets>,
+    /// Consecutive frames that held more scratch targets than they needed.
+    idle_frames: u32,
 }
+
+/// Frames the scratch targets may sit unused before release, as on D3D12:
+/// recreating one is a window-sized allocation, so short gaps keep them.
+const SCRATCH_RELEASE_FRAMES: u32 = 90;
 
 struct TargetTexture {
     texture: wgpu::Texture,
@@ -136,6 +144,27 @@ impl WgpuRendererCore {
             copy_to: None,
             backdrop,
         };
+        let snapshots = !scene.backdrop_blur_rects.is_empty()
+            || scene.effect_quads.iter().any(EffectQuad::needs_backdrop);
+        if let BackdropState::Ready(state) = &mut self.resources.backdrop {
+            let kernel_levels = scene
+                .backdrop_blur_rects
+                .iter()
+                .map(BackdropBlurRect::effective_kernel_levels)
+                .chain(
+                    scene
+                        .effect_quads
+                        .iter()
+                        .map(EffectQuad::effective_kernel_levels),
+                )
+                .max()
+                .unwrap_or(0) as usize;
+            state.trim_targets(if backdrop && snapshots {
+                kernel_levels.min(BLUR_TEXTURE_LEVELS) + 1
+            } else {
+                0
+            });
+        }
         if !backdrop {
             return frame;
         }
@@ -158,8 +187,6 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&globals),
         );
 
-        let snapshots = !scene.backdrop_blur_rects.is_empty()
-            || scene.effect_quads.iter().any(EffectQuad::needs_backdrop);
         if snapshots && !target.usage().contains(wgpu::TextureUsages::COPY_SRC) {
             let targets = state.targets(
                 &resources.device,
@@ -261,7 +288,25 @@ impl WgpuRendererCore {
             (rect.effective_kernel_levels() as usize, rect.bounds)
         }) {
             let kernel_levels = blur_rects[group.start].effective_kernel_levels() as usize;
-            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels)?;
+            let union = blur_rects[group.clone()]
+                .iter()
+                .map(|rect| rect.bounds)
+                .reduce(|union, bounds| union.union(&bounds))
+                .context("empty backdrop group")?;
+            let frame_rect = PixelRect::of(&frame.texture);
+            if PixelRect::round_out(&union, 0)
+                .intersect(frame_rect)
+                .is_empty()
+            {
+                continue;
+            }
+            // Only the pixels the composite reads, plus the kernel's reach.
+            let region = PixelRect::round_out(&union, blur_reach(kernel_levels));
+            #[cfg(test)]
+            let region = (!tests::FULL_WINDOW_BACKDROP.get()).then_some(region);
+            #[cfg(not(test))]
+            let region = Some(region);
+            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels, region)?;
             let state = self
                 .resources
                 .backdrop
@@ -293,8 +338,8 @@ impl WgpuRendererCore {
                 .resources
                 .backdrop
                 .ready()
-                .and_then(|state| state.effects.get(effect_id as usize))
-                .is_some_and(Option::is_some);
+                .and_then(|state| state.effect(effect_id))
+                .is_some();
         if !has_pipeline {
             EffectPass::Skip
         } else if first.needs_backdrop() {
@@ -314,7 +359,7 @@ impl WgpuRendererCore {
         let Some(state) = self.resources.backdrop.ready() else {
             return;
         };
-        let Some(Some(pipeline)) = state.effects.get(effect_id as usize) else {
+        let Some(pipeline) = state.effect(effect_id) else {
             return;
         };
         pass.set_pipeline(pipeline);
@@ -343,17 +388,14 @@ impl WgpuRendererCore {
             (quad.effective_kernel_levels() as usize, quad.bounds)
         }) {
             let kernel_levels = effect_quads[group.start].effective_kernel_levels() as usize;
-            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels)?;
+            // An effect may sample its backdrop anywhere, as on D3D12.
+            let textures = self.snapshot_backdrop(encoder, frame, kernel_levels, None)?;
             let state = self
                 .resources
                 .backdrop
                 .ready()
                 .context("backdrop pipelines missing")?;
-            let pipeline = state
-                .effects
-                .get(effect_id as usize)
-                .and_then(Option::as_ref)
-                .context("effect pipeline missing")?;
+            let pipeline = state.effect(effect_id).context("effect pipeline missing")?;
             let mut pass = super::continue_pass(encoder, &frame.view, "backdrop_effect_composite");
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &state.effect_globals_bind_group, &[]);
@@ -364,14 +406,16 @@ impl WgpuRendererCore {
         Ok(())
     }
 
-    /// Copies what the frame holds so far and blurs it `kernel_levels` deep.
-    /// Returns group 2 for the composite: the processed backdrop, the clamping
-    /// sampler and the untouched snapshot.
+    /// Copies what the frame holds so far and blurs it `kernel_levels` deep,
+    /// within `region` (frame pixels, the kernel's reach included) or the
+    /// whole frame. Returns group 2 for the composite: the processed backdrop,
+    /// the clamping sampler and the untouched snapshot.
     fn snapshot_backdrop(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameTarget,
         kernel_levels: usize,
+        region: Option<PixelRect>,
     ) -> Result<wgpu::BindGroup> {
         let kernel_levels = kernel_levels.min(BLUR_TEXTURE_LEVELS);
         let resources = &mut self.resources;
@@ -388,30 +432,58 @@ impl WgpuRendererCore {
         );
         let state = &**state;
         let targets = state.targets.as_ref().context("backdrop targets missing")?;
+        let full = PixelRect::of(&frame.texture);
+        let region = region.map_or(full, |region| region.intersect(full));
+        if region.is_empty() {
+            anyhow::bail!("empty backdrop region");
+        }
 
+        let origin = wgpu::Origin3d {
+            x: region.left as u32,
+            y: region.top as u32,
+            z: 0,
+        };
         encoder.copy_texture_to_texture(
-            frame.texture.as_image_copy(),
-            targets.snapshot.texture.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                origin,
+                ..frame.texture.as_image_copy()
+            },
+            wgpu::TexelCopyTextureInfo {
+                origin,
+                ..targets.snapshot.texture.as_image_copy()
+            },
             wgpu::Extent3d {
-                width,
-                height,
+                width: (region.right - region.left) as u32,
+                height: (region.bottom - region.top) as u32,
                 depth_or_array_layers: 1,
             },
         );
 
+        // Like D3D12, a pass writes only its scissor and leaves the rest of
+        // the level as it was; the rounded-out rects keep every texel the
+        // next pass reads inside what this one wrote.
         let source_layout = &resources.bind_group_layouts.texture;
         let blur_pass = |encoder: &mut wgpu::CommandEncoder,
                          pipeline: &wgpu::RenderPipeline,
                          source: &wgpu::TextureView,
-                         destination: &wgpu::TextureView| {
+                         destination: &TargetTexture,
+                         scale: usize| {
+            let rect = region
+                .scale_down(scale)
+                .intersect(PixelRect::of(&destination.texture));
+            if rect.is_empty() {
+                return;
+            }
+            #[cfg(test)]
+            tests::BLUR_PASS_RECTS.with_borrow_mut(|rects| rects.push(rect));
             let bind_group = source_bind_group(&resources.device, source_layout, state, source);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("backdrop_blur_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: destination,
+                    view: &destination.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -419,6 +491,12 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
+            pass.set_scissor_rect(
+                rect.left as u32,
+                rect.top as u32,
+                (rect.right - rect.left) as u32,
+                (rect.bottom - rect.top) as u32,
+            );
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..4, 0..1);
@@ -432,14 +510,16 @@ impl WgpuRendererCore {
                 encoder,
                 &state.blur_downsample,
                 &targets.snapshot.view,
-                &levels[0].view,
+                &levels[0],
+                1,
             );
             for level in 1..kernel_levels {
                 blur_pass(
                     encoder,
                     &state.blur_downsample,
                     &levels[level - 1].view,
-                    &levels[level].view,
+                    &levels[level],
+                    level + 1,
                 );
             }
             for level in (1..kernel_levels).rev() {
@@ -447,7 +527,8 @@ impl WgpuRendererCore {
                     encoder,
                     &state.blur_upsample,
                     &levels[level].view,
-                    &levels[level - 1].view,
+                    &levels[level - 1],
+                    level,
                 );
             }
             &levels[0].view
@@ -514,6 +595,71 @@ fn source_bind_group(
 fn instance_range(instances: &InstanceBinding, start: usize, group: Range<usize>) -> Range<u32> {
     let first = instances.first_instance + start as u32;
     first + group.start as u32..first + group.end as u32
+}
+
+/// Whole device pixels, edges exclusive on the right and bottom; D3D12's
+/// `RECT` helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl PixelRect {
+    fn of(texture: &wgpu::Texture) -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: texture.width() as i32,
+            bottom: texture.height() as i32,
+        }
+    }
+
+    /// The pixels covering `bounds`, grown by `margin` on every side.
+    fn round_out(bounds: &gpui::Bounds<gpui::ScaledPixels>, margin: i32) -> Self {
+        let clamp = |value: f32| value.clamp(i32::MIN as f32 / 2., i32::MAX as f32 / 2.) as i32;
+        Self {
+            left: clamp(bounds.origin.x.0.floor()).saturating_sub(margin),
+            top: clamp(bounds.origin.y.0.floor()).saturating_sub(margin),
+            right: clamp((bounds.origin.x.0 + bounds.size.width.0).ceil()).saturating_add(margin),
+            bottom: clamp((bounds.origin.y.0 + bounds.size.height.0).ceil()).saturating_add(margin),
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.left >= self.right || self.top >= self.bottom
+    }
+
+    /// This rect in a pyramid level `2^level` times smaller, rounded out by a
+    /// texel.
+    fn scale_down(self, level: usize) -> Self {
+        let divisor = 1i32 << level;
+        Self {
+            left: self.left.div_euclid(divisor) - 1,
+            top: self.top.div_euclid(divisor) - 1,
+            right: (self.right + divisor - 1).div_euclid(divisor) + 1,
+            bottom: (self.bottom + divisor - 1).div_euclid(divisor) + 1,
+        }
+    }
+}
+
+/// Frame pixels a blur of `levels` pyramid levels can carry into a pixel; the
+/// D3D12 renderer's bound. Each pass reads a texel to either side of its own,
+/// `2 * 2^level` frame pixels at level `level`, both chains together stay
+/// below `4 * 2^levels`, and the composite's bilinear read adds a few more.
+fn blur_reach(levels: usize) -> i32 {
+    (4 << levels) + 8
 }
 
 /// Splits a batch into runs that share a kernel depth and do not overlap.
@@ -682,6 +828,24 @@ impl WgpuBackdrop {
             })?;
 
         let effects = build_effect_pipelines(device, &effect_layout, &effect_vertex, format);
+        let punch = capture_validation(device, || {
+            render_pipeline(
+                device,
+                "effect_punch",
+                &effect_layout,
+                (&effect_vertex, "vs_effect"),
+                (&effect_vertex, "fs_punch"),
+                format,
+                Some(DESTINATION_OUT),
+            )
+        })
+        .inspect_err(|error| {
+            effects_advisory(&format!(
+                "`<iframe>` documents cannot show through — the punch pipeline failed to build: \
+                 {error:#}"
+            ));
+        })
+        .ok();
 
         Ok(Self {
             blur_downsample,
@@ -694,8 +858,39 @@ impl WgpuBackdrop {
             effect_globals_bind_group,
             clamp_sampler,
             placeholder_textures,
+            punch,
             targets: None,
+            idle_frames: 0,
         })
+    }
+
+    /// `needed` counts the snapshot as one more level below the pyramid.
+    fn trim_targets(&mut self, needed: usize) {
+        let held = self
+            .targets
+            .as_ref()
+            .map_or(0, |targets| targets.levels.len() + 1);
+        if needed >= held {
+            self.idle_frames = 0;
+            return;
+        }
+        self.idle_frames += 1;
+        if self.idle_frames < SCRATCH_RELEASE_FRAMES {
+            return;
+        }
+        self.idle_frames = 0;
+        match (needed, &mut self.targets) {
+            (0, targets) => *targets = None,
+            (needed, Some(targets)) => targets.levels.truncate(needed - 1),
+            (_, None) => {}
+        }
+    }
+
+    fn effect(&self, effect_id: u32) -> Option<&wgpu::RenderPipeline> {
+        if effect_id == gpui::effect_id::PUNCH {
+            return self.punch.as_ref();
+        }
+        self.effects.get(effect_id as usize)?.as_ref()
     }
 
     fn targets(
@@ -804,6 +999,21 @@ fn build_effect_pipelines(
     pipelines
 }
 
+/// D3D12's `Blend::DestinationOut`: the target times one minus the source's
+/// alpha, an eraser.
+const DESTINATION_OUT: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
 fn effect_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -817,8 +1027,8 @@ fn effect_pipeline(
     capture_validation(device, || {
         let fragment = shader_module(device, &label, wgsl);
         // A backdrop effect rewrites every pixel of its quad from its own
-        // snapshot. Any other blends as DirectX blends it: source alpha over.
-        let blend = (!needs_backdrop).then_some(wgpu::BlendState::ALPHA_BLENDING);
+        // snapshot. Any other is `sk_finish`'s premultiplied colour, drawn over.
+        let blend = (!needs_backdrop).then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
         render_pipeline(
             device,
             &label,
@@ -1034,6 +1244,44 @@ fn effects_advisory(message: &str) {
 mod tests {
     use super::*;
     use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
+
+    thread_local! {
+        /// Forces whole-frame blurs, the reference the region-limited path
+        /// must reproduce.
+        pub(super) static FULL_WINDOW_BACKDROP: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// The scissor of every blur pass drawn on this thread.
+        pub(super) static BLUR_PASS_RECTS: std::cell::RefCell<Vec<PixelRect>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn pixel_rects_match_the_d3d12_helpers() {
+        let rect = PixelRect::round_out(&bounds(10.5, 20., 5.25, 4.), 3);
+        assert_eq!(
+            rect,
+            PixelRect {
+                left: 7,
+                top: 17,
+                right: 19,
+                bottom: 27
+            }
+        );
+        assert_eq!(
+            rect.scale_down(2),
+            PixelRect {
+                left: 0,
+                top: 3,
+                right: 6,
+                bottom: 8
+            }
+        );
+        assert!(
+            rect.intersect(PixelRect::round_out(&bounds(40., 0., 1., 1.), 0))
+                .is_empty()
+        );
+        assert_eq!(blur_reach(2), 24);
+    }
 
     fn module(source: &str) -> naga::Module {
         let module = naga::front::wgsl::parse_str(source).expect("shader should parse");
@@ -1492,6 +1740,21 @@ mod tests {
             }
         }
 
+        /// `glow.slang`'s lobe for [`glow`] over black, at the centre of pixel
+        /// `x` on row 32: premultiplied red, drawn One, OneMinusSrcAlpha.
+        fn expected_glow_red(x: u32) -> u8 {
+            let (reach, peak) = (8_f32, 1_f32);
+            let element_distance = (x as f32 + 0.5 - 32.).abs() - 8.;
+            let signed_distance = element_distance.max(0.5 - 8.);
+            let t = if signed_distance > 0. {
+                signed_distance / reach
+            } else {
+                -signed_distance / (reach * 0.6)
+            };
+            let falloff = (1. - t).clamp(0., 1.);
+            (falloff * falloff * peak * 255.).round() as u8
+        }
+
         #[test]
         fn glow_bleeds_outside_the_element_and_stays_in_its_mask() -> Result<()> {
             let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -1499,16 +1762,21 @@ mod tests {
             scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x000000)));
             scene.insert_primitive(glow(mask(SIDE, SIDE)));
             let image = render(&mut renderer, scene)?;
-            let edge = pixel(&image, 24, 32);
-            let outside = pixel(&image, 22, 32);
-            assert!(edge[0] > 150 && edge[1] == 0, "peak at the edge: {edge:?}");
+            for x in [12, 18, 22, 24, 26, 32, 38, 40, 42, 46] {
+                let actual = pixel(&image, x, 32);
+                let expected = expected_glow_red(x);
+                assert!(
+                    actual[0].abs_diff(expected) <= 2 && actual[1..] == [0, 0, 255],
+                    "glow at x = {x}: {actual:?}, expected red {expected}"
+                );
+            }
+            assert_eq!(expected_glow_red(24), 205, "the peak sits at the edge");
             assert!(
-                outside[0] > 40 && outside[0] < edge[0],
-                "the halo must reach outside the border box: {outside:?}"
+                expected_glow_red(22) > 100,
+                "and reaches outside the border box"
             );
-            assert!(pixel(&image, 42, 32)[0] > 40, "and on every side");
-            assert_eq!(pixel(&image, 12, 32), [0, 0, 0, 255], "beyond the bleed");
-            assert!(pixel(&image, 32, 32)[0] < 8, "the lobe fades inward");
+            assert_eq!(expected_glow_red(12), 0, "but not beyond the bleed");
+            let outside = pixel(&image, 22, 32);
 
             let mut scene = Scene::default();
             scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x000000)));
@@ -1516,6 +1784,214 @@ mod tests {
             let clipped = render(&mut renderer, scene)?;
             assert_eq!(pixel(&clipped, 22, 32), outside, "inside the mask");
             assert_eq!(pixel(&clipped, 42, 32), [0, 0, 0, 255], "outside the mask");
+            Ok(())
+        }
+
+        fn punch(
+            rect: Bounds<ScaledPixels>,
+            content_mask: ContentMask<ScaledPixels>,
+        ) -> EffectQuad {
+            EffectQuad {
+                effect_id: effect_id::PUNCH,
+                bounds: rect,
+                content_mask,
+                corner_radii: Corners::all(ScaledPixels(8.)),
+                opacity: 1.,
+                scale: 1.,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn punch_erases_its_rounded_rect_inside_the_mask() -> Result<()> {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0xff0000)));
+            scene.insert_primitive(punch(bounds(16., 16., 32., 32.), mask(SIDE, 40.)));
+            scene.insert_primitive(quad(bounds(36., 20., 8., 8.), rgb(0x00ff00)));
+            let image = render(&mut renderer, scene)?;
+            assert_eq!(pixel(&image, 24, 24), [0; 4], "the hole is transparent");
+            assert_eq!(
+                pixel(&image, 17, 17),
+                [255, 0, 0, 255],
+                "outside the corner"
+            );
+            assert_eq!(pixel(&image, 8, 8), [255, 0, 0, 255], "outside the rect");
+            assert_eq!(pixel(&image, 24, 44), [255, 0, 0, 255], "outside the mask");
+            assert_eq!(
+                pixel(&image, 40, 24),
+                [0, 255, 0, 255],
+                "a later primitive paints over the hole"
+            );
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0xff0000)));
+            scene.insert_primitive(EffectQuad {
+                opacity: 0.5,
+                ..punch(bounds(16., 16., 32., 32.), mask(SIDE, SIDE))
+            });
+            let half = render(&mut renderer, scene)?;
+            assert_close(
+                pixel(&half, 32, 32),
+                [128, 0, 0, 128],
+                "a half-opaque punch",
+            );
+            Ok(())
+        }
+
+        /// Two scenes sharing stripes; `rect` is the one blurred.
+        fn striped_blur(side: f32, rect: Bounds<ScaledPixels>) -> Scene {
+            let mut scene = Scene::default();
+            let content_mask = mask(side, side);
+            scene.insert_primitive(Quad {
+                content_mask,
+                ..quad(bounds(0., 0., side, side), rgb(0x000000))
+            });
+            for index in 0..(side / 28.) as usize {
+                let x = 16. + index as f32 * 28.;
+                scene.insert_primitive(Quad {
+                    content_mask,
+                    ..quad(bounds(x, 0., 12., side), rgb(0xffffff))
+                });
+            }
+            scene.insert_primitive(BackdropBlurRect {
+                bounds: rect,
+                content_mask,
+                blur_radius: ScaledPixels(6.),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        }
+
+        #[test]
+        fn a_small_blur_processes_its_region_only_and_matches_the_whole_frame() -> Result<()> {
+            const LARGE: i32 = 256;
+            let size = size(DevicePixels(LARGE), DevicePixels(LARGE));
+            let rect = bounds(96., 96., 64., 64.);
+            let scene = striped_blur(LARGE as f32, rect);
+            let levels = scene.backdrop_blur_rects[0].effective_kernel_levels() as usize;
+            assert_eq!(levels, 2);
+
+            BLUR_PASS_RECTS.with_borrow_mut(Vec::clear);
+            let limited = WgpuHeadlessRenderer::new()?.render_scene_to_image(&scene, size)?;
+            let limited_passes = BLUR_PASS_RECTS.take();
+
+            FULL_WINDOW_BACKDROP.set(true);
+            let reference = WgpuHeadlessRenderer::new()?.render_scene_to_image(&scene, size);
+            FULL_WINDOW_BACKDROP.set(false);
+            let reference = reference?;
+            let full_passes = BLUR_PASS_RECTS.take();
+
+            let region = PixelRect::round_out(&rect, blur_reach(levels));
+            let level_rect = |level: usize| PixelRect {
+                left: 0,
+                top: 0,
+                right: LARGE >> level,
+                bottom: LARGE >> level,
+            };
+            assert_eq!(
+                limited_passes,
+                [
+                    region.scale_down(1),
+                    region.scale_down(2),
+                    region.scale_down(1)
+                ],
+                "down to level 2 and back, each within the region"
+            );
+            assert_eq!(
+                full_passes,
+                [level_rect(1), level_rect(2), level_rect(1)],
+                "the reference blurs every level whole"
+            );
+            let area = |rects: &[PixelRect]| {
+                rects
+                    .iter()
+                    .map(|rect| (rect.right - rect.left) * (rect.bottom - rect.top))
+                    .sum::<i32>()
+            };
+            assert!(
+                area(&limited_passes) * 4 < area(&full_passes),
+                "{} of {} pyramid texels",
+                area(&limited_passes),
+                area(&full_passes)
+            );
+
+            let mut largest = 0;
+            for y in 96..160 {
+                for x in 96..160 {
+                    let (limited, reference) = (pixel(&limited, x, y), pixel(&reference, x, y));
+                    for channel in 0..4 {
+                        largest = largest.max(limited[channel].abs_diff(reference[channel]));
+                    }
+                }
+            }
+            assert!(
+                largest <= 2,
+                "inside the rect the region blur is off by {largest}"
+            );
+            assert!(
+                (96..160).any(|x| {
+                    let red = pixel(&limited, x, 128)[0];
+                    red > 16 && red < 240
+                }),
+                "the fixture must blur"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn idle_scratch_targets_are_released_as_on_d3d12() -> Result<()> {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let held = |renderer: &WgpuHeadlessRenderer| -> Result<Option<usize>> {
+                Ok(backdrop(renderer)?
+                    .targets
+                    .as_ref()
+                    .map(|targets| targets.levels.len()))
+            };
+            let mut blurred = split_scene();
+            blurred.insert_primitive(blur_rect());
+            blurred.finish();
+            renderer.render_scene(&blurred, frame_size())?;
+            assert_eq!(held(&renderer)?, Some(2));
+
+            let mut frosted = Scene::default();
+            frosted.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0xff0000)));
+            frosted.insert_primitive(EffectQuad {
+                effect_id: effect_id::FROST,
+                bounds: bounds(8., 8., 48., 48.),
+                content_mask: mask(SIDE, SIDE),
+                params0: [1., 0., 0., 0.],
+                opacity: 1.,
+                scale: 1.,
+                flags: EFFECT_FLAG_NEEDS_BACKDROP,
+                ..Default::default()
+            });
+            frosted.finish();
+            renderer.render_scene(&frosted, frame_size())?;
+            assert_eq!(
+                held(&renderer)?,
+                Some(2),
+                "a short gap must not release levels a recent frame used"
+            );
+            for _ in 0..SCRATCH_RELEASE_FRAMES {
+                renderer.render_scene(&frosted, frame_size())?;
+            }
+            assert_eq!(
+                held(&renderer)?,
+                Some(0),
+                "a zero-radius effect keeps the snapshot and no levels"
+            );
+            for _ in 0..SCRATCH_RELEASE_FRAMES {
+                renderer.render_scene(&Scene::default(), frame_size())?;
+            }
+            assert_eq!(
+                held(&renderer)?,
+                None,
+                "a scene without backdrops releases the snapshot"
+            );
+            renderer.render_scene(&blurred, frame_size())?;
+            assert_eq!(held(&renderer)?, Some(2), "and a later blur gets them back");
             Ok(())
         }
 

@@ -61,8 +61,9 @@ const BACKDROP_SHADERS: &str = concat!(
 /// The blur pyramid passes, standalone: their bindings sit in group 0.
 const BLUR_SHADERS: &str = include_str!("shaders_blur.wgsl");
 
-/// The vertex stage of every `--shading` effect, standalone: its group 0 is the
-/// DirectX-layout globals the generated fragment stages read.
+/// The vertex stage of every `--shading` effect and the `<iframe>` punch's
+/// fragment stage, standalone: its group 0 is the DirectX-layout globals the
+/// generated fragment stages read.
 const EFFECT_VERTEX_SHADER: &str = include_str!("shaders_effects.wgsl");
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {

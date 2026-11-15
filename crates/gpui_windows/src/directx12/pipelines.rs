@@ -331,7 +331,7 @@ impl Pipelines {
                     if effect.needs_backdrop {
                         Blend::Replace
                     } else {
-                        Blend::Straight
+                        Blend::Premultiplied
                     },
                 )
             }
@@ -486,6 +486,8 @@ fn module_blend(module: ShaderModule) -> Blend {
         | ShaderModule::VnLayer => Blend::Premultiplied,
         ShaderModule::SubpixelSprite => Blend::Subpixel,
         ShaderModule::Effect(effect) if effect.needs_backdrop() => Blend::Replace,
+        // `sk_finish` outputs premultiplied colour.
+        ShaderModule::Effect(_) => Blend::Premultiplied,
         _ => Blend::Straight,
     }
 }

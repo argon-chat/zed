@@ -2680,6 +2680,15 @@ mod tests {
             scale: 1.,
             ..Default::default()
         });
+        scene.insert_primitive(EffectQuad {
+            effect_id: effect_id::PUNCH,
+            bounds: bounds(44., 44., 18., 14.),
+            content_mask: mask(64., 54.),
+            corner_radii: Corners::all(ScaledPixels(5.)),
+            opacity: 0.75,
+            scale: 1.,
+            ..Default::default()
+        });
         scene.finish();
 
         let native =
