@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 pub const APP_EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
 
 /// The `effects.json` layout this build understands.
-pub const APP_EFFECTS_SCHEMA: u32 = 9;
+pub const APP_EFFECTS_SCHEMA: u32 = 10;
 
 /// One generated shader of an [`AppEffect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,7 +357,7 @@ mod tests {
     fn the_manifest_resolves_each_effect_to_its_shader_per_target() -> Result<(), String> {
         let app = AppEffects::new(
             "test",
-            r#"{"schema": 9, "kind": "user", "effects": [
+            r#"{"schema": 10, "kind": "user", "effects": [
                 {"name": "ripple", "backdrop": true, "hlsl": "ripple.hlsl", "wgsl": "ripple.wgsl"},
                 {"name": "plain", "backdrop": false, "hlsl": "plain.hlsl"}
             ]}"#,

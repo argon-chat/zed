@@ -1740,8 +1740,15 @@ impl Style {
             );
         }
         let corner_radii = self.corner_radii_for(bounds.size, window.rem_size());
-        self.paint_backdrop(bounds, corner_radii, window, &effects, element);
-        let shaded: Vec<_> = effects.iter().flatten().copied().collect();
+        self.paint_backdrop(bounds, corner_radii, window, cx, &effects, element);
+        let shaded: Vec<_> = effects
+            .iter()
+            .flatten()
+            .map(|(spec, weight)| {
+                let textures = crate::resolve_effect_textures(spec, window, cx);
+                (*spec, *weight, textures)
+            })
+            .collect();
         window.vn_with_effect_content(bounds, corner_radii, &shaded, element, |window| {
             self.paint_untransformed(bounds, window, cx, continuation, &effects, element, true)
         })
@@ -1761,6 +1768,7 @@ impl Style {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         window: &mut Window,
+        cx: &mut App,
         effects: &[Option<(EffectSpec, f32)>; 2],
         element: u64,
     ) {
@@ -1774,7 +1782,7 @@ impl Style {
                 crate::BackdropBlurEffect::new(radius),
             );
         }
-        Self::paint_effects(bounds, corner_radii, window, effects, element, true);
+        Self::paint_effects(bounds, corner_radii, window, cx, effects, element, true);
     }
 
     /// The effects of one kind that do not read the element's content: the
@@ -1786,6 +1794,7 @@ impl Style {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         window: &mut Window,
+        cx: &mut App,
         effects: &[Option<(EffectSpec, f32)>; 2],
         element: u64,
         backdrop: bool,
@@ -1795,7 +1804,7 @@ impl Style {
                 && (spec.flags & crate::EFFECT_FLAG_NEEDS_BACKDROP != 0) == backdrop
             {
                 window.with_element_opacity((*weight < 1.).then_some(*weight), |window| {
-                    window.vn_paint_effect(bounds, corner_radii, *spec, element)
+                    window.vn_paint_textured_effect(bounds, corner_radii, *spec, element, cx)
                 });
             }
         }
@@ -1851,7 +1860,7 @@ impl Style {
         }
 
         if !in_content {
-            self.paint_backdrop(bounds, corner_radii, window, effects, element);
+            self.paint_backdrop(bounds, corner_radii, window, cx, effects, element);
         }
         // The background quads: the whole box, or only the ring.
         let fill = |background: Background| match ring_widths {
@@ -1901,7 +1910,7 @@ impl Style {
             window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
         }
 
-        Self::paint_effects(bounds, corner_radii, window, effects, element, false);
+        Self::paint_effects(bounds, corner_radii, window, cx, effects, element, false);
 
         continuation(window, cx);
 

@@ -1779,7 +1779,7 @@ struct VnLayer {
 
 StructuredBuffer<VnLayer> vn_layers: register(t1);
 // `[x0, y0, x1, y1]`, every layer's edges; a layer names its run.
-StructuredBuffer<float4> vn_clip_segments: register(t3);
+StructuredBuffer<float4> vn_clip_segments: register(t9);
 
 // Same layout as gpui::VnTextBackground: one stack entry, not per glyph.
 struct VnTextBackground {
@@ -1789,7 +1789,7 @@ struct VnTextBackground {
     float scale_factor;
     float pad;
 };
-StructuredBuffer<VnTextBackground> vn_text_backgrounds: register(t4);
+StructuredBuffer<VnTextBackground> vn_text_backgrounds: register(t10);
 
 
 struct VnLayerVertexOutput {

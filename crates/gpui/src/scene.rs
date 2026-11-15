@@ -52,6 +52,10 @@ pub struct Scene {
     pub quads: Vec<Quad>,
     pub backdrop_blur_rects: Vec<BackdropBlurRect>,
     pub effect_quads: Vec<EffectQuad>,
+    /// vue-native fork: the images effect quads sample; [`EffectQuad::texture_set`]
+    /// indexes it.
+    pub effect_texture_sets: Vec<std::sync::Arc<crate::EffectTextureSet>>,
+    effect_texture_set_index: HashMap<crate::EffectTextureKey, usize>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
@@ -166,11 +170,14 @@ pub struct VnLayer {
 
 /// vue-native fork: one `--shading` quad of a [`VnEffectLayer`], with the key
 /// of its history (0 for none).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct VnEffectDraw {
     pub quad: EffectQuad,
     pub history: u64,
+    /// The images the quad samples; in [`Scene::vn_effect_draws`] they are
+    /// interned like a primitive's ([`EffectQuad::texture_set`]) and this is None.
+    pub textures: Option<std::sync::Arc<crate::EffectTextureSet>>,
 }
 
 /// vue-native fork: a [`VnLayer`] composited by its [`Scene::vn_effect_draws`]
@@ -270,9 +277,15 @@ impl VnGroupLists {
             .sort_by_key(|backdrop_blur_rect| backdrop_blur_rect.order);
         // Secondary key `effect_id`: the batch iterator breaks a run when the
         // id changes (each id is a different pipeline), so sorting by it keeps
-        // same-effect quads at the same draw order in ONE instanced draw.
-        self.effect_quads
-            .sort_by_key(|effect_quad| (effect_quad.order, effect_quad.effect_id));
+        // same-effect quads at the same draw order in ONE instanced draw. The
+        // texture set breaks a run the same way.
+        self.effect_quads.sort_by_key(|effect_quad| {
+            (
+                effect_quad.order,
+                effect_quad.effect_id,
+                effect_quad.texture_set(),
+            )
+        });
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -332,6 +345,8 @@ impl Scene {
         self.quads.clear();
         self.backdrop_blur_rects.clear();
         self.effect_quads.clear();
+        self.effect_texture_sets.clear();
+        self.effect_texture_set_index.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
@@ -555,11 +570,15 @@ impl Scene {
         let snapshots = effect.draws.iter().any(|draw| draw.quad.needs_backdrop());
         let order = self.order_for(snapshots, bounds);
         let start = self.vn_effect_draws.len() as u32;
-        self.vn_effect_draws
-            .extend(effect.draws.iter().map(|draw| VnEffectDraw {
-                quad: EffectQuad { order, ..draw.quad },
+        for draw in &effect.draws {
+            let mut quad = EffectQuad { order, ..draw.quad };
+            self.vn_set_effect_textures(&mut quad, draw.textures.as_ref());
+            self.vn_effect_draws.push(VnEffectDraw {
+                quad,
                 history: draw.history,
-            }));
+                textures: None,
+            });
+        }
         self.vn_layers.push(VnLayer {
             order,
             group: group_index,
@@ -681,6 +700,30 @@ impl Scene {
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    /// vue-native fork: points `quad` at `textures` in
+    /// [`Self::effect_texture_sets`], which holds each distinct set of images once.
+    fn vn_set_effect_textures(
+        &mut self,
+        quad: &mut EffectQuad,
+        textures: Option<&std::sync::Arc<crate::EffectTextureSet>>,
+    ) {
+        quad.flags &= (1 << crate::EFFECT_FLAG_TEXTURE_SET_SHIFT) - 1;
+        let Some(textures) = textures else {
+            return;
+        };
+        let key = crate::effect_texture_key(textures);
+        let index = match self.effect_texture_set_index.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = self.effect_texture_sets.len();
+                self.effect_texture_sets.push(textures.clone());
+                self.effect_texture_set_index.insert(key, index);
+                index
+            }
+        };
+        quad.flags |= (index as u32 + 1) << crate::EFFECT_FLAG_TEXTURE_SET_SHIFT;
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         // The content mask is a WINDOW-space rect and `bounds` is the
@@ -713,8 +756,9 @@ impl Scene {
                 backdrop_blur_rect.order = order;
                 self.backdrop_blur_rects.push(*backdrop_blur_rect);
             }
-            Primitive::EffectQuad(effect_quad) => {
+            Primitive::EffectQuad(effect_quad, textures) => {
                 effect_quad.order = order;
+                self.vn_set_effect_textures(effect_quad, textures.as_ref());
                 self.effect_quads.push(*effect_quad);
             }
             Primitive::Path(path) => {
@@ -840,7 +884,7 @@ impl Scene {
     ) -> DrawOrder {
         let snapshots_backdrop = match primitive {
             Primitive::BackdropBlurRect(_) => true,
-            Primitive::EffectQuad(effect_quad) => effect_quad.needs_backdrop(),
+            Primitive::EffectQuad(effect_quad, _) => effect_quad.needs_backdrop(),
             _ => false,
         };
         self.order_for(snapshots_backdrop, clipped_bounds)
@@ -927,7 +971,8 @@ pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     BackdropBlurRect(BackdropBlurRect),
-    EffectQuad(EffectQuad),
+    /// vue-native fork: with the images it samples.
+    EffectQuad(EffectQuad, Option<std::sync::Arc<crate::EffectTextureSet>>),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -943,7 +988,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::BackdropBlurRect(backdrop_blur_rect) => &backdrop_blur_rect.bounds,
-            Primitive::EffectQuad(effect_quad) => &effect_quad.bounds,
+            Primitive::EffectQuad(effect_quad, _) => &effect_quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -967,7 +1012,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => Some(sprite.transformation),
             Primitive::PolychromeSprite(sprite) => Some(sprite.transformation),
             Primitive::BackdropBlurRect(_)
-            | Primitive::EffectQuad(_)
+            | Primitive::EffectQuad(..)
             | Primitive::Path(_)
             | Primitive::Surface(_) => None,
         }
@@ -978,7 +1023,7 @@ impl Primitive {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::BackdropBlurRect(backdrop_blur_rect) => &backdrop_blur_rect.content_mask,
-            Primitive::EffectQuad(effect_quad) => &effect_quad.content_mask,
+            Primitive::EffectQuad(effect_quad, _) => &effect_quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -1203,8 +1248,10 @@ impl<'a> BatchIterator<'a> {
             PrimitiveKind::EffectQuad => {
                 // Each `effect_id` is a different fragment pipeline, so a run
                 // breaks when it changes — the same shape as the sprite batches
-                // breaking on `texture_id`.
-                let effect_id = self.effect_quads_iter.peek().unwrap().effect_id;
+                // breaking on `texture_id`. Its images break it too: a batch
+                // binds one texture set, its first quad's.
+                let first = self.effect_quads_iter.peek().unwrap();
+                let (effect_id, textures) = (first.effect_id, first.texture_set());
                 let effect_quads_start = self.effect_quads_start;
                 let mut effect_quads_end = effect_quads_start + 1;
                 self.effect_quads_iter.next();
@@ -1213,6 +1260,7 @@ impl<'a> BatchIterator<'a> {
                     .next_if(|effect_quad| {
                         (effect_quad.order, batch_kind) < max_order_and_kind
                             && effect_quad.effect_id == effect_id
+                            && effect_quad.texture_set() == textures
                     })
                     .is_some()
                 {
@@ -1845,6 +1893,10 @@ pub struct EffectSpec {
     pub clock_window: f32,
     /// The positional parameters, in schema order.
     pub params: [f32; EFFECT_PARAM_SLOTS],
+    /// The `SkTexture` parameters by binding: `None` past the ones the effect
+    /// declares.
+    #[serde(default)]
+    pub textures: [Option<crate::EffectTextureParam>; crate::EFFECT_TEXTURE_SLOTS],
 }
 
 impl EffectSpec {
@@ -1862,11 +1914,19 @@ impl EffectSpec {
         clock_mask: 0,
         clock_window: 0.,
         params: [0.; EFFECT_PARAM_SLOTS],
+        textures: [None; crate::EFFECT_TEXTURE_SLOTS],
     };
 
     /// Whether this spec actually paints anything.
     pub fn is_some(&self) -> bool {
         self.id != effect_id::NONE
+    }
+
+    /// Whether a transition can interpolate from `self` to `other` slot by
+    /// slot: the same effect sampling the same images. Otherwise it
+    /// cross-fades, since an image does not interpolate.
+    pub fn interpolates_with(&self, other: &EffectSpec) -> bool {
+        self.id == other.id && self.textures == other.textures
     }
 
     /// Whether the painter fills a pointer parameter, so the element repaints
@@ -2020,7 +2080,7 @@ impl EffectQuad {
 
 impl From<EffectQuad> for Primitive {
     fn from(effect_quad: EffectQuad) -> Self {
-        Primitive::EffectQuad(effect_quad)
+        Primitive::EffectQuad(effect_quad, None)
     }
 }
 

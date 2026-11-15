@@ -1708,6 +1708,7 @@ impl WgpuRendererCore {
                             backdrop::EffectPass::Skip => {}
                             backdrop::EffectPass::Blended => self.draw_blended_effects(
                                 effect_id,
+                                effect_quads[0].texture_set(),
                                 &instance_bindings.effect_quads,
                                 instance_range(range),
                                 &mut pass,

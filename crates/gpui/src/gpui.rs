@@ -33,6 +33,7 @@ mod asset_cache;
 mod assets;
 mod bounds_tree;
 mod color;
+mod effect_textures;
 mod element;
 mod elements;
 mod executor;
@@ -44,9 +45,9 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod keymap;
-mod path_builder;
 /// Optional embedder hooks for recording native drawing spans.
 pub mod native_profiling;
+mod path_builder;
 mod platform;
 mod platform_scheduler;
 mod scene;
@@ -61,9 +62,9 @@ mod taffy;
 mod text_system;
 mod util;
 mod view;
-mod window;
 mod vn_clip;
 mod vn_effect_history;
+mod window;
 
 #[cfg(feature = "profiler")]
 mod debug_overlay;
@@ -125,6 +126,7 @@ pub use app_effects::*;
 pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
+pub use effect_textures::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
@@ -155,9 +157,9 @@ pub use taffy::{AvailableSpace, LayoutId, VnRetainedLayoutStats};
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
-pub use window::*;
 pub use vn_clip::*;
 pub use vn_effect_history::*;
+pub use window::*;
 
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;

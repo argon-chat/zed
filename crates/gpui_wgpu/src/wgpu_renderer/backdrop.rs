@@ -83,10 +83,15 @@ pub(super) struct WgpuBackdrop {
     effect_globals_buffer: wgpu::Buffer,
     pub(super) effect_globals_bind_group: wgpu::BindGroup,
     clamp_sampler: wgpu::Sampler,
+    /// At binding 9, for an effect's images.
+    repeat_sampler: wgpu::Sampler,
     placeholder: TargetTexture,
     /// Group 2 of an effect that does not read the backdrop: its shader still
     /// declares the textures.
     placeholder_textures: wgpu::BindGroup,
+    effect_images: gpui::EffectTextureCache<wgpu::TextureView>,
+    /// This frame's `Scene::effect_texture_sets`, uploaded.
+    frame_effect_images: Vec<[Option<wgpu::TextureView>; gpui::EFFECT_TEXTURE_SLOTS]>,
     /// `gpui::effect_id::PUNCH`.
     punch: Option<wgpu::RenderPipeline>,
     /// `gpui::effect_id::CONTENT`.
@@ -208,6 +213,7 @@ impl WgpuRendererCore {
             is_bgr: self.is_bgr as u32,
             pad: [0; 3],
         };
+        let color_format = self.atlas.color_texture_format();
         let resources = &mut self.resources;
         let BackdropState::Ready(state) = &mut resources.backdrop else {
             return frame;
@@ -217,6 +223,7 @@ impl WgpuRendererCore {
             0,
             bytemuck::bytes_of(&globals),
         );
+        state.upload_effect_images(&resources.device, &resources.queue, color_format, scene);
 
         if snapshots && !target.usage().contains(wgpu::TextureUsages::COPY_SRC) {
             let targets = state.targets(
@@ -338,7 +345,7 @@ impl WgpuRendererCore {
             #[cfg(not(test))]
             let region = Some(region);
             let textures =
-                self.snapshot_backdrop(encoder, frame, kernel_levels, region, [None, None])?;
+                self.snapshot_backdrop(encoder, frame, kernel_levels, region, [None, None], None)?;
             let state = self
                 .resources
                 .backdrop
@@ -384,6 +391,7 @@ impl WgpuRendererCore {
     pub(super) fn draw_blended_effects(
         &self,
         effect_id: u32,
+        images: Option<usize>,
         instances: &InstanceBinding,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
@@ -397,7 +405,18 @@ impl WgpuRendererCore {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &state.effect_globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &state.placeholder_textures, &[]);
+        match images {
+            Some(_) => {
+                let textures = state.effect_textures(
+                    &self.resources.device,
+                    [None, None],
+                    [None, None],
+                    images,
+                );
+                pass.set_bind_group(2, &textures, &[]);
+            }
+            None => pass.set_bind_group(2, &state.placeholder_textures, &[]),
+        }
         pass.draw(
             0..4,
             instances.first_instance + range.start..instances.first_instance + range.end,
@@ -421,8 +440,9 @@ impl WgpuRendererCore {
         }) {
             let kernel_levels = effect_quads[group.start].effective_kernel_levels() as usize;
             // An effect may sample its backdrop anywhere, as on D3D12.
+            let images = effect_quads[0].texture_set();
             let textures =
-                self.snapshot_backdrop(encoder, frame, kernel_levels, None, [None, None])?;
+                self.snapshot_backdrop(encoder, frame, kernel_levels, None, [None, None], images)?;
             let state = self
                 .resources
                 .backdrop
@@ -442,8 +462,8 @@ impl WgpuRendererCore {
     /// Copies what the frame holds so far and blurs it `kernel_levels` deep,
     /// within `region` (frame pixels, the kernel's reach included) or the
     /// whole frame. Returns group 2 for the composite: the processed backdrop,
-    /// the clamping sampler, the untouched snapshot and `layer`, an effect
-    /// layer's content and history.
+    /// the clamping sampler, the untouched snapshot, `layer` (an effect
+    /// layer's content and history) and the effect's `images`.
     fn snapshot_backdrop(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -451,6 +471,7 @@ impl WgpuRendererCore {
         kernel_levels: usize,
         region: Option<PixelRect>,
         layer: [Option<&wgpu::TextureView>; 2],
+        images: Option<usize>,
     ) -> Result<wgpu::BindGroup> {
         let kernel_levels = kernel_levels.min(BLUR_TEXTURE_LEVELS);
         let resources = &mut self.resources;
@@ -573,6 +594,7 @@ impl WgpuRendererCore {
             &resources.device,
             [Some(blurred), Some(&targets.snapshot.view)],
             layer,
+            images,
         ))
     }
 
@@ -583,8 +605,9 @@ impl WgpuRendererCore {
         frame: &FrameTarget,
         kernel_levels: usize,
         layer: [Option<&wgpu::TextureView>; 2],
+        images: Option<usize>,
     ) -> Result<wgpu::BindGroup> {
-        self.snapshot_backdrop(encoder, frame, kernel_levels, None, layer)
+        self.snapshot_backdrop(encoder, frame, kernel_levels, None, layer, images)
     }
 
     fn source_bind_group(
@@ -747,8 +770,18 @@ impl WgpuBackdrop {
                     count: None,
                 },
                 texture_entry(2),
+                texture_entry(3),
+                texture_entry(4),
+                texture_entry(5),
+                texture_entry(6),
                 texture_entry(7),
                 texture_entry(8),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let effect_globals_size = std::mem::size_of::<EffectGlobals>() as u64;
@@ -788,6 +821,14 @@ impl WgpuBackdrop {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("effect_repeat_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let placeholder = create_target_texture(
             device,
             "backdrop_placeholder",
@@ -799,8 +840,9 @@ impl WgpuBackdrop {
         let placeholder_textures = textures_bind_group(
             device,
             &textures_layout,
-            &clamp_sampler,
+            (&clamp_sampler, &repeat_sampler),
             [&placeholder.view; 4],
+            [&placeholder.view; gpui::EFFECT_TEXTURE_SLOTS],
         );
 
         let pass_layout = pipeline_layout(device, "backdrop_pass_layout", &[&layouts.texture]);
@@ -901,8 +943,11 @@ impl WgpuBackdrop {
             effect_globals_buffer,
             effect_globals_bind_group,
             clamp_sampler,
+            repeat_sampler,
             placeholder,
             placeholder_textures,
+            effect_images: Default::default(),
+            frame_effect_images: Vec::new(),
             punch,
             content,
             histories: Default::default(),
@@ -944,26 +989,60 @@ impl WgpuBackdrop {
         });
     }
 
-    /// Group 2 of an effect: the backdrop as blurred and as snapshotted, then
-    /// an effect layer's content and history; a placeholder for each absent.
+    /// Group 2 of an effect: the backdrop as blurred and as snapshotted, an
+    /// effect layer's content and history, and the images of texture set
+    /// `images` (`EffectQuad::texture_set`); a placeholder for each absent.
     pub(super) fn effect_textures(
         &self,
         device: &wgpu::Device,
         backdrop: [Option<&wgpu::TextureView>; 2],
         layer: [Option<&wgpu::TextureView>; 2],
+        images: Option<usize>,
     ) -> wgpu::BindGroup {
         let placeholder = &self.placeholder.view;
+        let images = images.and_then(|set| self.frame_effect_images.get(set));
         textures_bind_group(
             device,
             &self.textures_layout,
-            &self.clamp_sampler,
+            (&self.clamp_sampler, &self.repeat_sampler),
             [
                 backdrop[0].unwrap_or(placeholder),
                 backdrop[1].unwrap_or(placeholder),
                 layer[0].unwrap_or(placeholder),
                 layer[1].unwrap_or(placeholder),
             ],
+            std::array::from_fn(|slot| {
+                images
+                    .and_then(|images| images[slot].as_ref())
+                    .unwrap_or(placeholder)
+            }),
         )
+    }
+
+    /// Uploads the images this frame's effects sample that are not on the GPU yet.
+    fn upload_effect_images(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        scene: &Scene,
+    ) {
+        self.effect_images.begin_frame();
+        let cache = &mut self.effect_images;
+        self.frame_effect_images = scene
+            .effect_texture_sets
+            .iter()
+            .map(|set| {
+                std::array::from_fn(|slot| {
+                    let texture = set[slot].as_ref()?;
+                    cache
+                        .get(texture, |width, height, texels| {
+                            upload_effect_texture(device, queue, format, width, height, texels)
+                        })
+                        .cloned()
+                })
+            })
+            .collect();
     }
 
     /// The `[SkHistory]` step of app effect `effect_id`.
@@ -1092,27 +1171,87 @@ fn build_builtin_effect_pipelines(
 fn textures_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
+    (clamp, repeat): (&wgpu::Sampler, &wgpu::Sampler),
     [blurred, snapshot, content, history]: [&wgpu::TextureView; 4],
+    [image0, image1, image2, image3]: [&wgpu::TextureView; gpui::EFFECT_TEXTURE_SLOTS],
 ) -> wgpu::BindGroup {
     let texture = |binding, view| wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::TextureView(view),
+    };
+    let sampler = |binding, sampler| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Sampler(sampler),
     };
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("effect_textures"),
         layout,
         entries: &[
             texture(0, blurred),
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
+            sampler(1, clamp),
             texture(2, snapshot),
+            texture(3, image0),
+            texture(4, image1),
+            texture(5, image2),
+            texture(6, image3),
             texture(7, content),
             texture(8, history),
+            sampler(9, repeat),
         ],
     })
+}
+
+/// `format` is the atlas's colour format, `Bgra8Unorm` or `Rgba8Unorm`.
+fn upload_effect_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    texels: &[u8],
+) -> Result<wgpu::TextureView> {
+    let limit = device.limits().max_texture_dimension_2d;
+    anyhow::ensure!(
+        width <= limit && height <= limit,
+        "a {width}x{height} image is larger than this GPU's {limit}px textures"
+    );
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("effect_texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let swizzled;
+    let texels = if format == wgpu::TextureFormat::Rgba8Unorm {
+        let mut rgba = texels.to_vec();
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        swizzled = rgba;
+        &swizzled[..]
+    } else {
+        texels
+    };
+    queue.write_texture(
+        texture.as_image_copy(),
+        texels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    Ok(texture.create_view(&wgpu::TextureViewDescriptor::default()))
 }
 
 /// D3D12's `Blend::DestinationOut`: the target times one minus the source's
@@ -2172,7 +2311,7 @@ pub(super) mod tests {
             gpui::reload_app_effects(
                 gpui::AppEffects::new(
                     "test",
-                    r#"{"schema": 9, "effects": [
+                    r#"{"schema": 10, "effects": [
                         {"name": "tint", "backdrop": false, "wgsl": "tint.wgsl"}
                     ]}"#,
                     [("tint.wgsl".to_string(), wgsl.to_string())],
@@ -2226,6 +2365,64 @@ pub(super) mod tests {
                 [0, 255, 0, 255],
                 "a replacement that does not compile keeps the last good pipeline"
             );
+            Ok(())
+        }
+
+        #[test]
+        fn effect_images_bind_per_quad_premultiplied_unless_linear() -> Result<()> {
+            use gpui::{EffectTexture, Primitive, RenderImage};
+            use std::sync::Arc;
+
+            let _app_effects = APP_EFFECTS.lock();
+            install_app_effect(
+                "@group(2) @binding(3) var t0: texture_2d<f32>;
+                 @group(2) @binding(4) var t1: texture_2d<f32>;
+                 @group(2) @binding(9) var wrap: sampler;
+                 @fragment fn effect_fragment(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                     if (p.y < 32.0) {
+                         return vec4<f32>(textureSampleLevel(t0, wrap, vec2<f32>(0.25, 0.5), 0.0).rgb, 1.0);
+                     }
+                     return vec4<f32>(textureSampleLevel(t1, wrap, vec2<f32>(1.25, 0.5), 0.0).rgb, 1.0);
+                 }",
+            )?;
+            let image = |bgra: &[[u8; 4]]| {
+                let buffer =
+                    image::RgbaImage::from_raw(bgra.len() as u32, 1, bgra.concat()).unwrap();
+                Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+            };
+            let halves = image(&[[0, 0, 255, 128], [255, 0, 0, 255]]);
+            let green = image(&[[0, 255, 0, 255]]);
+            let set = |first: &Arc<RenderImage>| {
+                let mut set = gpui::EffectTextureSet::default();
+                set[0] = Some(EffectTexture {
+                    image: first.clone(),
+                    linear: false,
+                });
+                set[1] = Some(EffectTexture {
+                    image: halves.clone(),
+                    linear: true,
+                });
+                Some(Arc::new(set))
+            };
+            let effect = |x: f32| EffectQuad {
+                effect_id: effect_id::COUNT,
+                bounds: bounds(x, 0., SIDE / 2., SIDE),
+                content_mask: mask(SIDE, SIDE),
+                opacity: 1.,
+                scale: 1.,
+                ..Default::default()
+            };
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x000000)));
+            scene.insert_primitive(Primitive::EffectQuad(effect(0.), set(&halves)));
+            scene.insert_primitive(Primitive::EffectQuad(effect(SIDE / 2.), set(&green)));
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let image = render(&mut renderer, scene)?;
+            assert_close(pixel(&image, 16, 16), [128, 0, 0, 255], "colour");
+            assert_close(pixel(&image, 16, 48), [255, 0, 0, 255], "linear");
+            assert_close(pixel(&image, 48, 16), [0, 255, 0, 255], "second");
+            assert_close(pixel(&image, 48, 48), [255, 0, 0, 255], "shared");
             Ok(())
         }
 

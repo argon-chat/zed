@@ -166,10 +166,12 @@ struct DirectXRenderPipelines {
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
     /// vue-native fork: the isolated layer composite, and the clip segments
-    /// it reads at t3.
+    /// it reads at t9.
     vn_layer_pipeline: PipelineState<VnLayer>,
     vn_clip_segments: VnStructuredBuffer,
     vn_text_backgrounds: VnStructuredBuffer,
+    /// The images of `--shading` effects, bound at t3..t6.
+    effect_textures: EffectTextureCache<ID3D11ShaderResourceView>,
 }
 
 struct AppEffectPipeline {
@@ -501,6 +503,7 @@ impl DirectXRenderer {
         })?;
         self.prepare_vn_effects(scene)?;
         self.upload_scene_buffers(scene)?;
+        self.pipelines.effect_textures.begin_frame();
 
         // vue-native fork: the root group, and through its composites every
         // isolated layer's (`Scene::vn_batches`).
@@ -548,6 +551,10 @@ impl DirectXRenderer {
                     effect_id,
                     &scene.effect_quads[range.clone()],
                     range.start,
+                    scene.effect_quads[range.start]
+                        .texture_set()
+                        .and_then(|set| scene.effect_texture_sets.get(set))
+                        .map(|set| &**set),
                 ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
@@ -612,7 +619,7 @@ impl DirectXRenderer {
         self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources(
             &devices.device_context,
             None,
-            &[(0, layer_texture), (3, segments), (4, text_backgrounds)],
+            &[(0, layer_texture), (9, segments), (10, text_backgrounds)],
             self.globals
                 .batch_params_buffer
                 .as_ref()
@@ -773,10 +780,17 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|history| (history.read.clone(), history.step.clone(), history.fresh));
             let history_srv = history.as_ref().and_then(|(read, _, _)| read.srv.clone());
+            let views = quad
+                .texture_set()
+                .and_then(|set| scene.effect_texture_sets.get(set))
+                .map(|set| self.effect_texture_views(set))
+                .unwrap_or_default();
             let layer = [
+                (3, &views[..]),
                 (7, slice::from_ref(&content)),
                 (8, slice::from_ref(&history_srv)),
             ];
+            let samplers = self.effect_samplers();
             let devices = self.devices.as_ref().context("devices missing")?;
             let batch_params = self
                 .globals
@@ -805,7 +819,7 @@ impl DirectXRenderer {
                         None,
                         &layer,
                         batch_params,
-                        &self.samplers(),
+                        &samplers,
                         *step,
                         1,
                     )?;
@@ -834,6 +848,7 @@ impl DirectXRenderer {
                     1,
                     kernel_levels,
                     [&content, &history_srv],
+                    &views,
                 )?;
                 continue;
             }
@@ -846,7 +861,7 @@ impl DirectXRenderer {
                 None,
                 &layer,
                 batch_params,
-                &self.samplers(),
+                &samplers,
                 instance,
                 1,
             )?;
@@ -1218,28 +1233,36 @@ impl DirectXRenderer {
         effect_id: u32,
         effect_quads: &[EffectQuad],
         start: usize,
+        textures: Option<&EffectTextureSet>,
     ) -> Result<()> {
         if effect_quads.is_empty() {
             return Ok(());
         }
-        let Some(pipeline) = self.pipelines.effect(effect_id) else {
+        if self.pipelines.effect(effect_id).is_none() {
             // Building the pipeline already explained why, once. Skipping the
             // draw is the documented degradation: every other style on the
             // element still renders.
             return Ok(());
-        };
+        }
+        let views = textures
+            .map(|set| self.effect_texture_views(set))
+            .unwrap_or_default();
 
         if !effect_quads[0].needs_backdrop() {
             let devices = self.devices.as_ref().context("devices missing")?;
+            let pipeline = self
+                .pipelines
+                .effect(effect_id)
+                .context("effect pipeline missing")?;
             return pipeline.draw_range_with_texture_resources(
                 &devices.device_context,
                 None,
-                &[],
+                &[(3, &views[..])],
                 self.globals
                     .batch_params_buffer
                     .as_ref()
                     .context("batch params buffer missing")?,
-                &self.samplers(),
+                &self.effect_samplers(),
                 start as u32,
                 effect_quads.len() as u32,
             );
@@ -1275,6 +1298,7 @@ impl DirectXRenderer {
                 group_end - group_start,
                 kernel_levels,
                 [&None, &None],
+                &views,
             )?;
             group_start = group_end;
         }
@@ -1284,8 +1308,8 @@ impl DirectXRenderer {
 
     /// Binds the processed backdrop at t0 and the untouched snapshot at t2 —
     /// the same register contract the blur composite uses, which is exactly why
-    /// a Slang effect module drops into it with no renderer changes — and an
-    /// effect layer's content and history at t7 and t8.
+    /// a Slang effect module drops into it with no renderer changes — its
+    /// images at t3..t6, and an effect layer's content and history at t7 and t8.
     fn composite_effect_quads(
         &self,
         effect_id: u32,
@@ -1293,6 +1317,7 @@ impl DirectXRenderer {
         len: usize,
         kernel_levels: usize,
         [content, history]: [&Option<ID3D11ShaderResourceView>; 2],
+        textures: &[Option<ID3D11ShaderResourceView>; EFFECT_TEXTURE_SLOTS],
     ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
@@ -1310,6 +1335,7 @@ impl DirectXRenderer {
         let fragment_textures = [
             (0, backdrop_texture),
             (2, original_texture),
+            (3, &textures[..]),
             (7, slice::from_ref(content)),
             (8, slice::from_ref(history)),
         ];
@@ -1335,7 +1361,7 @@ impl DirectXRenderer {
                     .batch_params_buffer
                     .as_ref()
                     .context("batch params buffer missing")?,
-                &self.samplers(),
+                &self.effect_samplers(),
                 start as u32,
                 len as u32,
             )?;
@@ -1507,6 +1533,33 @@ impl DirectXRenderer {
             self.globals.sampler.clone(),
             self.globals.clamp_sampler.clone(),
         ]
+    }
+
+    /// [`Self::samplers`], plus the wrapping one at s2 for an effect's images.
+    fn effect_samplers(&self) -> [Option<ID3D11SamplerState>; 3] {
+        let [wrap, clamp] = self.samplers();
+        [wrap.clone(), clamp, wrap]
+    }
+
+    /// The views for t3..t6, uploading images seen for the first time. A
+    /// missing image binds nothing, which reads zero; the shader reads its
+    /// fallback before it would sample one.
+    fn effect_texture_views(
+        &mut self,
+        set: &EffectTextureSet,
+    ) -> [Option<ID3D11ShaderResourceView>; EFFECT_TEXTURE_SLOTS] {
+        let Some(device) = self.devices.as_ref().map(|d| d.device.clone()) else {
+            return Default::default();
+        };
+        let cache = &mut self.pipelines.effect_textures;
+        std::array::from_fn(|slot| {
+            let texture = set[slot].as_ref()?;
+            cache
+                .get(texture, |width, height, texels| {
+                    create_effect_texture(&device, width, height, texels)
+                })
+                .cloned()
+        })
     }
 
     fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
@@ -1956,6 +2009,7 @@ impl DirectXRenderPipelines {
             vn_layer_pipeline,
             vn_clip_segments,
             vn_text_backgrounds,
+            effect_textures: EffectTextureCache::default(),
         };
         pipelines.sync_app_effects(device);
         Ok(pipelines)
@@ -3178,6 +3232,44 @@ fn set_pipeline_state(
     }
 }
 
+fn create_effect_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+) -> Result<ID3D11ShaderResourceView> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: bgra.as_ptr().cast(),
+        SysMemPitch: width * 4,
+        SysMemSlicePitch: 0,
+    };
+    let mut texture = None;
+    let mut view = None;
+    // SAFETY: `bgra` holds `width * height` BGRA8 texels (`EffectTexture::texels`), which
+    // `CreateTexture2D` copies before returning.
+    unsafe {
+        device.CreateTexture2D(&desc, Some(&data), Some(&mut texture))?;
+        let texture = texture.context("CreateTexture2D returned no texture")?;
+        device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+    }
+    view.context("CreateShaderResourceView returned no view")
+}
+
 /// D3D11 refuses to bind a texture as a render target while it is still bound
 /// as a shader resource. The blur passes ping-pong between the two roles, so
 /// every transition clears t0..t2 first.
@@ -3821,7 +3913,8 @@ pub(crate) mod effect_layer_tests {
     use anyhow::Result;
     use gpui::*;
 
-    /// `swap` shows its content with the channels rotated (green turns blue);
+    /// `swap` shows its content with the channels rotated (green turns blue),
+    /// or with its first parameter set, its first image where the content is;
     /// `count` shows the red of its history, and each step adds 0.25 to it.
     const LAYER_EFFECTS_HLSL: &str = r#"
         cbuffer GlobalParams: register(b0) {
@@ -3846,6 +3939,7 @@ pub(crate) mod effect_layer_tests {
             uint flags;
         };
         StructuredBuffer<Quad> quads: register(t1);
+        Texture2D<float4> image: register(t3);
         Texture2D<float4> content: register(t7);
         Texture2D<float4> history: register(t8);
         SamplerState clamp_sampler: register(s1);
@@ -3866,6 +3960,9 @@ pub(crate) mod effect_layer_tests {
                 return float4(last.r, 0.0, 0.0, 1.0) * quad.opacity;
             }
             float4 shown = content.SampleLevel(clamp_sampler, p / viewport_size, 0.0);
+            if (quad.params[0] > 0.5) {
+                return image.Load(int3(0, 0, 0)) * shown.a * quad.opacity;
+            }
             return float4(shown.b, shown.r, shown.g, shown.a) * quad.opacity;
         }
     "#;
@@ -3875,7 +3972,7 @@ pub(crate) mod effect_layer_tests {
         reload_app_effects(
             AppEffects::new(
                 "test",
-                r#"{"schema": 9, "effects": [
+                r#"{"schema": 10, "effects": [
                     {"name": "swap", "backdrop": false, "hlsl": "fx.hlsl"},
                     {"name": "count", "backdrop": false, "history": true, "hlsl": "fx.hlsl"}
                 ]}"#,
@@ -3911,6 +4008,56 @@ pub(crate) mod effect_layer_tests {
             flags,
             ..Default::default()
         }
+    }
+
+    /// A black page and an element, a green box and a white corner, that
+    /// `swap` replaces with a yellow image on the left half and a magenta
+    /// one on the right; with `images` false neither draw has one.
+    pub(crate) fn stamped_element(images: bool) -> Scene {
+        let mask = ContentMask {
+            bounds: rect(0., 0., 64., 64.),
+            ..Default::default()
+        };
+        let quad = |area, color: Rgba| Quad {
+            bounds: area,
+            background: color.into(),
+            content_mask: mask.clone(),
+            ..Default::default()
+        };
+        let stamp = |area, bgra: [u8; 4]| {
+            let textures = images.then(|| {
+                let buffer = image::RgbaImage::from_raw(1, 1, bgra.to_vec()).unwrap();
+                let mut set = EffectTextureSet::default();
+                set[0] = Some(EffectTexture {
+                    image: std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                    linear: false,
+                });
+                std::sync::Arc::new(set)
+            });
+            VnEffectDraw {
+                quad: EffectQuad {
+                    params: EffectQuad::params_from(&[1.]),
+                    ..layer_effect(effect_id::COUNT, area, 1., EFFECT_FLAG_NEEDS_CONTENT)
+                },
+                history: 0,
+                textures,
+            }
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 64., 64.), rgb(0x000000)));
+        scene.vn_push_effect(VnEffectPaint {
+            draws: vec![
+                stamp(rect(0., 0., 32., 64.), [0, 255, 255, 255]),
+                stamp(rect(32., 0., 32., 64.), [255, 0, 255, 255]),
+            ],
+            content: true,
+            content_mask: mask.clone(),
+        });
+        scene.insert_primitive(quad(rect(16., 16., 32., 32.), rgb(0x00ff00)));
+        scene.insert_primitive(quad(rect(0., 0., 8., 8.), rgb(0xffffff)));
+        scene.vn_pop_isolation();
+        scene.finish();
+        scene
     }
 
     #[cfg(not(feature = "native-dx12"))]
@@ -4001,6 +4148,7 @@ pub(crate) mod effect_layer_tests {
                     EFFECT_FLAG_NEEDS_CONTENT,
                 ),
                 history: 0,
+                textures: None,
             };
             let mut renderer = offscreen(64, 64)?;
             let transparent = WindowBackgroundAppearance::Transparent;
@@ -4024,6 +4172,7 @@ pub(crate) mod effect_layer_tests {
                     EFFECT_FLAG_NEEDS_CONTENT,
                 ),
                 history: 0,
+                textures: None,
             };
             let image = renderer.render_to_image(&scene(vec![plain, swap(0.5)]), transparent)?;
             close(
@@ -4053,6 +4202,7 @@ pub(crate) mod effect_layer_tests {
                             ..layer_effect(effect_id::COUNT + 1, area, 1., EFFECT_FLAG_HISTORY)
                         },
                         history: 7,
+                        textures: None,
                     }],
                     content: false,
                     content_mask: mask(),
@@ -4084,6 +4234,28 @@ pub(crate) mod effect_layer_tests {
                 renderer.vn_histories.is_empty(),
                 "a frame without it frees it"
             );
+            Ok(())
+        }
+
+        #[::core::prelude::v1::test]
+        #[ignore = "requires a D3D11 adapter; run explicitly for renderer qualification"]
+        fn d3d11_content_effect_samples_its_own_images() -> Result<()> {
+            install_layer_effects()?;
+            let mut renderer = offscreen(64, 64)?;
+            let transparent = WindowBackgroundAppearance::Transparent;
+            let image = renderer.render_to_image(&stamped_element(true), transparent)?;
+            assert_eq!(
+                image.get_pixel(24, 32).0,
+                [255, 255, 0, 255],
+                "the first draw's"
+            );
+            assert_eq!(
+                image.get_pixel(40, 32).0,
+                [255, 0, 255, 255],
+                "the second draw's"
+            );
+            let image = renderer.render_to_image(&stamped_element(false), transparent)?;
+            assert_eq!(image.get_pixel(32, 32).0, [0, 0, 0, 255], "none bound");
             Ok(())
         }
     }

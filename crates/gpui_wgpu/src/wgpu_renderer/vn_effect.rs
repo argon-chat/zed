@@ -162,6 +162,7 @@ impl WgpuRendererCore {
             let quad = draw.effects.quads[base + index];
             let history = draw.effects.histories[index].as_ref();
             let layer = [content.as_ref(), history.map(|history| &history.read)];
+            let images = quad.texture_set();
             let state = self
                 .resources
                 .backdrop
@@ -171,7 +172,8 @@ impl WgpuRendererCore {
             if let Some((write, step)) = history.and_then(|history| history.step.as_ref())
                 && let Some(pipeline) = state.history_effect(quad.effect_id)
             {
-                let textures = state.effect_textures(&self.resources.device, [None, None], layer);
+                let textures =
+                    state.effect_textures(&self.resources.device, [None, None], layer, images);
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("vn_effect_history_step"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -208,6 +210,7 @@ impl WgpuRendererCore {
                     frame,
                     quad.effective_kernel_levels() as usize,
                     layer,
+                    images,
                 )?;
                 let state = self
                     .resources
@@ -225,7 +228,8 @@ impl WgpuRendererCore {
                 let Some(pipeline) = state.effect(effect_id) else {
                     continue;
                 };
-                let textures = state.effect_textures(&self.resources.device, [None, None], layer);
+                let textures =
+                    state.effect_textures(&self.resources.device, [None, None], layer, images);
                 let mut pass = continue_pass(encoder, &frame.view, "vn_effect_composite");
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &state.effect_globals_bind_group, &[]);
@@ -251,12 +255,14 @@ mod tests {
 
     const SIDE: f32 = 64.;
 
-    /// `swap` shows its content with the channels rotated (green turns blue);
+    /// `swap` shows its content with the channels rotated (green turns blue),
+    /// or with its first parameter set, its first image where the content is;
     /// `count` shows the red of its history, and each step adds 0.25 to it.
     const EFFECTS_WGSL: &str = r#"
         @group(0) @binding(0) var<uniform> globals: array<vec4<f32>, 3>;
         @group(1) @binding(0) var<storage, read> quads: array<array<f32, 56>>;
         @group(2) @binding(1) var clamp_sampler: sampler;
+        @group(2) @binding(3) var image: texture_2d<f32>;
         @group(2) @binding(7) var content: texture_2d<f32>;
         @group(2) @binding(8) var history: texture_2d<f32>;
 
@@ -283,6 +289,9 @@ mod tests {
                 return vec4<f32>(last.r, 0.0, 0.0, 1.0) * quad[50];
             }
             let shown = textureSampleLevel(content, clamp_sampler, position / globals[1].xy, 0.0);
+            if quad[18] > 0.5 {
+                return textureLoad(image, vec2<i32>(0, 0), 0) * shown.a * quad[50];
+            }
             return vec4<f32>(shown.b, shown.r, shown.g, shown.a) * quad[50];
         }
     "#;
@@ -294,7 +303,7 @@ mod tests {
         gpui::reload_app_effects(
             gpui::AppEffects::new(
                 "test",
-                r#"{"schema": 9, "effects": [
+                r#"{"schema": 10, "effects": [
                     {"name": "swap", "backdrop": false, "wgsl": "fx.wgsl"},
                     {"name": "count", "backdrop": false, "history": true, "wgsl": "fx.wgsl"}
                 ]}"#,
@@ -364,6 +373,7 @@ mod tests {
                     ..effect(COUNT, rect, 1., EFFECT_FLAG_HISTORY)
                 },
                 history: 7,
+                textures: None,
             }],
             content: false,
             content_mask: mask(),
@@ -404,6 +414,7 @@ mod tests {
                 EFFECT_FLAG_NEEDS_CONTENT,
             ),
             history: 0,
+            textures: None,
         };
 
         let image = render(&mut renderer, &element_scene(vec![swap(1.)]))?;
@@ -422,6 +433,7 @@ mod tests {
                 EFFECT_FLAG_NEEDS_CONTENT,
             ),
             history: 0,
+            textures: None,
         };
         let image = render(&mut renderer, &element_scene(vec![plain, swap(0.5)]))?;
         assert_close(
@@ -480,6 +492,56 @@ mod tests {
         )?;
         render(&mut renderer, &Scene::default())?;
         assert_eq!(histories(&renderer)?, 0, "a frame without it frees it");
+        Ok(())
+    }
+
+    #[test]
+    fn a_content_effect_samples_its_own_images() -> Result<()> {
+        use gpui::{EffectTexture, EffectTextureSet, RenderImage};
+        use std::sync::Arc;
+
+        let _app_effects = APP_EFFECTS.lock();
+        install_effects()?;
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let image = |bgra: [u8; 4]| {
+            let buffer = image::RgbaImage::from_raw(1, 1, bgra.to_vec()).unwrap();
+            let mut set = EffectTextureSet::default();
+            set[0] = Some(EffectTexture {
+                image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                linear: false,
+            });
+            Some(Arc::new(set))
+        };
+        let stamp = |rect, textures| VnEffectDraw {
+            quad: EffectQuad {
+                params: EffectQuad::params_from(&[1.]),
+                ..effect(SWAP, rect, 1., EFFECT_FLAG_NEEDS_CONTENT)
+            },
+            history: 0,
+            textures,
+        };
+
+        let scene = element_scene(vec![
+            stamp(bounds(0., 0., 32., SIDE), image([0, 255, 255, 255])),
+            stamp(bounds(32., 0., 32., SIDE), image([255, 0, 255, 255])),
+        ]);
+        let image = render(&mut renderer, &scene)?;
+        assert_eq!(
+            pixel(&image, 24, 32),
+            [255, 255, 0, 255],
+            "the first draw's"
+        );
+        assert_eq!(
+            pixel(&image, 40, 32),
+            [255, 0, 255, 255],
+            "the second draw's"
+        );
+
+        let image = render(
+            &mut renderer,
+            &element_scene(vec![stamp(mask().bounds, None)]),
+        )?;
+        assert_eq!(pixel(&image, 32, 32), [0, 0, 0, 255], "none bound");
         Ok(())
     }
 }

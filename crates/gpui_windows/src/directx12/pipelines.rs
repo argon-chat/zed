@@ -34,6 +34,7 @@ pub(super) const ROOT_INSTANCES: u32 = 2;
 pub(super) const ROOT_CLIP_SEGMENTS: u32 = 3;
 pub(super) const ROOT_TEXT_BACKGROUNDS: u32 = 4;
 pub(super) const ROOT_TEXTURES: u32 = 5;
+pub(super) const ROOT_EFFECT_TEXTURES: u32 = 6;
 /// The descriptors in a [`ROOT_TEXTURES`] table: t0, t2, and an effect
 /// layer's content and history at t7 and t8.
 pub(super) const TABLE_TEXTURES: usize = 4;
@@ -535,6 +536,14 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
             OffsetInDescriptorsFromTableStart: 2,
         },
     ];
+    // t3..t6: an effect's `SkTexture` images.
+    let effect_texture_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: gpui::EFFECT_TEXTURE_SLOTS as u32,
+        BaseShaderRegister: 3,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
     let descriptor = |kind, register| D3D12_ROOT_PARAMETER {
         ParameterType: kind,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -559,8 +568,8 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
-        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 3),
-        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 4),
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 9),
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 10),
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -570,6 +579,16 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
                 },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &effect_texture_range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         },
     ];
     let sampler = |register, address| D3D12_STATIC_SAMPLER_DESC {
@@ -589,6 +608,7 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
     let samplers = [
         sampler(0, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
         sampler(1, D3D12_TEXTURE_ADDRESS_MODE_CLAMP),
+        sampler(2, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
     ];
     let description = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: parameters.len() as u32,

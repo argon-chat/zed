@@ -233,6 +233,7 @@ impl MetalRenderer {
                     viewport_size,
                     None,
                     layer,
+                    Some(state.images(quad.texture_set())),
                     *step..*step + 1,
                 );
                 encoder.endEncoding();
@@ -272,6 +273,7 @@ impl MetalRenderer {
                 viewport_size,
                 textures.as_ref(),
                 layer,
+                Some(state.images(quad.texture_set())),
                 instance..instance + 1,
             );
             encoder.endEncoding();
@@ -291,7 +293,8 @@ mod tests {
 
     const SIDE: f32 = 64.;
 
-    /// `swap` shows its content with the channels rotated (green turns blue);
+    /// `swap` shows its content with the channels rotated (green turns blue),
+    /// or with its first parameter set, its first image where the content is;
     /// `count` shows the red of its history, and each step adds 0.25 to it.
     const EFFECTS_MSL: &str = r#"
         #include <metal_stdlib>
@@ -306,6 +309,7 @@ mod tests {
             Varying input [[stage_in]],
             constant float4 *globals [[buffer(0)]],
             constant float *quads [[buffer(1)]],
+            texture2d<float> image [[texture(3)]],
             texture2d<float> content [[texture(7)]],
             texture2d<float> history [[texture(8)]],
             sampler clamp_sampler [[sampler(1)]]) {
@@ -325,6 +329,9 @@ mod tests {
                 return float4(last.r, 0., 0., 1.) * quad[50];
             }
             float4 shown = content.sample(clamp_sampler, position / globals[1].xy, level(0.));
+            if (quad[18] > 0.5) {
+                return image.read(uint2(0, 0)) * shown.a * quad[50];
+            }
             return float4(shown.b, shown.r, shown.g, shown.a) * quad[50];
         }
     "#;
@@ -336,7 +343,7 @@ mod tests {
         gpui::reload_app_effects(
             gpui::AppEffects::new(
                 "test",
-                r#"{"schema": 9, "effects": [
+                r#"{"schema": 10, "effects": [
                     {"name": "swap", "backdrop": false, "metal": "fx.metal"},
                     {"name": "count", "backdrop": false, "history": true, "metal": "fx.metal"}
                 ]}"#,
@@ -404,6 +411,7 @@ mod tests {
                     ..effect(COUNT, rect, 1., EFFECT_FLAG_HISTORY)
                 },
                 history: 7,
+                textures: None,
             }],
             content: false,
             content_mask: mask(),
@@ -444,6 +452,7 @@ mod tests {
                 EFFECT_FLAG_NEEDS_CONTENT,
             ),
             history: 0,
+            textures: None,
         };
 
         let image = render(&mut renderer, &element_scene(vec![swap(1.)]))?;
@@ -462,6 +471,7 @@ mod tests {
                 EFFECT_FLAG_NEEDS_CONTENT,
             ),
             history: 0,
+            textures: None,
         };
         let image = render(&mut renderer, &element_scene(vec![plain, swap(0.5)]))?;
         assert_close(
@@ -518,6 +528,56 @@ mod tests {
         )?;
         render(&mut renderer, &Scene::default())?;
         assert_eq!(histories(&renderer)?, 0, "a frame without it frees it");
+        Ok(())
+    }
+
+    #[test]
+    fn a_content_effect_samples_its_own_images() -> Result<()> {
+        use gpui::{EffectTexture, EffectTextureSet, RenderImage};
+        use std::sync::Arc;
+
+        let _app_effects = APP_EFFECTS.lock();
+        install_effects()?;
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let image = |bgra: [u8; 4]| {
+            let buffer = image::RgbaImage::from_raw(1, 1, bgra.to_vec()).unwrap();
+            let mut set = EffectTextureSet::default();
+            set[0] = Some(EffectTexture {
+                image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                linear: false,
+            });
+            Some(Arc::new(set))
+        };
+        let stamp = |rect, textures| VnEffectDraw {
+            quad: EffectQuad {
+                params: EffectQuad::params_from(&[1.]),
+                ..effect(SWAP, rect, 1., EFFECT_FLAG_NEEDS_CONTENT)
+            },
+            history: 0,
+            textures,
+        };
+
+        let scene = element_scene(vec![
+            stamp(bounds(0., 0., 32., SIDE), image([0, 255, 255, 255])),
+            stamp(bounds(32., 0., 32., SIDE), image([255, 0, 255, 255])),
+        ]);
+        let image = render(&mut renderer, &scene)?;
+        assert_eq!(
+            pixel(&image, 24, 32),
+            [255, 255, 0, 255],
+            "the first draw's"
+        );
+        assert_eq!(
+            pixel(&image, 40, 32),
+            [255, 0, 255, 255],
+            "the second draw's"
+        );
+
+        let image = render(
+            &mut renderer,
+            &element_scene(vec![stamp(mask().bounds, None)]),
+        )?;
+        assert_eq!(pixel(&image, 32, 32), [0, 0, 0, 255], "none bound");
         Ok(())
     }
 }

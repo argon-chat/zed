@@ -15,8 +15,8 @@ use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCompileOptions, MTLDevice, MTLFunction, MTLLibrary, MTLLoadAction, MTLOrigin,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLCompileOptions, MTLDevice, MTLFunction, MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResource, MTLSamplerAddressMode,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLScissorRect, MTLSize,
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
@@ -40,6 +40,10 @@ const SCRATCH_RELEASE_FRAMES: u32 = 90;
 
 /// The generated effect fragment stages' `[[sampler(1)]]`.
 const CLAMP_SAMPLER_INDEX: usize = 1;
+/// Their `[[sampler(2)]]`, which repeats an effect's images.
+const REPEAT_SAMPLER_INDEX: usize = 2;
+/// Their `[[texture(3)]]`..`[[texture(6)]]`: an effect's images.
+const EFFECT_TEXTURE_INDEX: usize = 3;
 
 /// Duplicated from the `sk-effects` registry, as in gpui_windows: gpui sits
 /// below it. An app effect reads its manifest's `backdrop` field instead.
@@ -103,10 +107,15 @@ pub(super) struct MetalBackdrop {
     /// `gpui::effect_id::CONTENT`.
     content: Option<Pipeline>,
     clamp_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
-    /// Bound for an effect that does not read the backdrop: its shader still
-    /// declares the textures.
+    /// `[[sampler(2)]]`, for an effect's images.
+    repeat_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    /// Bound for an effect that does not read the backdrop, or misses an
+    /// image: its shader still declares the textures.
     placeholder: Texture,
     pub(super) histories: gpui::VnEffectHistories<Texture>,
+    effect_textures: gpui::EffectTextureCache<Texture>,
+    /// This frame's `Scene::effect_texture_sets`, uploaded.
+    frame_effect_textures: Vec<[Option<Texture>; gpui::EFFECT_TEXTURE_SLOTS]>,
     targets: Option<BackdropTargets>,
     /// Consecutive frames that held more scratch targets than they needed.
     idle_frames: u32,
@@ -189,6 +198,7 @@ impl MetalRenderer {
             !scene.backdrop_blur_rects.is_empty() || effect_quads().any(EffectQuad::needs_backdrop);
         if let BackdropState::Ready(state) = &mut self.backdrop {
             state.sync_app_effects(&self.device);
+            state.upload_effect_textures(&self.device, scene);
             let kernel_levels = scene
                 .backdrop_blur_rects
                 .iter()
@@ -350,6 +360,7 @@ impl MetalRenderer {
                 viewport_size,
                 Some(&textures),
                 [None, None],
+                None,
                 start + group.start..start + group.end,
             );
         }
@@ -385,6 +396,7 @@ impl MetalRenderer {
     pub(super) fn draw_blended_effects(
         &self,
         effect_id: u32,
+        textures: Option<usize>,
         range: Range<usize>,
         instances: &InstanceBinding,
         viewport_size: Size<DevicePixels>,
@@ -403,6 +415,7 @@ impl MetalRenderer {
             viewport_size,
             None,
             [None, None],
+            Some(state.images(textures)),
             range,
         );
     }
@@ -446,6 +459,7 @@ impl MetalRenderer {
                 viewport_size,
                 Some(&textures),
                 [None, None],
+                Some(state.images(effect_quads[0].texture_set())),
                 start + group.start..start + group.end,
             );
         }
@@ -793,6 +807,12 @@ impl MetalBackdrop {
             MTLTextureUsage::ShaderRead,
         )?;
 
+        sampler_descriptor.setSAddressMode(MTLSamplerAddressMode::Repeat);
+        sampler_descriptor.setTAddressMode(MTLSamplerAddressMode::Repeat);
+        let repeat_sampler = device
+            .newSamplerStateWithDescriptor(&sampler_descriptor)
+            .context("creating the effect image sampler")?;
+
         let mut backdrop = Self {
             blur_downsample,
             blur_upsample,
@@ -804,13 +824,47 @@ impl MetalBackdrop {
             punch,
             content,
             clamp_sampler,
+            repeat_sampler,
             placeholder,
             histories: Default::default(),
+            effect_textures: Default::default(),
+            frame_effect_textures: Vec::new(),
             targets: None,
             idle_frames: 0,
         };
         backdrop.sync_app_effects(device);
         Ok(backdrop)
+    }
+
+    /// The images an effect batch binds at 3..6: its texture set's, the
+    /// placeholder for a missing one.
+    pub(super) fn images(&self, set: Option<usize>) -> [&Texture; gpui::EFFECT_TEXTURE_SLOTS] {
+        let images = set.and_then(|set| self.frame_effect_textures.get(set));
+        std::array::from_fn(|slot| {
+            images
+                .and_then(|images| images[slot].as_ref())
+                .unwrap_or(&self.placeholder)
+        })
+    }
+
+    /// Uploads the images this frame's effects sample that are not on the GPU yet.
+    fn upload_effect_textures(&mut self, device: &ProtocolObject<dyn MTLDevice>, scene: &Scene) {
+        self.effect_textures.begin_frame();
+        let cache = &mut self.effect_textures;
+        self.frame_effect_textures = scene
+            .effect_texture_sets
+            .iter()
+            .map(|set| {
+                std::array::from_fn(|slot| {
+                    let texture = set[slot].as_ref()?;
+                    cache
+                        .get(texture, |width, height, texels| {
+                            upload_effect_texture(device, width, height, texels)
+                        })
+                        .cloned()
+                })
+            })
+            .collect();
     }
 
     pub(super) fn sync_app_effects(&mut self, device: &ProtocolObject<dyn MTLDevice>) {
@@ -957,6 +1011,7 @@ impl MetalBackdrop {
         viewport_size: Size<DevicePixels>,
         textures: Option<&BackdropTextures>,
         layer: [Option<&Texture>; 2],
+        images: Option<[&Texture; gpui::EFFECT_TEXTURE_SLOTS]>,
         range: Range<usize>,
     ) {
         if range.is_empty() {
@@ -1022,6 +1077,15 @@ impl MetalBackdrop {
                 BackdropTextureIndex::History as usize,
             );
             encoder.setFragmentSamplerState_atIndex(Some(&self.clamp_sampler), CLAMP_SAMPLER_INDEX);
+            if let Some(images) = images {
+                for (slot, image) in images.into_iter().enumerate() {
+                    encoder.setFragmentTexture_atIndex(Some(image), EFFECT_TEXTURE_INDEX + slot);
+                }
+                encoder.setFragmentSamplerState_atIndex(
+                    Some(&self.repeat_sampler),
+                    REPEAT_SAMPLER_INDEX,
+                );
+            }
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::TriangleStrip,
                 0,
@@ -1170,6 +1234,51 @@ fn pipeline_in(
     device
         .newRenderPipelineStateWithDescriptor_error(&descriptor)
         .with_context(|| format!("creating {label} render pipeline"))
+}
+
+fn upload_effect_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    texels: &[u8],
+) -> Result<Texture> {
+    let descriptor = MTLTextureDescriptor::new();
+    // SAFETY: `EffectTexture::texels` never yields an empty image, and this
+    // descriptor creates a 2D texture.
+    unsafe {
+        descriptor.setWidth(width as usize);
+        descriptor.setHeight(height as usize);
+    }
+    descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    // Shared storage only on Apple GPU families, as in the atlas.
+    descriptor.setStorageMode(if device.supportsFamily(MTLGPUFamily::Apple1) {
+        MTLStorageMode::Shared
+    } else {
+        MTLStorageMode::Managed
+    });
+    let texture = device
+        .newTextureWithDescriptor(&descriptor)
+        .context("allocating an effect image")?;
+    let region = MTLRegion {
+        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+        size: MTLSize {
+            width: width as usize,
+            height: height as usize,
+            depth: 1,
+        },
+    };
+    // SAFETY: `texels` holds `width * height` BGRA8 texels, every row of the
+    // region, and the texture is new: no GPU work reads it yet.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            region,
+            0,
+            ptr::NonNull::from(texels).cast(),
+            width as usize * 4,
+        );
+    }
+    Ok(texture)
 }
 
 pub(super) fn create_target_texture(
@@ -1957,7 +2066,7 @@ pub(super) mod tests {
         gpui::reload_app_effects(
             gpui::AppEffects::new(
                 "test",
-                r#"{"schema": 9, "effects": [
+                r#"{"schema": 10, "effects": [
                     {"name": "tint", "backdrop": false, "metal": "tint.metal"}
                 ]}"#,
                 [("tint.metal".to_string(), msl.to_string())],
@@ -2009,6 +2118,60 @@ pub(super) mod tests {
             [0, 255, 0, 255],
             "a replacement that does not compile keeps the last good pipeline"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn effect_images_bind_per_quad_premultiplied_unless_linear() -> Result<()> {
+        use gpui::{EffectTexture, Primitive, RenderImage};
+
+        let _app_effects = APP_EFFECTS.lock();
+        install_app_effect(
+            "#include <metal_stdlib>\nusing namespace metal;\n\
+             fragment float4 effect_fragment(float4 p [[position]],\n\
+                 texture2d<float> t0 [[texture(3)]], texture2d<float> t1 [[texture(4)]],\n\
+                 sampler wrap [[sampler(2)]]) {\n\
+               if (p.y < 32.0) return float4(t0.sample(wrap, float2(0.25, 0.5), level(0.0)).rgb, 1.0);\n\
+               return float4(t1.sample(wrap, float2(1.25, 0.5), level(0.0)).rgb, 1.0);\n\
+             }",
+        )?;
+        let image = |bgra: &[[u8; 4]]| {
+            let buffer = image::RgbaImage::from_raw(bgra.len() as u32, 1, bgra.concat()).unwrap();
+            Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+        };
+        let halves = image(&[[0, 0, 255, 128], [255, 0, 0, 255]]);
+        let green = image(&[[0, 255, 0, 255]]);
+        let set = |first: &Arc<RenderImage>| {
+            let mut set = gpui::EffectTextureSet::default();
+            set[0] = Some(EffectTexture {
+                image: first.clone(),
+                linear: false,
+            });
+            set[1] = Some(EffectTexture {
+                image: halves.clone(),
+                linear: true,
+            });
+            Some(Arc::new(set))
+        };
+        let effect = |x: f32| EffectQuad {
+            effect_id: effect_id::COUNT,
+            bounds: bounds(x, 0., SIDE / 2., SIDE),
+            content_mask: mask(SIDE, SIDE),
+            opacity: 1.,
+            scale: 1.,
+            ..Default::default()
+        };
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x000000)));
+        scene.insert_primitive(Primitive::EffectQuad(effect(0.), set(&halves)));
+        scene.insert_primitive(Primitive::EffectQuad(effect(SIDE / 2.), set(&green)));
+        let mut renderer = renderer()?;
+        let image = render(&mut renderer, scene)?;
+        assert_close(pixel(&image, 16, 16), [128, 0, 0, 255], "colour");
+        assert_close(pixel(&image, 16, 48), [255, 0, 0, 255], "linear");
+        assert_close(pixel(&image, 48, 16), [0, 255, 0, 255], "second");
+        assert_close(pixel(&image, 48, 48), [255, 0, 0, 255], "shared");
         Ok(())
     }
 

@@ -987,6 +987,7 @@ impl MetalRenderer {
                         backdrop::EffectPass::Skip => {}
                         backdrop::EffectPass::Blended => self.draw_blended_effects(
                             effect_id,
+                            effect_quads[0].texture_set(),
                             range,
                             &instance_bindings.effect_quads,
                             viewport_size,

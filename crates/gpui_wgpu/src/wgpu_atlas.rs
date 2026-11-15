@@ -70,6 +70,11 @@ impl WgpuAtlas {
         )
     }
 
+    /// The format of colour textures on this device, and so of effect images.
+    pub fn color_texture_format(&self) -> wgpu::TextureFormat {
+        self.0.lock().backend.color_texture_format
+    }
+
     pub fn before_frame(&self) {
         let mut lock = self.0.lock();
         lock.backend.flush_uploads();

@@ -6352,21 +6352,54 @@ impl Window {
         spec: EffectSpec,
         element: u64,
     ) {
+        self.vn_paint_effect_with(bounds, corner_radii, spec, element, None);
+    }
+
+    /// vue-native: [`Self::vn_paint_effect`] with the images `spec` samples,
+    /// resolved through [`crate::set_effect_texture_resolver`].
+    pub fn vn_paint_textured_effect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        spec: EffectSpec,
+        element: u64,
+        cx: &mut App,
+    ) {
+        let textures = crate::resolve_effect_textures(&spec, self, cx);
+        self.vn_paint_effect_with(bounds, corner_radii, spec, element, textures);
+    }
+
+    fn vn_paint_effect_with(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        spec: EffectSpec,
+        element: u64,
+        textures: Option<Arc<crate::EffectTextureSet>>,
+    ) {
         self.invalidator.debug_assert_paint();
         let opacity = self.element_opacity();
-        let Some(mut quad) = self.vn_effect_quad(bounds, corner_radii, spec, opacity) else {
+        let Some(mut quad) =
+            self.vn_effect_quad(bounds, corner_radii, spec, opacity, textures.as_deref())
+        else {
             return;
         };
         quad.flags &= !crate::EFFECT_FLAG_NEEDS_CONTENT;
         let history = vn_history_key(element, &spec);
         if history == 0 {
             quad.flags &= !crate::EFFECT_FLAG_HISTORY;
-            self.next_frame.scene.insert_primitive(quad);
+            self.next_frame
+                .scene
+                .insert_primitive(crate::Primitive::EffectQuad(quad, textures));
             return;
         }
         let content_mask = quad.content_mask;
         self.next_frame.scene.vn_push_effect(crate::VnEffectPaint {
-            draws: vec![crate::VnEffectDraw { quad, history }],
+            draws: vec![crate::VnEffectDraw {
+                quad,
+                history,
+                textures,
+            }],
             content: false,
             content_mask,
         });
@@ -6403,7 +6436,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
-        effects: &[(EffectSpec, f32)],
+        effects: &[(EffectSpec, f32, Option<Arc<crate::EffectTextureSet>>)],
         element: u64,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -6413,12 +6446,17 @@ impl Window {
         }
         let mut draws = Vec::new();
         let mut plain = 1.;
-        for (spec, weight) in effects {
+        for (spec, weight, textures) in effects {
             if spec.flags & crate::EFFECT_FLAG_NEEDS_CONTENT == 0 || *weight <= 0. {
                 continue;
             }
-            let Some(mut quad) = self.vn_effect_quad(bounds, corner_radii, *spec, opacity * weight)
-            else {
+            let Some(mut quad) = self.vn_effect_quad(
+                bounds,
+                corner_radii,
+                *spec,
+                opacity * weight,
+                textures.as_deref(),
+            ) else {
                 continue;
             };
             let history = vn_history_key(element, spec);
@@ -6426,7 +6464,11 @@ impl Window {
                 quad.flags &= !crate::EFFECT_FLAG_HISTORY;
             }
             plain -= weight;
-            draws.push(crate::VnEffectDraw { quad, history });
+            draws.push(crate::VnEffectDraw {
+                quad,
+                history,
+                textures: textures.clone(),
+            });
         }
         let content_mask = self.snapped_content_mask();
         if plain > 1e-3 {
@@ -6443,6 +6485,7 @@ impl Window {
                         ..Default::default()
                     },
                     history: 0,
+                    textures: None,
                 },
             );
         }
@@ -6466,6 +6509,7 @@ impl Window {
         corner_radii: Corners<Pixels>,
         spec: EffectSpec,
         opacity: f32,
+        textures: Option<&crate::EffectTextureSet>,
     ) -> Option<EffectQuad> {
         if !spec.is_some() || opacity <= 0. {
             return None;
@@ -6491,6 +6535,7 @@ impl Window {
                 *param *= scale_factor;
             }
         }
+        crate::write_effect_texture_sizes(&spec, textures, &mut params);
 
         // vue-native fork: as for the backdrop blur — no `transformation`
         // field, so the element transform is folded into the rect, and a
