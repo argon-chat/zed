@@ -485,10 +485,13 @@ impl Element for Img {
                     }
                     // vue-native fork: the picture's size, not its pixels' (an
                     // embedder may have swapped in a smaller copy).
-                    let new_bounds = self
-                        .style
-                        .object_fit
-                        .get_bounds(bounds, data.natural_size(layout_state.frame_index));
+                    let natural = data.natural_size(layout_state.frame_index);
+                    let new_bounds = match style.vn_object_position {
+                        Some(position) => {
+                            self.style.object_fit.get_bounds_at(bounds, natural, position)
+                        }
+                        None => self.style.object_fit.get_bounds(bounds, natural),
+                    };
                     // vue-native fork: percentages and the overlap rule resolve
                     // against the box (`Style::corner_radii_for`).
                     let corner_radii = style.corner_radii_for(bounds.size, window.rem_size());

@@ -50,71 +50,53 @@ impl ObjectFit {
         bounds: Bounds<Pixels>,
         image_size: Size<DevicePixels>,
     ) -> Bounds<Pixels> {
+        let fitted = self.get_bounds_at(bounds, image_size, ObjectPosition::default());
+        match self {
+            ObjectFit::None => Bounds {
+                origin: bounds.origin,
+                size: fitted.size,
+            },
+            _ => fitted,
+        }
+    }
+
+    /// The bounds of the image within `bounds`, placed in the free space by `position`
+    /// (CSS `object-fit` with `object-position`).
+    pub fn get_bounds_at(
+        &self,
+        bounds: Bounds<Pixels>,
+        image_size: Size<DevicePixels>,
+        position: ObjectPosition,
+    ) -> Bounds<Pixels> {
         let image_size = image_size.map(|dimension| Pixels::from(u32::from(dimension)));
         let image_ratio = image_size.width / image_size.height;
         let bounds_ratio = bounds.size.width / bounds.size.height;
-
-        match self {
-            ObjectFit::Fill => bounds,
-            ObjectFit::Contain => {
-                let new_size = if bounds_ratio > image_ratio {
-                    size(
-                        image_size.width * (bounds.size.height / image_size.height),
-                        bounds.size.height,
-                    )
-                } else {
-                    size(
-                        bounds.size.width,
-                        image_size.height * (bounds.size.width / image_size.width),
-                    )
-                };
-
-                Bounds {
-                    origin: point(
-                        bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
-                        bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
-                    ),
-                    size: new_size,
-                }
+        let contain = || {
+            if bounds_ratio > image_ratio {
+                size(
+                    image_size.width * (bounds.size.height / image_size.height),
+                    bounds.size.height,
+                )
+            } else {
+                size(
+                    bounds.size.width,
+                    image_size.height * (bounds.size.width / image_size.width),
+                )
             }
-            ObjectFit::ScaleDown => {
-                // Check if the image is larger than the bounds in either dimension.
-                if image_size.width > bounds.size.width || image_size.height > bounds.size.height {
-                    // If the image is larger, use the same logic as Contain to scale it down.
-                    let new_size = if bounds_ratio > image_ratio {
-                        size(
-                            image_size.width * (bounds.size.height / image_size.height),
-                            bounds.size.height,
-                        )
-                    } else {
-                        size(
-                            bounds.size.width,
-                            image_size.height * (bounds.size.width / image_size.width),
-                        )
-                    };
+        };
 
-                    Bounds {
-                        origin: point(
-                            bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
-                            bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
-                        ),
-                        size: new_size,
-                    }
+        let new_size = match self {
+            ObjectFit::Fill => bounds.size,
+            ObjectFit::Contain => contain(),
+            ObjectFit::ScaleDown => {
+                if image_size.width > bounds.size.width || image_size.height > bounds.size.height {
+                    contain()
                 } else {
-                    // If the image is smaller than or equal to the container, display it at its original size,
-                    // centered within the container.
-                    let original_size = size(image_size.width, image_size.height);
-                    Bounds {
-                        origin: point(
-                            bounds.origin.x + (bounds.size.width - original_size.width) / 2.0,
-                            bounds.origin.y + (bounds.size.height - original_size.height) / 2.0,
-                        ),
-                        size: original_size,
-                    }
+                    image_size
                 }
             }
             ObjectFit::Cover => {
-                let new_size = if bounds_ratio > image_ratio {
+                if bounds_ratio > image_ratio {
                     size(
                         bounds.size.width,
                         image_size.height * (bounds.size.width / image_size.width),
@@ -124,20 +106,46 @@ impl ObjectFit {
                         image_size.width * (bounds.size.height / image_size.height),
                         bounds.size.height,
                     )
-                };
-
-                Bounds {
-                    origin: point(
-                        bounds.origin.x + (bounds.size.width - new_size.width) / 2.0,
-                        bounds.origin.y + (bounds.size.height - new_size.height) / 2.0,
-                    ),
-                    size: new_size,
                 }
             }
-            ObjectFit::None => Bounds {
-                origin: bounds.origin,
-                size: image_size,
-            },
+            ObjectFit::None => image_size,
+        };
+        Bounds {
+            origin: point(
+                bounds.origin.x
+                    + (bounds.size.width - new_size.width) * position.x_fraction
+                    + position.x_offset,
+                bounds.origin.y
+                    + (bounds.size.height - new_size.height) * position.y_fraction
+                    + position.y_offset,
+            ),
+            size: new_size,
+        }
+    }
+}
+
+/// CSS `object-position`: per axis, a fraction of the free space (box minus content, which may be
+/// negative) plus an offset. The default is centred.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct ObjectPosition {
+    /// Fraction of the horizontal free space.
+    pub x_fraction: f32,
+    /// Added to the horizontal placement.
+    pub x_offset: Pixels,
+    /// Fraction of the vertical free space.
+    pub y_fraction: f32,
+    /// Added to the vertical placement.
+    pub y_offset: Pixels,
+}
+
+impl Default for ObjectPosition {
+    fn default() -> Self {
+        Self {
+            x_fraction: 0.5,
+            x_offset: Pixels::ZERO,
+            y_fraction: 0.5,
+            y_offset: Pixels::ZERO,
         }
     }
 }
@@ -593,6 +601,9 @@ pub struct Style {
     /// CSS `order`: a flex or grid item is laid out in ascending order, ties in document order.
     /// Painting, hit-testing and focus order keep document order.
     pub vn_order: i32,
+    /// CSS `object-position` of an image painted in this box; `None` keeps
+    /// [`ObjectFit::get_bounds`]'s placement.
+    pub vn_object_position: Option<ObjectPosition>,
 
     /// The fill color of this element
     pub background: Option<Fill>,
@@ -2029,6 +2040,7 @@ impl Default for Style {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             vn_order: 0,
+            vn_object_position: None,
             flex_basis: Length::Auto,
             background: None,
             background_layers: Vec::new(),
@@ -2801,6 +2813,35 @@ mod tests {
 /// vue-native fork: `AlignContent::SafeCenter` reaches taffy as `safe center`.
 /// A block container centres content that fits and starts content that
 /// overflows.
+#[cfg(test)]
+mod vn_object_position_tests {
+    use super::*;
+    use crate::{px, size};
+
+    #[test]
+    fn the_position_places_the_fitted_image_in_the_free_space() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(50.)));
+        let square = size(DevicePixels(40), DevicePixels(40));
+        let at = |fit: ObjectFit, x: (f32, f32), y: (f32, f32)| {
+            let position = ObjectPosition {
+                x_fraction: x.0,
+                x_offset: px(x.1),
+                y_fraction: y.0,
+                y_offset: px(y.1),
+            };
+            let b = fit.get_bounds_at(bounds, square, position);
+            (f32::from(b.origin.x), f32::from(b.origin.y), f32::from(b.size.width), f32::from(b.size.height))
+        };
+        assert_eq!(at(ObjectFit::Contain, (0., 0.), (0., 0.)), (10., 20., 50., 50.));
+        assert_eq!(at(ObjectFit::Contain, (1., -5.), (0.5, 0.)), (55., 20., 50., 50.));
+        assert_eq!(at(ObjectFit::Cover, (0., 0.), (1., 0.)), (10., -30., 100., 100.));
+        assert_eq!(at(ObjectFit::None, (0.25, 0.), (0., 3.)), (25., 23., 40., 40.));
+        assert_eq!(at(ObjectFit::Fill, (0.5, 7.), (0.5, 0.)), (17., 20., 100., 50.));
+        let legacy = ObjectFit::None.get_bounds(bounds, square);
+        assert_eq!(legacy.origin, bounds.origin);
+    }
+}
+
 #[cfg(test)]
 mod vn_safe_center_tests {
     use crate::{AlignContent, Context, TestAppContext, Window, div, prelude::*, px, size};
