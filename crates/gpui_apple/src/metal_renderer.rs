@@ -2074,6 +2074,7 @@ enum VnLayerInputIndex {
     TextBackgrounds = 2,
     ViewportSize = 3,
     Texture = 4,
+    MaskTexture = 5,
 }
 
 #[repr(C)]

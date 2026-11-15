@@ -815,6 +815,9 @@ pub struct Style {
     /// CSS backgrounds painted through the descendant glyph alpha, not the box.
     pub vn_text_fill: Option<VnTextFill>,
 
+    /// CSS `mask` over the element's whole painting, inside its `clip-path`.
+    pub vn_mask: Option<VnMask>,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -1031,6 +1034,46 @@ pub enum TextAlign {
 
     /// Align the text to the right of the element
     Right,
+}
+
+/// Paints a mask's layers into the border box it is given. With a tint (always
+/// opaque), the layers paint in that colour as the element's whole picture
+/// ([`VnMask::tint_leaf`]).
+pub type VnMaskPainter = std::rc::Rc<dyn Fn(Bounds<Pixels>, Option<Hsla>, &mut Window, &mut App)>;
+
+/// CSS `mask`: the element's painting, subtree included, is multiplied by the
+/// alpha (or luminance) of what `paint` draws over its border box.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct VnMask {
+    /// `mask-mode: luminance`; alpha otherwise.
+    pub luminance: bool,
+    /// The element paints nothing but its background, and every layer can be
+    /// drawn tinted: a solid background then paints as the mask in its colour,
+    /// without an isolated layer.
+    pub tint_leaf: bool,
+    /// Identifies what `paint` draws, for comparing styles.
+    pub key: u64,
+    /// Draws the layers; no painter, no mask.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    pub paint: Option<VnMaskPainter>,
+}
+
+impl std::fmt::Debug for VnMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VnMask")
+            .field("luminance", &self.luminance)
+            .field("tint_leaf", &self.tint_leaf)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for VnMask {
+    fn eq(&self, other: &Self) -> bool {
+        (self.luminance, self.tint_leaf, self.key) == (other.luminance, other.tint_leaf, other.key)
+    }
 }
 
 /// A CSS background stack clipped to the element's descendant text.
@@ -1677,10 +1720,20 @@ impl Style {
         let clip = self.vn_clip_mask(bounds, window.rem_size());
         let outline = self.vn_clip_outline(bounds, window.rem_size());
         let element = window.vn_take_effect_element();
-        if !transformation.is_unit() {
-            return window.with_element_transform(transformation, |window| {
-                window.with_content_mask(clip, |window| {
-                    window.vn_with_clip_shape(outline.as_ref(), |window| {
+        let paint = |window: &mut Window| {
+            window.with_content_mask(clip, |window| {
+                window.vn_with_clip_shape(outline.as_ref(), |window| {
+                    if let Some(tint) = self.vn_mask_tint()
+                        && let Some(paint) = self.vn_mask.as_ref().and_then(|mask| mask.paint.clone())
+                    {
+                        if !tint.is_transparent() {
+                            window.with_element_opacity(Some(tint.a), |window| {
+                                paint(bounds, Some(Hsla { a: 1., ..tint }), window, cx)
+                            });
+                        }
+                        return continuation(window, cx);
+                    }
+                    window.vn_with_mask(self.vn_mask.as_ref(), bounds, cx, |window, cx| {
                         window.vn_with_color_matrix(self.vn_color_matrix, |window| {
                             window.vn_with_isolation(self.vn_isolate, |window| {
                                 self.paint_shaded(bounds, element, window, cx, continuation)
@@ -1688,17 +1741,36 @@ impl Style {
                         })
                     })
                 })
-            });
-        }
-        window.with_content_mask(clip, |window| {
-            window.vn_with_clip_shape(outline.as_ref(), |window| {
-                window.vn_with_color_matrix(self.vn_color_matrix, |window| {
-                    window.vn_with_isolation(self.vn_isolate, |window| {
-                        self.paint_shaded(bounds, element, window, cx, continuation)
-                    })
-                })
             })
-        })
+        };
+        if !transformation.is_unit() {
+            return window.with_element_transform(transformation, paint);
+        }
+        paint(window)
+    }
+
+    /// The colour a [`VnMask::tint_leaf`] mask paints in, when nothing but a
+    /// solid background shows under it.
+    fn vn_mask_tint(&self) -> Option<Hsla> {
+        let mask = self.vn_mask.as_ref()?;
+        if !mask.tint_leaf
+            || mask.luminance
+            || self.vn_color_matrix.is_some()
+            || !self.background_layers.is_empty()
+            || !self.box_shadow.is_empty()
+            || self.is_border_visible()
+            || self.backdrop_blur.is_some_and(|radius| radius > px(0.))
+            || self.vn_effect.is_some()
+            || self.vn_effect_fade.is_some()
+            || self.vn_mask_ring
+            || self.vn_outline.is_some_and(|o| o.width > px(0.) && !o.color.is_transparent())
+        {
+            return None;
+        }
+        match self.background.as_ref().and_then(Fill::color) {
+            None => Some(Hsla::transparent_black()),
+            Some(background) => background.as_solid(),
+        }
     }
 
     /// The `--shading` effects this style paints, the outgoing one of a
@@ -2120,6 +2192,7 @@ impl Default for Style {
             vn_capture: None,
             vn_isolate: false,
             vn_text_fill: None,
+            vn_mask: None,
             vn_corner_radii: Corners::default(),
 
             #[cfg(debug_assertions)]
@@ -3463,6 +3536,73 @@ mod vn_clip_path_tests {
                 assert!(hits(40., 40.));
                 assert!(!hits(60., 60.), "inside the box, outside the triangle");
                 assert!(!hits(150., 10.));
+            })
+            .unwrap();
+    }
+
+    fn quad_mask(tint_leaf: bool) -> crate::VnMask {
+        crate::VnMask {
+            luminance: false,
+            tint_leaf,
+            key: 1,
+            paint: Some(std::rc::Rc::new(|bounds, tint, window: &mut Window, _: &mut crate::App| {
+                let half = Bounds::new(bounds.origin, size(bounds.size.width / 2., bounds.size.height));
+                window.paint_quad(crate::fill(half, tint.unwrap_or_else(Hsla::white)));
+            })),
+        }
+    }
+
+    /// A translucent box with a child and a deferred child under a mask, and an icon-like leaf.
+    struct Masked;
+
+    impl Render for Masked {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let deferred = crate::deferred(div().absolute().top_0().left_0().size(px(20.)).bg(Hsla::black()));
+            let mut boxed = div()
+                .size(px(40.))
+                .bg(Hsla::red())
+                .opacity(0.5)
+                .child(div().size(px(10.)).bg(Hsla::green()))
+                .child(deferred.clip_to_ancestors(true));
+            boxed.style().vn_mask = Some(quad_mask(false));
+            let mut icon = div().size(px(20.)).bg(Hsla::blue());
+            icon.style().vn_mask = Some(quad_mask(true));
+            div().child(boxed).child(icon)
+        }
+    }
+
+    #[gpui::test]
+    fn a_mask_composites_its_group_through_the_mask_group_and_a_leaf_is_tinted(cx: &mut TestAppContext) {
+        let window = cx.open_window(size(px(200.), px(200.)), |_, _| Masked);
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                assert_eq!(scene.vn_layers.len(), 2, "the box, the deferred child, and no layer for the leaf");
+                let colors = |group: usize| -> Vec<Hsla> {
+                    scene
+                        .vn_batches(group)
+                        .filter_map(|b| match b {
+                            crate::VnBatch::Primitives(crate::PrimitiveBatch::Quads(r)) => Some(r),
+                            _ => None,
+                        })
+                        .flat_map(|r| scene.quads[r].iter().filter_map(|q| q.background.as_solid()).collect::<Vec<_>>())
+                        .collect()
+                };
+                let mut groups = Vec::new();
+                for layer in &scene.vn_layers {
+                    assert_eq!(layer.fill_rule, 1 << 1, "an alpha mask over a nonzero box");
+                    let content = colors(layer.group as usize);
+                    assert!(content.iter().all(|c| (c.a - 0.5).abs() < 1e-3), "{content:?}");
+                    assert_eq!(colors(layer.group as usize + 1), vec![Hsla::white()], "the mask is not faded");
+                    groups.push(content.len());
+                }
+                groups.sort();
+                assert_eq!(groups, vec![1, 2], "the deferred child paints through the mask again");
+                let root = colors(0);
+                assert_eq!(root, vec![Hsla::blue()], "the leaf paints the mask in its colour");
+                let leaf = scene.quads.iter().find(|q| q.background.as_solid() == Some(Hsla::blue())).unwrap();
+                assert_eq!(leaf.bounds.size.width.0, 10. * window.scale_factor());
             })
             .unwrap();
     }

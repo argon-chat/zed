@@ -1543,6 +1543,10 @@ fn layer_depth(scene: &Scene, group: usize, depth: usize) -> Result<usize> {
                     continue;
                 }
                 required = required.max(layer_depth(scene, layer.group as usize, depth + 1)?);
+                if layer.fill_rule >> 1 != 0 {
+                    required =
+                        required.max(layer_depth(scene, layer.group as usize + 1, depth + 2)?);
+                }
             }
         }
     }
@@ -2011,7 +2015,7 @@ impl Encoding<'_> {
             };
             snapshot.to(self.list, SHADER_READ, self.changes);
             retain(&self.retained, snapshot.clone());
-            return self.composite(index, layer.flags, &snapshot.sampled());
+            return self.composite(index, layer.flags, &snapshot.sampled(), None);
         }
         ensure!(
             depth < MAX_LAYER_DEPTH,
@@ -2031,17 +2035,32 @@ impl Encoding<'_> {
             return Ok(());
         }
         let target = self.draw_group_offscreen(layer.group as usize, depth, clip)?;
-        self.composite(index, layer.flags, &target.sampled())
+        let mask = if layer.fill_rule >> 1 != 0 {
+            Some(
+                self.draw_group_offscreen(layer.group as usize + 1, depth + 1, clip)?
+                    .sampled(),
+            )
+        } else {
+            None
+        };
+        self.composite(index, layer.flags, &target.sampled(), mask.as_ref())
     }
-    /// Composites layer `index` from `source` over the current target.
-    fn composite(&mut self, index: usize, flags: u32, source: &AtlasTexture) -> Result<()> {
+    /// Composites layer `index` from `source` over the current target,
+    /// through `mask` (at t2) when it has one.
+    fn composite(
+        &mut self,
+        index: usize,
+        flags: u32,
+        source: &AtlasTexture,
+        mask: Option<&AtlasTexture>,
+    ) -> Result<()> {
         let pipeline = if flags & vn_layer_flags::PLUS_LIGHTER != 0 {
             self.pipelines.vn_plus_lighter(FORMAT)?
         } else {
             self.pipelines.pipeline(ShaderModule::VnLayer, FORMAT, 1)?
         };
         let buffer = self.data.layers;
-        self.draw_pipeline(&pipeline, buffer, index as u32, 1, 4, Some(source), None)
+        self.draw_pipeline(&pipeline, buffer, index as u32, 1, 4, Some(source), mask)
     }
     /// Draws each capture's group into a cleared layer target and copies its
     /// ink into the capture's snapshot, before anything samples one.
@@ -3088,6 +3107,78 @@ mod tests {
             renderer.layers.is_empty(),
             "closed isolated groups must release their scratch targets"
         );
+        Ok(())
+    }
+
+    /// The scene of gpui_wgpu's and gpui_apple's `masks_multiply_by_alpha_or_luminance`.
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
+    fn native_masks_multiply_by_alpha_or_luminance() -> Result<()> {
+        let mut renderer = offscreen(64, 64)?;
+        let content_mask = mask(64., 64.);
+        let rectangle = |x: f32, y: f32| {
+            let (right, bottom) = (x + 32., y + 32.);
+            VnIsolation {
+                geometry: Arc::new(VnClipGeometry {
+                    fill_rule: VnFillRule::NonZero,
+                    segments: vec![
+                        [x, y, right, y],
+                        [right, y, right, bottom],
+                        [right, bottom, x, bottom],
+                        [x, bottom, x, y],
+                    ],
+                    bounds: bounds(x, y, 32., 32.),
+                }),
+                color_matrix: None,
+                text_paint: None,
+                content_mask,
+                capture: None,
+            }
+        };
+        let red = |x: f32, y: f32| quad(bounds(x, y, 32., 32.), rgb(0xff0000), content_mask);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 64., 64.), rgb(0x0000ff), content_mask));
+
+        scene.vn_push_isolation(rectangle(0., 0.));
+        scene.insert_primitive(red(0., 0.));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(0., 0., 16., 32.), rgba(0xffffff80), content_mask));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(rectangle(32., 0.));
+        scene.insert_primitive(red(32., 0.));
+        scene.vn_begin_mask(true);
+        scene.insert_primitive(quad(bounds(32., 0., 32., 32.), rgb(0x00ff00), content_mask));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(rectangle(0., 32.));
+        scene.insert_primitive(red(0., 32.));
+        scene.vn_begin_mask(false);
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(rectangle(32., 32.));
+        scene.vn_push_isolation(rectangle(32., 32.));
+        scene.insert_primitive(red(32., 32.));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(32., 32., 16., 32.), rgb(0xffffff), content_mask));
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        scene.finish();
+        let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        for (x, y, expected) in [
+            (8, 16, [128, 0, 127, 255]),
+            (24, 16, [0, 0, 255, 255]),
+            (40, 16, [182, 0, 73, 255]),
+            (8, 48, [0, 0, 255, 255]),
+            (40, 40, [255, 0, 0, 255]),
+            (56, 40, [0, 0, 255, 255]),
+        ] {
+            let actual = image.get_pixel(x, y).0;
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                close_channel(actual, expected);
+            }
+        }
+        assert_eq!(renderer.layers.len(), 3, "a nested mask draws two levels down");
         Ok(())
     }
 

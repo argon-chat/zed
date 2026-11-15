@@ -1893,7 +1893,8 @@ fragment float4 vn_layer_fragment(
     constant float4 *segments [[buffer(VnLayerInputIndex_Segments)]],
     constant VnTextBackground *text_backgrounds
     [[buffer(VnLayerInputIndex_TextBackgrounds)]],
-    texture2d<float> source [[texture(VnLayerInputIndex_Texture)]]) {
+    texture2d<float> source [[texture(VnLayerInputIndex_Texture)]],
+    texture2d<float> mask_source [[texture(VnLayerInputIndex_MaskTexture)]]) {
   VnLayer layer = layers[input.layer_id];
   float2 p = input.position.xy;
   if ((layer.flags & 1u) != 0u) {
@@ -1913,7 +1914,7 @@ fragment float4 vn_layer_fragment(
     return sampled * (snapshot_coverage * layer.opacity);
   }
   float coverage = vn_clip_coverage(p, segments, layer.segment_start,
-                                    layer.segment_count, layer.fill_rule) *
+                                    layer.segment_count, layer.fill_rule & 1u) *
                    content_mask_coverage(p, layer.content_mask.bounds,
                                          layer.content_mask.corner_radii);
   float4 color = source.read(uint2(p));
@@ -1957,6 +1958,13 @@ fragment float4 vn_layer_fragment(
       filtered.rgb = vn_linear_to_srgb(filtered.rgb);
     }
     color = float4(filtered.rgb * filtered.a, filtered.a);
+  }
+  uint mask_mode = layer.fill_rule >> 1;
+  if (mask_mode != 0u) {
+    float4 mask_texel = mask_source.read(uint2(p));
+    // Premultiplied, so this is the luminance times the alpha.
+    float luminance = dot(mask_texel.rgb, float3(0.2126, 0.7152, 0.0722));
+    color *= mask_mode == 2u ? luminance : mask_texel.a;
   }
   return color * (coverage * layer.opacity);
 }

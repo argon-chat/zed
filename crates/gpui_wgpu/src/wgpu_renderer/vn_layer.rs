@@ -157,16 +157,17 @@ impl WgpuRendererCore {
             let Some(pipeline) = self.vn_layer_pipeline(layer.flags) else {
                 return Ok(());
             };
-            self.vn_composite(&layers.bind_group, &pipeline, &view, index, encoder, frame);
+            self.vn_composite(&layers.bind_group, &pipeline, &view, None, index, encoder, frame);
             return Ok(());
         }
         let Some(layers) = draw.layers else {
             return self.draw_group(draw, group, depth, encoder, frame, None, instance_offset);
         };
-        if depth >= MAX_DEPTH {
+        let masked = layer.fill_rule >> 1 != 0;
+        if depth + usize::from(masked) >= MAX_DEPTH {
             effects_advisory(&format!(
-                "`clip-path` shapes nested more than {MAX_DEPTH} deep are not applied below that \
-                 depth — the content inside paints unclipped"
+                "`clip-path` shapes and masks nested more than {MAX_DEPTH} deep are not applied \
+                 below that depth — the content inside paints unclipped"
             ));
             return self.draw_group(draw, group, depth, encoder, frame, None, instance_offset);
         }
@@ -175,26 +176,40 @@ impl WgpuRendererCore {
         };
 
         let target = self.draw_group_offscreen(draw, group, depth, encoder, frame, instance_offset)?;
-        self.vn_composite(&layers.bind_group, &pipeline, &target.view, index, encoder, frame);
+        let mask = if masked {
+            Some(self.draw_group_offscreen(draw, group + 1, depth + 1, encoder, frame, instance_offset)?)
+        } else {
+            None
+        };
+        let mask = mask.as_ref().map(|mask| &mask.view);
+        self.vn_composite(&layers.bind_group, &pipeline, &target.view, mask, index, encoder, frame);
         Ok(())
     }
 
-    /// Layer `index`'s composite from `source` over `frame`.
+    /// Layer `index`'s composite from `source` over `frame`, through `mask`
+    /// when it has one.
+    #[allow(clippy::too_many_arguments)]
     fn vn_composite(
         &self,
         layers: &wgpu::BindGroup,
         pipeline: &wgpu::RenderPipeline,
         source: &wgpu::TextureView,
+        mask: Option<&wgpu::TextureView>,
         index: usize,
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameTarget,
     ) {
         let texture = self.create_texture_bind_group("vn_layer_texture", source);
+        let mask = match mask {
+            Some(mask) => self.create_texture_bind_group("vn_layer_mask", mask),
+            None => texture.clone(),
+        };
         let mut pass = continue_pass(encoder, &frame.view, "vn_layer_composite");
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources.globals_bind_group, &[]);
         pass.set_bind_group(1, layers, &[]);
         pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(3, &mask, &[]);
         pass.draw(0..4, index as u32..index as u32 + 1);
     }
 
@@ -317,7 +332,12 @@ impl WgpuRendererCore {
             let layout = pipeline_layout(
                 &device,
                 "vn_layer_layout",
-                &[&layouts.globals, &layouts.instances, &layouts.texture],
+                &[
+                    &layouts.globals,
+                    &layouts.instances,
+                    &layouts.texture,
+                    &layouts.texture,
+                ],
             );
             let blend = if plus_lighter {
                 let add = wgpu::BlendComponent {
@@ -716,6 +736,58 @@ mod tests {
             "plus-lighter halves sum to opaque",
         );
         Ok(())
+    }
+
+    /// The scene of gpui_windows' `native_masks_multiply_by_alpha_or_luminance` and
+    /// gpui_apple's `masks_multiply_by_alpha_or_luminance`.
+    #[test]
+    fn masks_multiply_by_alpha_or_luminance() -> Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let image = render(&mut renderer, mask_scene())?;
+
+        assert_close(pixel(&image, 8, 16), [128, 0, 127, 255], "half alpha");
+        assert_close(pixel(&image, 24, 16), [0, 0, 255, 255], "outside the mask");
+        assert_close(pixel(&image, 40, 16), [182, 0, 73, 255], "green luminance");
+        assert_close(pixel(&image, 8, 48), [0, 0, 255, 255], "an empty mask");
+        assert_close(pixel(&image, 40, 40), [255, 0, 0, 255], "inside a clip");
+        assert_close(pixel(&image, 56, 40), [0, 0, 255, 255], "masked inside a clip");
+        assert_eq!(
+            renderer.core.resources.vn_layers.targets.len(),
+            3,
+            "a nested mask draws two levels down"
+        );
+        Ok(())
+    }
+
+    fn mask_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x0000ff)));
+
+        scene.vn_push_isolation(isolation(rectangle(0., 0., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(0., 0., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(0., 0., 16., 32.), gpui::rgba(0xffffff80)));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(32., 0., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(32., 0., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(true);
+        scene.insert_primitive(quad(bounds(32., 0., 32., 32.), rgb(0x00ff00)));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(0., 32., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(0., 32., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(32., 32., 32., 32.), None, false));
+        scene.vn_push_isolation(isolation(rectangle(32., 32., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(32., 32., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(32., 32., 16., 32.), rgb(0xffffff)));
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        scene
     }
 
     /// The scene of gpui_windows' `native_nested_layers_apply_text_gradients_clips_and_color_matrix`.

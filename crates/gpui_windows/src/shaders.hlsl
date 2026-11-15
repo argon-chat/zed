@@ -1870,7 +1870,7 @@ float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
         return vn_snapshot_fragment(layer, input.position.xy);
     }
     float coverage = vn_clip_coverage(input.position.xy, layer.segment_start,
-        layer.segment_count, layer.fill_rule);
+        layer.segment_count, layer.fill_rule & 1u);
     coverage *= content_mask_coverage(input.position.xy, layer.content_mask, layer.content_mask_radii);
     // The layer is the size of the window: the texel under the pixel.
     float4 color = t_sprite.Load(int3(int2(input.position.xy), 0));
@@ -1903,6 +1903,14 @@ float4 vn_layer_fragment(VnLayerFragmentInput input): SV_Target {
                 1.055 * pow(filtered.rgb, 1.0 / 2.4) - 0.055, step(0.0031308, filtered.rgb));
         }
         color = float4(filtered.rgb * filtered.a, filtered.a);
+    }
+    // A mask's target is bound at t2, the same size as the layer's.
+    uint mask_mode = layer.fill_rule >> 1;
+    if (mask_mode != 0u) {
+        float4 mask = t_backdrop_original.Load(int3(int2(input.position.xy), 0));
+        // Premultiplied, so this is the luminance times the alpha.
+        float luminance = dot(mask.rgb, float3(0.2126, 0.7152, 0.0722));
+        color *= mask_mode == 2u ? luminance : mask.a;
     }
     // Premultiplied over premultiplied (the path sprite blend).
     return color * (coverage * layer.opacity);

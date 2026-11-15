@@ -692,36 +692,49 @@ impl DirectXRenderer {
             let Some(srv) = self.vn_snapshots.get(&id).map(|s| s.srv.clone()) else {
                 return Ok(());
             };
-            return self.vn_composite(index, layer.flags, &srv);
+            return self.vn_composite(index, layer.flags, &srv, None);
         }
-        if depth >= MAX_VN_LAYER_DEPTH {
+        let masked = layer.fill_rule >> 1 != 0;
+        if depth + usize::from(masked) >= MAX_VN_LAYER_DEPTH {
             effects_advisory(&format!(
-                "`clip-path` shapes nested more than {MAX_VN_LAYER_DEPTH} deep are not \
+                "`clip-path` shapes and masks nested more than {MAX_VN_LAYER_DEPTH} deep are not \
                  applied below that depth — the content inside paints unclipped"
             ));
             return self.draw_vn_group(scene, layer.group as usize, depth);
         }
         let target = self.draw_vn_group_offscreen(scene, layer.group as usize, depth)?;
-        self.vn_composite(index, layer.flags, &target.srv)
+        let mask = if masked {
+            Some(self.draw_vn_group_offscreen(scene, layer.group as usize + 1, depth + 1)?)
+        } else {
+            None
+        };
+        self.vn_composite(index, layer.flags, &target.srv, mask.as_ref().map(|mask| &mask.srv))
     }
 
     /// vue-native fork: composites layer `index` from `source` over the
-    /// current target.
+    /// current target, through `mask` (at t2) when it has one.
     fn vn_composite(
         &self,
         index: usize,
         flags: u32,
         source: &Option<ID3D11ShaderResourceView>,
+        mask: Option<&Option<ID3D11ShaderResourceView>>,
     ) -> Result<()> {
         self.bind_current_target()?;
         let devices = self.devices.as_ref().context("devices missing")?;
         let layer_texture = slice::from_ref(source);
+        let mask_texture = slice::from_ref(mask.unwrap_or(source));
         let segments = slice::from_ref(&self.pipelines.vn_clip_segments.view);
         let text_backgrounds = slice::from_ref(&self.pipelines.vn_text_backgrounds.view);
         self.pipelines.vn_layer_pipeline.draw_range_with_texture_resources_blend(
             &devices.device_context,
             None,
-            &[(0, layer_texture), (9, segments), (10, text_backgrounds)],
+            &[
+                (0, layer_texture),
+                (2, mask_texture),
+                (9, segments),
+                (10, text_backgrounds),
+            ],
             self.globals
                 .batch_params_buffer
                 .as_ref()

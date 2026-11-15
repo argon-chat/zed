@@ -122,6 +122,7 @@ impl MetalRenderer {
                 bindings,
                 &pipeline,
                 &texture,
+                None,
                 index,
                 command_buffer,
                 frame,
@@ -146,10 +147,11 @@ impl MetalRenderer {
         let Some(bindings) = draw.layers else {
             return inline(self, writer, surface_textures);
         };
-        if depth >= MAX_DEPTH {
+        let masked = layer.fill_rule >> 1 != 0;
+        if depth + usize::from(masked) >= MAX_DEPTH {
             effects_advisory(&format!(
-                "`clip-path` shapes nested more than {MAX_DEPTH} deep are not applied below that \
-                 depth — the content inside paints unclipped"
+                "`clip-path` shapes and masks nested more than {MAX_DEPTH} deep are not applied \
+                 below that depth — the content inside paints unclipped"
             ));
             return inline(self, writer, surface_textures);
         }
@@ -166,10 +168,24 @@ impl MetalRenderer {
             writer,
             surface_textures,
         )?;
+        let mask = if masked {
+            Some(self.draw_group_offscreen(
+                draw,
+                group + 1,
+                depth + 1,
+                command_buffer,
+                frame,
+                writer,
+                surface_textures,
+            )?)
+        } else {
+            None
+        };
         encode_composite(
             bindings,
             &pipeline,
             &target.texture,
+            mask.as_ref().map(|mask| &*mask.texture),
             index,
             command_buffer,
             frame,
@@ -358,11 +374,14 @@ impl MetalRenderer {
     }
 }
 
-/// Layer `index`'s composite from `source` over `frame`, in a pass of its own.
+/// Layer `index`'s composite from `source` over `frame`, in a pass of its own,
+/// through `mask` when it has one.
+#[allow(clippy::too_many_arguments)]
 fn encode_composite(
     bindings: &VnLayerBindings,
     pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
     source: &ProtocolObject<dyn MTLTexture>,
+    mask: Option<&ProtocolObject<dyn MTLTexture>>,
     index: usize,
     command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     frame: &FrameTarget,
@@ -402,6 +421,10 @@ fn encode_composite(
             VnLayerInputIndex::TextBackgrounds as usize,
         );
         encoder.setFragmentTexture_atIndex(Some(source), VnLayerInputIndex::Texture as usize);
+        encoder.setFragmentTexture_atIndex(
+            Some(mask.unwrap_or(source)),
+            VnLayerInputIndex::MaskTexture as usize,
+        );
         encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
             MTLPrimitiveType::TriangleStrip,
             0,
@@ -645,6 +668,50 @@ mod tests {
             [0, 0, 0, 255],
             "the page's edge stays sharp"
         );
+        Ok(())
+    }
+
+    /// The scene of gpui_windows' `native_masks_multiply_by_alpha_or_luminance` and
+    /// gpui_wgpu's `masks_multiply_by_alpha_or_luminance`.
+    #[test]
+    fn masks_multiply_by_alpha_or_luminance() -> Result<()> {
+        let mut renderer = MetalRenderer::new_headless(Default::default())?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., SIDE, SIDE), rgb(0x0000ff)));
+
+        scene.vn_push_isolation(isolation(rectangle(0., 0., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(0., 0., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(0., 0., 16., 32.), gpui::rgba(0xffffff80)));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(32., 0., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(32., 0., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(true);
+        scene.insert_primitive(quad(bounds(32., 0., 32., 32.), rgb(0x00ff00)));
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(0., 32., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(0., 32., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.vn_pop_isolation();
+
+        scene.vn_push_isolation(isolation(rectangle(32., 32., 32., 32.), None, false));
+        scene.vn_push_isolation(isolation(rectangle(32., 32., 32., 32.), None, false));
+        scene.insert_primitive(quad(bounds(32., 32., 32., 32.), rgb(0xff0000)));
+        scene.vn_begin_mask(false);
+        scene.insert_primitive(quad(bounds(32., 32., 16., 32.), rgb(0xffffff)));
+        scene.vn_pop_isolation();
+        scene.vn_pop_isolation();
+        let image = render(&mut renderer, scene)?;
+
+        assert_close(pixel(&image, 8, 16), [128, 0, 127, 255], "half alpha");
+        assert_close(pixel(&image, 24, 16), [0, 0, 255, 255], "outside the mask");
+        assert_close(pixel(&image, 40, 16), [182, 0, 73, 255], "green luminance");
+        assert_close(pixel(&image, 8, 48), [0, 0, 255, 255], "an empty mask");
+        assert_close(pixel(&image, 40, 40), [255, 0, 0, 255], "inside a clip");
+        assert_close(pixel(&image, 56, 40), [0, 0, 255, 255], "masked inside a clip");
+        assert_eq!(renderer.vn_layers.targets.len(), 3, "a nested mask draws two levels down");
         Ok(())
     }
 

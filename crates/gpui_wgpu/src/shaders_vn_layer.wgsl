@@ -7,7 +7,10 @@
 // clip segment (4 words), then every text background (69 words). The renderer
 // rewrites `segment_start` and `text_start` to the word where each run begins.
 // Group 2 binding 0 (`t_sprite`) is the layer's target, or the snapshot a
-// snapshot composite samples.
+// snapshot composite samples; group 3 binding 0 is its mask's (the target
+// itself when the layer has no mask).
+
+@group(3) @binding(0) var t_vn_mask: texture_2d<f32>;
 
 struct VnLayer {
     segment_start: u32,
@@ -158,7 +161,7 @@ fn fs_vn_layer(input: VnLayerVarying) -> @location(0) vec4<f32> {
     if ((layer.flags & 1u) != 0u) {
         return vn_snapshot_color(layer, position);
     }
-    let coverage = vn_clip_coverage(position, layer.segment_start, layer.segment_count, layer.fill_rule)
+    let coverage = vn_clip_coverage(position, layer.segment_start, layer.segment_count, layer.fill_rule & 1u)
         * content_mask_coverage(position, layer.content_mask, layer.content_mask_radii);
     var color = textureLoad(t_sprite, vec2<i32>(position), 0);
     if (layer.text_count != 0u) {
@@ -189,6 +192,13 @@ fn fs_vn_layer(input: VnLayerVarying) -> @location(0) vec4<f32> {
             filtered = vec4<f32>(linear_to_srgb(filtered.rgb), filtered.a);
         }
         color = vec4<f32>(filtered.rgb * filtered.a, filtered.a);
+    }
+    let mask_mode = layer.fill_rule >> 1u;
+    if (mask_mode != 0u) {
+        let mask = textureLoad(t_vn_mask, vec2<i32>(position), 0);
+        // Premultiplied, so this is the luminance times the alpha.
+        let luminance = dot(mask.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        color *= select(mask.a, luminance, mask_mode == 2u);
     }
     return color * (coverage * layer.opacity);
 }

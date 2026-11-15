@@ -191,8 +191,10 @@ pub struct VnTextBackground {
 /// group `group` into an offscreen target the size of the window, then
 /// composites it over its parent's, multiplied by the coverage of the
 /// segments `segment_start..segment_start + segment_count` of
-/// [`Scene::vn_clip_segments`] under `fill_rule` (0 nonzero, 1 evenodd), and
-/// by the content mask.
+/// [`Scene::vn_clip_segments`] under `fill_rule` (bit 0: 0 nonzero, 1
+/// evenodd), and by the content mask. Bits 1–2 of `fill_rule` name a mask
+/// ([`Scene::vn_begin_mask`]): 1 multiplies by the alpha, 2 by the luminance
+/// of group `group + 1`, which the renderer draws into a target of its own.
 ///
 /// A snapshot composite ([`vn_layer_flags::SNAPSHOT`]) samples the snapshot
 /// instead: each device pixel maps through `source_transform` into the
@@ -476,6 +478,9 @@ struct VnOpenGroup {
     existing_group: Option<usize>,
     shared_key: Option<(u8, u64, usize)>,
     context: usize,
+    /// Once the mask is painting: the group's own lists, and whether the mask
+    /// is luminance.
+    mask: Option<(VnGroupLists, bool)>,
 }
 
 /// An entry on the scene's layer stack. The bounds are retained so that a
@@ -567,6 +572,7 @@ impl Scene {
             existing_group,
             shared_key,
             context,
+            mask: None,
         });
     }
 
@@ -601,7 +607,30 @@ impl Scene {
             existing_group: None,
             shared_key: None,
             context,
+            mask: None,
         });
+    }
+
+    /// vue-native fork: what the innermost isolated layer paints from here to
+    /// its [`Scene::vn_pop_isolation`] is its mask: the group composites
+    /// multiplied by the mask's alpha, or its luminance.
+    pub fn vn_begin_mask(&mut self, luminance: bool) {
+        self.paint_operations.push(PaintOperation::VnBeginMask(luminance));
+        let Some(open) = self.vn_open.last() else {
+            return;
+        };
+        if open.mask.is_some()
+            || open.effect.is_some()
+            || open.existing_group.is_some()
+            || open.shared_key.is_some()
+        {
+            return;
+        }
+        let mut content = VnGroupLists::default();
+        self.vn_swap_lists(&mut content);
+        if let Some(open) = self.vn_open.last_mut() {
+            open.mask = Some((content, luminance));
+        }
     }
 
     /// vue-native fork: whether an isolated layer is open.
@@ -626,6 +655,10 @@ impl Scene {
             self.vn_close_effect(group, effect);
             return;
         }
+        let (mut group, mask_group) = match open.mask {
+            Some((content, luminance)) => (content, Some((group, luminance))),
+            None => (group, None),
+        };
         if let Some(index) = open.existing_group {
             // Its composite was inserted on the first paint. Appending source
             // pixels here must neither filter them alone nor composite twice.
@@ -661,13 +694,25 @@ impl Scene {
             ),
         )
         .intersect(&mask.bounds);
-        if (group.is_empty() && color_group.is_none()) || geometry.segments.is_empty() || bounds.is_empty() {
+        // An empty mask hides everything, as CSS's transparent black layer does.
+        let hidden = mask_group.as_ref().is_some_and(|(lists, _)| lists.is_empty());
+        if (group.is_empty() && color_group.is_none()) || hidden || geometry.segments.is_empty() || bounds.is_empty() {
             return;
         }
         if color_group.is_none() { group.primitive_bounds = BoundsTree::default(); }
         group.layer_stack = Vec::new();
         if let Some(key) = color_group { self.vn_color_groups.insert(key, self.vn_groups.len()); }
         self.vn_groups.push(group);
+        let mask_mode = match mask_group {
+            Some((mut lists, luminance)) => {
+                lists.primitive_bounds = BoundsTree::default();
+                lists.layer_stack = Vec::new();
+                self.vn_groups.push(lists);
+                if luminance { 2 } else { 1 }
+            }
+            None => 0,
+        };
+        let group_index = self.vn_groups.len() as u32 - u32::from(mask_mode != 0);
         let segment_start = self.vn_clip_segments.len() as u32;
         self.vn_clip_segments.extend_from_slice(&geometry.segments);
         let order = self
@@ -690,10 +735,10 @@ impl Scene {
         let text_count = self.vn_text_backgrounds.len() as u32 - text_start;
         self.vn_layers.push(VnLayer {
             order,
-            group: self.vn_groups.len() as u32,
+            group: group_index,
             segment_start,
             segment_count: geometry.segments.len() as u32,
-            fill_rule: (geometry.fill_rule == crate::VnFillRule::EvenOdd) as u32,
+            fill_rule: (geometry.fill_rule == crate::VnFillRule::EvenOdd) as u32 | mask_mode << 1,
             pad: [open.isolation.color_matrix.map_or(0, |m| if m.linear_rgb { 1 } else { 2 }), text_start, text_count],
             color_matrix: open.isolation.color_matrix.map_or([0.; 20], |matrix| matrix.gpu_values()),
             bounds,
@@ -1051,6 +1096,7 @@ impl Scene {
                 PaintOperation::VnStartEffect(effect) => self.vn_push_effect(effect.clone()),
                 PaintOperation::VnEndIsolation => self.vn_pop_isolation(),
                 PaintOperation::VnSnapshot(paint) => self.vn_insert_snapshot(*paint),
+                PaintOperation::VnBeginMask(luminance) => self.vn_begin_mask(*luminance),
             }
         }
     }
@@ -1225,6 +1271,8 @@ pub(crate) enum PaintOperation {
     VnEndIsolation,
     /// vue-native fork: [`Scene::vn_insert_snapshot`].
     VnSnapshot(VnSnapshotPaint),
+    /// vue-native fork: [`Scene::vn_begin_mask`].
+    VnBeginMask(bool),
 }
 
 #[derive(Clone)]

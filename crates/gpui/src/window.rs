@@ -5002,7 +5002,7 @@ impl Window {
                     self.with_rendered_view(deferred_draw.current_view, |window| {
                         // Reopen inherited clipping and transforms in their original order.
                         window.with_content_mask(content_mask, |window| {
-                            window.vn_reopen_clip_layers(vn_clip, |window| {
+                            window.vn_reopen_clip_layers(vn_clip, cx, |window, cx| {
                                 window.with_absolute_element_opacity(element_opacity, |window| {
                                     window.with_absolute_element_transform(element_transform, |window| {
                                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
@@ -5336,6 +5336,7 @@ impl Window {
             geometry,
             color_matrix: None,
             capture: None,
+            mask: None,
             parent: self.vn_clip_stack.clone(),
         });
         let previous = self.vn_clip_stack.replace(node.clone());
@@ -5369,6 +5370,7 @@ impl Window {
             geometry,
             color_matrix: Some(matrix),
             capture: None,
+            mask: None,
             parent: self.vn_clip_stack.clone(),
         });
         let previous = self.vn_clip_stack.replace(node.clone());
@@ -5406,6 +5408,90 @@ impl Window {
         let result = f(self);
         self.next_frame.scene.vn_pop_isolation();
         result
+    }
+
+    /// vue-native fork: CSS `mask`. While painting, `f` goes into an isolated
+    /// layer cut to the border box `bounds`, composited multiplied by the alpha
+    /// (or luminance) of what the mask paints over `bounds`. The mask is on the
+    /// clip stack meanwhile, in prepaint too, so a deferred descendant paints
+    /// through it again ([`Window::vn_reopen_clip_layers`]).
+    pub fn vn_with_mask<R>(
+        &mut self,
+        mask: Option<&crate::VnMask>,
+        bounds: Bounds<Pixels>,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
+    ) -> R {
+        let Some(mask) = mask.filter(|mask| mask.paint.is_some()) else {
+            return f(self, cx);
+        };
+        let node = Arc::new(crate::VnClipNode {
+            geometry: self.vn_box_geometry(bounds),
+            color_matrix: None,
+            capture: None,
+            mask: Some(crate::VnClipMask {
+                mask: mask.clone(),
+                bounds,
+                transform: self.element_transform,
+            }),
+            parent: self.vn_clip_stack.clone(),
+        });
+        let previous = self.vn_clip_stack.replace(node.clone());
+        let result = if self.invalidator.is_painting() {
+            let content_mask = self.snapped_content_mask();
+            self.next_frame.scene.vn_push_isolation(crate::VnIsolation {
+                geometry: node.geometry.clone(),
+                color_matrix: None,
+                text_paint: None,
+                content_mask,
+                capture: None,
+            });
+            let result = f(self, cx);
+            self.vn_paint_mask(&node, cx);
+            self.next_frame.scene.vn_pop_isolation();
+            result
+        } else {
+            f(self, cx)
+        };
+        self.vn_clip_stack = previous;
+        result
+    }
+
+    /// Ends the content of `node`'s open layer with its mask, if it has one.
+    fn vn_paint_mask(&mut self, node: &crate::VnClipNode, cx: &mut App) {
+        let Some(clip) = &node.mask else { return };
+        let Some(paint) = clip.mask.paint.clone() else { return };
+        self.next_frame.scene.vn_begin_mask(clip.mask.luminance);
+        // The content already carries the element's opacity; the mask must not
+        // apply it a second time.
+        let opacity = mem::replace(&mut self.element_opacity, 1.);
+        let tint = mem::replace(&mut self.element_image_tint, Hsla::transparent_black());
+        let transform = mem::replace(&mut self.element_transform, clip.transform);
+        paint(clip.bounds, None, self, cx);
+        self.element_opacity = opacity;
+        self.element_image_tint = tint;
+        self.element_transform = transform;
+    }
+
+    /// The border box `bounds` as a clip shape through the element transform.
+    fn vn_box_geometry(&self, bounds: Bounds<Pixels>) -> Arc<crate::VnClipGeometry> {
+        let (x, y) = (bounds.origin.x.0, bounds.origin.y.0);
+        let (right, bottom) = (x + bounds.size.width.0, y + bounds.size.height.0);
+        let outline = crate::VnClipOutline {
+            fill_rule: crate::VnFillRule::NonZero,
+            verbs: vec![
+                crate::VnPathVerb::MoveTo([x, y]),
+                crate::VnPathVerb::LineTo([right, y]),
+                crate::VnPathVerb::LineTo([right, bottom]),
+                crate::VnPathVerb::LineTo([x, bottom]),
+                crate::VnPathVerb::Close,
+            ],
+        };
+        Arc::new(crate::VnClipGeometry::new(
+            &outline,
+            self.scale_factor,
+            self.element_transform,
+        ))
     }
 
     /// vue-native fork: `f` inside an isolated layer for `node`'s shape when
@@ -5451,10 +5537,11 @@ impl Window {
     fn vn_reopen_clip_layers<R>(
         &mut self,
         clip: Option<Arc<crate::VnClipNode>>,
-        f: impl FnOnce(&mut Self) -> R,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
     ) -> R {
         let Some(innermost) = clip.clone() else {
-            return self.vn_with_absolute_clip_stack(None, f);
+            return self.vn_with_absolute_clip_stack(None, |window| f(window, cx));
         };
         let chain = crate::VnClipNode::outermost_first(&innermost);
         self.vn_with_absolute_clip_stack(clip, |window| {
@@ -5468,8 +5555,9 @@ impl Window {
                     capture: node.capture,
                 });
             }
-            let result = f(window);
-            for _ in &chain {
+            let result = f(window, cx);
+            for node in chain.iter().rev() {
+                window.vn_paint_mask(node, cx);
                 window.next_frame.scene.vn_pop_isolation();
             }
             result
@@ -5501,6 +5589,7 @@ impl Window {
             geometry: Arc::new(crate::VnClipGeometry::rect(device)),
             color_matrix: None,
             capture: Some(info),
+            mask: None,
             parent: None,
         });
         let previous_clip = self.vn_clip_stack.replace(node.clone());
