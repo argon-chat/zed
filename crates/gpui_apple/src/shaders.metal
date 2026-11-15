@@ -1580,3 +1580,194 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// vue-native: CSS `backdrop-filter: blur()` and the `--shading` effects, a port
+// of gpui_windows' shaders.hlsl / effects.hlsl and gpui_wgpu's
+// shaders_{blur,backdrop,effects}.wgsl. Every entry point draws a four-vertex
+// triangle strip.
+
+constexpr sampler backdrop_clamp_sampler(address::clamp_to_edge,
+                                         mag_filter::linear,
+                                         min_filter::linear);
+
+float2 strip_unit_vertex(uint vertex_id) {
+  return float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+}
+
+// Keeps rgb <= a, so a premultiplied target never holds an out-of-gamut pixel.
+float4 clamp_premultiplied(float4 color) {
+  float alpha = saturate(color.a);
+  return float4(clamp(color.rgb, float3(0.), float3(alpha)), alpha);
+}
+
+// The rect cut to its content mask's rectangle. Nothing here is transformed,
+// so drawing the intersection rejects exactly the pixels that the other
+// pipelines' clip distances reject.
+Bounds_ScaledPixels clip_to_mask(Bounds_ScaledPixels bounds,
+                                 Bounds_ScaledPixels mask) {
+  float2 origin = max(float2(bounds.origin.x, bounds.origin.y),
+                      float2(mask.origin.x, mask.origin.y));
+  float2 corner = min(
+      float2(bounds.origin.x + bounds.size.width,
+             bounds.origin.y + bounds.size.height),
+      float2(mask.origin.x + mask.size.width, mask.origin.y + mask.size.height));
+  float2 size = max(corner - origin, float2(0.));
+  Bounds_ScaledPixels clipped;
+  clipped.origin.x = origin.x;
+  clipped.origin.y = origin.y;
+  clipped.size.width = size.x;
+  clipped.size.height = size.y;
+  return clipped;
+}
+
+struct BackdropPassVertexOutput {
+  float4 position [[position]];
+  float2 texture_position;
+};
+
+// The whole target, for the blur pyramid passes and the intermediate frame's
+// copy; drawn with blending disabled.
+vertex BackdropPassVertexOutput backdrop_pass_vertex(uint vertex_id [[vertex_id]]) {
+  float2 unit_vertex = strip_unit_vertex(vertex_id);
+  return BackdropPassVertexOutput{
+      float4(unit_vertex * float2(2., -2.) + float2(-1., 1.), 0., 1.),
+      unit_vertex};
+}
+
+fragment float4 blur_downsample_fragment(
+    BackdropPassVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(BackdropTextureIndex_Processed)]]) {
+  float2 texel = 1. / float2(source.get_width(), source.get_height());
+  float2 uv = input.texture_position;
+  float4 color = source.sample(backdrop_clamp_sampler, uv) * 0.5;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(-1., -1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(1., -1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(-1., 1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(1., 1.)) * 0.125;
+  return clamp_premultiplied(color);
+}
+
+fragment float4 blur_upsample_fragment(
+    BackdropPassVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(BackdropTextureIndex_Processed)]]) {
+  float2 texel = 1. / float2(source.get_width(), source.get_height());
+  float2 uv = input.texture_position;
+  float4 color = float4(0.);
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(-1., 0.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(1., 0.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(0., -1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(0., 1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(-1., -1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(1., -1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(-1., 1.)) * 0.125;
+  color += source.sample(backdrop_clamp_sampler, uv + texel * float2(1., 1.)) * 0.125;
+  return clamp_premultiplied(color);
+}
+
+fragment float4 frame_copy_fragment(
+    BackdropPassVertexOutput input [[stage_in]],
+    texture2d<float> source [[texture(BackdropTextureIndex_Processed)]]) {
+  return source.read(uint2(input.position.xy));
+}
+
+struct BlurRectVertexOutput {
+  float4 position [[position]];
+  uint blur_rect_id [[flat]];
+};
+
+vertex BlurRectVertexOutput blur_rect_vertex(
+    uint vertex_id [[vertex_id]], uint blur_rect_id [[instance_id]],
+    constant BackdropBlurRect *blur_rects [[buffer(BackdropInputIndex_Instances)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]]) {
+  BackdropBlurRect blur_rect = blur_rects[blur_rect_id];
+  float4 position = to_device_position(
+      strip_unit_vertex(vertex_id),
+      clip_to_mask(blur_rect.bounds, blur_rect.content_mask.bounds),
+      viewport_size);
+  return BlurRectVertexOutput{position, blur_rect_id};
+}
+
+// `above` arrives with straight alpha, `below` is already premultiplied.
+float4 over_straight_on_premultiplied(float4 below, float4 above) {
+  float4 premultiplied = float4(above.rgb * above.a, above.a);
+  return clamp_premultiplied(premultiplied + below * (1. - above.a));
+}
+
+// Drawn with blending disabled: outside the rounded rect the untouched
+// snapshot is written back, which keeps the antialiased edge correct.
+fragment float4 blur_rect_fragment(
+    BlurRectVertexOutput input [[stage_in]],
+    constant BackdropBlurRect *blur_rects [[buffer(BackdropInputIndex_Instances)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]],
+    texture2d<float> processed [[texture(BackdropTextureIndex_Processed)]],
+    texture2d<float> original [[texture(BackdropTextureIndex_Original)]]) {
+  BackdropBlurRect blur_rect = blur_rects[input.blur_rect_id];
+  float2 position = input.position.xy;
+  float2 texture_position =
+      position / float2(viewport_size->width, viewport_size->height);
+
+  float sdf = quad_sdf(position, blur_rect.bounds, blur_rect.corner_radii);
+  float shape_alpha = saturate(0.5 - sdf);
+
+  float4 untouched =
+      original.sample(backdrop_clamp_sampler, texture_position, level(0.));
+  float4 blurred =
+      processed.sample(backdrop_clamp_sampler, texture_position, level(0.));
+  float4 tint = hsla_to_rgba(blur_rect.tint);
+  float4 tinted =
+      tint.a > 0. ? over_straight_on_premultiplied(blurred, tint) : blurred;
+  float coverage = shape_alpha * saturate(blur_rect.opacity) *
+                   content_mask_coverage(position, blur_rect.content_mask.bounds,
+                                         blur_rect.content_mask.corner_radii);
+  return clamp_premultiplied(mix(untouched, tinted, float4(coverage)));
+}
+
+// The generated fragment stages (crates/sk-effects/generated/*.metal) read
+// the quad's index as `[[flat]] uint [[user(TEXCOORD)]]`.
+struct EffectVertexOutput {
+  float4 position [[position]];
+  uint effect_quad_id [[user(TEXCOORD), flat]];
+};
+
+// The VERTEX half of every `--shading` effect. One instance draws one effect
+// quad, already dilated by its bleed, cut to its content mask's rectangle
+// because the generated fragment stage cannot discard.
+vertex EffectVertexOutput effect_vertex(
+    uint vertex_id [[vertex_id]], uint effect_quad_id [[instance_id]],
+    constant EffectQuad *effect_quads [[buffer(BackdropInputIndex_Instances)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropInputIndex_ViewportSize)]]) {
+  EffectQuad quad = effect_quads[effect_quad_id];
+  float4 position =
+      to_device_position(strip_unit_vertex(vertex_id),
+                         clip_to_mask(quad.bounds, quad.content_mask.bounds),
+                         viewport_size);
+  return EffectVertexOutput{position, effect_quad_id};
+}
+
+float punch_distance(float2 position, Bounds_ScaledPixels bounds,
+                     Corners_ScaledPixels radii) {
+  float2 half_size = float2(bounds.size.width, bounds.size.height) * 0.5;
+  float2 p = position - (float2(bounds.origin.x, bounds.origin.y) + half_size);
+  float left = p.y < 0. ? radii.top_left : radii.bottom_left;
+  float right = p.y < 0. ? radii.top_right : radii.bottom_right;
+  float radius = min(p.x < 0. ? left : right, min(half_size.x, half_size.y));
+  float2 q = abs(p) - half_size + radius;
+  return length(max(q, float2(0.))) + min(max(q.x, q.y), 0.) - radius;
+}
+
+// `gpui::effect_id::PUNCH`: only a coverage, which the pipeline's
+// destination-out blend erases from the target.
+fragment float4 punch_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant EffectQuad *effect_quads [[buffer(BackdropInputIndex_Instances)]]) {
+  EffectQuad quad = effect_quads[input.effect_quad_id];
+  float inside = saturate(
+      0.5 - punch_distance(input.position.xy, quad.bounds, quad.corner_radii));
+  float unmasked = saturate(0.5 - punch_distance(input.position.xy,
+                                                 quad.content_mask.bounds,
+                                                 quad.content_mask.corner_radii));
+  return float4(0., 0., 0., inside * unmasked * quad.opacity);
+}

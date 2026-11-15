@@ -1,3 +1,5 @@
+mod backdrop;
+
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -142,6 +144,12 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Kept for the backdrop pipelines, built on the first frame that needs them.
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    backdrop: backdrop::BackdropState,
+    /// Whether this renderer turned the layer's `framebufferOnly` off, so a
+    /// backdrop can copy from the drawable; restored with the scratch targets.
+    framebuffer_only_lifted: bool,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
@@ -437,6 +445,9 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            library,
+            backdrop: backdrop::BackdropState::default(),
+            framebuffer_only_lifted: false,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -861,10 +872,11 @@ impl MetalRenderer {
             .commandBuffer()
             .context("creating command buffer")?;
         let alpha = if self.opaque { 1. } else { 0. };
+        let frame = self.prepare_frame_target(scene, texture);
 
         let mut command_encoder = new_command_encoder_for_texture(
             &command_buffer,
-            texture,
+            &frame.texture,
             viewport_size,
             Some(MTLClearColor {
                 red: 0.,
@@ -882,14 +894,45 @@ impl MetalRenderer {
                 PrimitiveBatch::Quads(range) => {
                     self.draw_quads(range, instance_bindings, viewport_size, &command_encoder)
                 }
-                PrimitiveBatch::BackdropBlurRects(_) => {
-                    // DirectX is the only backend with backdrop blur support.
+                // A backdrop reads what has been drawn so far, so the pass
+                // ends here and resumes after the composite.
+                PrimitiveBatch::BackdropBlurRects(range) => {
+                    if frame.backdrop && !range.is_empty() {
+                        command_encoder = self.draw_backdrop_blur_rects(
+                            &command_buffer,
+                            command_encoder,
+                            &frame,
+                            &scene.backdrop_blur_rects[range.clone()],
+                            range.start,
+                            &instance_bindings.backdrop_blur_rects,
+                            viewport_size,
+                        )?;
+                    }
                 }
-                PrimitiveBatch::EffectQuads { .. } => {
-                    // …and the only one with `--shading` effect pipelines. The
-                    // `.slang` sources retarget (`-target wgsl` / SPIR-V), but
-                    // the engine-owned vertex stage and the pipeline table are
-                    // per-backend, so this is a real port rather than a flag.
+                PrimitiveBatch::EffectQuads { effect_id, range } => {
+                    let effect_quads = &scene.effect_quads[range.clone()];
+                    match self.effect_pass(&frame, effect_id, effect_quads) {
+                        backdrop::EffectPass::Skip => {}
+                        backdrop::EffectPass::Blended => self.draw_blended_effects(
+                            effect_id,
+                            range,
+                            &instance_bindings.effect_quads,
+                            viewport_size,
+                            &command_encoder,
+                        ),
+                        backdrop::EffectPass::Backdrop => {
+                            command_encoder = self.draw_backdrop_effects(
+                                &command_buffer,
+                                command_encoder,
+                                &frame,
+                                effect_id,
+                                effect_quads,
+                                range.start,
+                                &instance_bindings.effect_quads,
+                                viewport_size,
+                            )?;
+                        }
+                    }
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
@@ -904,7 +947,7 @@ impl MetalRenderer {
 
                     command_encoder = new_command_encoder_for_texture(
                         &command_buffer,
-                        texture,
+                        &frame.texture,
                         viewport_size,
                         None,
                     )?;
@@ -958,6 +1001,7 @@ impl MetalRenderer {
         }
 
         command_encoder.endEncoding();
+        self.finish_frame_target(&command_buffer, &frame)?;
 
         Ok(command_buffer)
     }
@@ -1685,6 +1729,8 @@ struct InstanceBinding {
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
+    backdrop_blur_rects: InstanceBinding,
+    effect_quads: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
@@ -1695,6 +1741,8 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
+        backdrop_blur_rects: writer.write(&scene.backdrop_blur_rects)?,
+        effect_quads: writer.write(&scene.effect_quads)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
         polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
@@ -1886,6 +1934,24 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+}
+
+/// Buffer slots of the backdrop and effect pipelines. `Globals` and
+/// `Instances` are the generated effect fragment stages' `[[buffer(0)]]` and
+/// `[[buffer(1)]]`.
+#[repr(C)]
+enum BackdropInputIndex {
+    Globals = 0,
+    Instances = 1,
+    ViewportSize = 2,
+}
+
+/// Texture slots of the same pipelines, the generated stages' `[[texture(0)]]`
+/// (the blurred backdrop) and `[[texture(2)]]` (the untouched snapshot).
+#[repr(C)]
+enum BackdropTextureIndex {
+    Processed = 0,
+    Original = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

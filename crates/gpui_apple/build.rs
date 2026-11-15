@@ -23,6 +23,58 @@ mod apple_build {
         emit_stitched_shaders(&header_path);
         #[cfg(not(feature = "runtime_shaders"))]
         compile_metal_shaders(&header_path);
+
+        embed_builtin_effects();
+    }
+
+    /// `gpui::effect_id` order; `metal_renderer::backdrop` asserts the count.
+    const BUILTIN_EFFECTS: [&str; 3] = ["frost", "noise", "glow"];
+
+    /// Embeds the MSL fragment stages `bun scripts/shaders.ts` checks in beside
+    /// the `.slang` sources; the renderer compiles them at runtime. A layout
+    /// without them still builds: the effects are then unavailable at runtime,
+    /// with an advisory.
+    fn embed_builtin_effects() {
+        use std::fmt::Write as _;
+
+        println!("cargo:rerun-if-env-changed=SK_EFFECTS_GENERATED_DIR");
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let generated = match env::var("SK_EFFECTS_GENERATED_DIR") {
+            Ok(directory) => manifest_dir.join(directory),
+            Err(_) => manifest_dir.join("../../../../crates/sk-effects/generated"),
+        };
+
+        let mut table = String::from(
+            "pub(super) const BUILTIN_EFFECT_MSL: [(&str, Option<&str>); BUILTIN_EFFECT_COUNT] = [\n",
+        );
+        for effect in BUILTIN_EFFECTS {
+            let path = generated.join(format!("{effect}.metal"));
+            println!("cargo:rerun-if-changed={}", path.display());
+            if path.is_file() {
+                let path = path.to_str().expect("effect shader path is not UTF-8");
+                writeln!(table, "    ({effect:?}, Some(include_str!({path:?}))),").unwrap();
+            } else {
+                println!(
+                    "cargo:warning=missing generated effect shader {} — `--shading: {effect}(…)` \
+                     will be unavailable; run `bun run shaders` at the SDK root or point \
+                     SK_EFFECTS_GENERATED_DIR at the directory",
+                    path.display()
+                );
+                writeln!(table, "    ({effect:?}, None),").unwrap();
+            }
+        }
+        table.push_str("];\n");
+        writeln!(
+            table,
+            "pub(super) const BUILTIN_EFFECT_COUNT: usize = {};",
+            BUILTIN_EFFECTS.len()
+        )
+        .unwrap();
+        std::fs::write(
+            PathBuf::from(env::var("OUT_DIR").unwrap()).join("builtin_effects.rs"),
+            table,
+        )
+        .unwrap();
     }
 
     fn generate_shader_bindings() -> PathBuf {
@@ -64,6 +116,10 @@ mod apple_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            "BackdropBlurRect".into(),
+            "EffectQuad".into(),
+            "BackdropInputIndex".into(),
+            "BackdropTextureIndex".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

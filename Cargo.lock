@@ -7477,6 +7477,8 @@ dependencies = [
  "objc2-security",
  "parking_lot",
  "pathfinder_geometry",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.17",
  "zed-font-kit",
