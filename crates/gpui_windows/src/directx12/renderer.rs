@@ -2628,6 +2628,88 @@ mod tests {
         Ok(())
     }
 
+    /// Linux draws backdrop blur and the built-in effects through gpui_wgpu;
+    /// both renderers must agree on the same scene.
+    #[::core::prelude::v1::test]
+    #[ignore = "requires a native D3D12 adapter and a Vulkan or GL adapter; run explicitly for renderer qualification"]
+    fn native_backdrop_and_effects_match_the_wgpu_renderer() -> Result<()> {
+        let content_mask = mask(64., 64.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 64., 64.), rgb(0x000000), content_mask));
+        scene.insert_primitive(quad(bounds(0., 0., 32., 64.), rgb(0xffffff), content_mask));
+        scene.insert_primitive(quad(bounds(4., 40., 56., 6.), rgb(0x3060d0), content_mask));
+        scene.insert_primitive(BackdropBlurRect {
+            bounds: bounds(4., 4., 40., 30.),
+            content_mask: mask(36., 64.),
+            corner_radii: Corners::all(ScaledPixels(10.)),
+            blur_radius: ScaledPixels(10.),
+            opacity: 0.8,
+            tint: Hsla { a: 0.3, ..red() },
+            ..Default::default()
+        });
+        scene.insert_primitive(EffectQuad {
+            effect_id: effect_id::FROST,
+            bounds: bounds(36., 4., 24., 30.),
+            content_mask,
+            corner_radii: Corners::all(ScaledPixels(6.)),
+            params0: [0.7, 6., 0., 0.],
+            params1: [1., 1., 1., 0.1],
+            opacity: 1.,
+            backdrop_blur_radius: ScaledPixels(6.),
+            scale: 1.,
+            flags: EFFECT_FLAG_NEEDS_BACKDROP,
+            ..Default::default()
+        });
+        scene.insert_primitive(EffectQuad {
+            effect_id: effect_id::GLOW,
+            bounds: bounds(6., 34., 28., 28.),
+            content_mask,
+            params0: [6., 0.9, 0., 0.],
+            params1: [0.2, 1., 0.4, 1.],
+            opacity: 1.,
+            bleed: ScaledPixels(6.),
+            scale: 1.,
+            ..Default::default()
+        });
+        scene.insert_primitive(EffectQuad {
+            effect_id: effect_id::NOISE,
+            bounds: bounds(40., 40., 20., 20.),
+            content_mask,
+            params0: [0.6, 2., 0., 0.],
+            opacity: 1.,
+            scale: 1.,
+            ..Default::default()
+        });
+        scene.finish();
+
+        let native =
+            offscreen(64, 64)?.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+        let wgpu = gpui_wgpu::WgpuHeadlessRenderer::new()?
+            .render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(64)))?;
+        let differences: Vec<u8> = native
+            .as_raw()
+            .iter()
+            .zip(wgpu.as_raw())
+            .map(|(native, wgpu)| native.abs_diff(*wgpu))
+            .collect();
+        let largest = differences.iter().copied().max().unwrap_or_default();
+        let mean = differences
+            .iter()
+            .map(|&difference| f64::from(difference))
+            .sum::<f64>()
+            / differences.len() as f64;
+        let outliers = differences
+            .iter()
+            .filter(|&&difference| difference > 4)
+            .count();
+        assert!(
+            mean < 0.5 && outliers * 200 < differences.len() && largest <= 16,
+            "wgpu must match D3D12: mean {mean:.3}, {outliers} channels off by more than 4, \
+             largest {largest}"
+        );
+        Ok(())
+    }
+
     fn draw_repeatedly(renderer: &mut DirectXRenderer, scene: &Scene, frames: u32) -> Result<()> {
         for _ in 0..frames {
             renderer.render_to_image(scene, WindowBackgroundAppearance::Transparent)?;

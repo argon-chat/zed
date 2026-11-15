@@ -1,3 +1,5 @@
+mod backdrop;
+
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -46,6 +48,22 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_decode.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
+
+/// The backdrop blur composite. Storage buffers only: the backdrop primitives
+/// are skipped on the WebGL2 transport.
+const BACKDROP_SHADERS: &str = concat!(
+    include_str!("shaders.wgsl"),
+    include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_decode.wgsl"),
+    include_str!("shaders_backdrop.wgsl"),
+);
+
+/// The blur pyramid passes, standalone: their bindings sit in group 0.
+const BLUR_SHADERS: &str = include_str!("shaders_blur.wgsl");
+
+/// The vertex stage of every `--shading` effect, standalone: its group 0 is the
+/// DirectX-layout globals the generated fragment stages read.
+const EFFECT_VERTEX_SHADER: &str = include_str!("shaders_effects.wgsl");
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -156,6 +174,8 @@ struct InstanceBinding {
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
+    backdrop_blur_rects: InstanceBinding,
+    effect_quads: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
@@ -200,6 +220,7 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    backdrop: backdrop::BackdropState,
 }
 
 struct CachedTextureBindGroup {
@@ -213,6 +234,7 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.backdrop.invalidate_targets();
     }
 }
 
@@ -471,8 +493,12 @@ impl WgpuRenderer {
             );
         }
 
+        // A copy source lets a backdrop blur snapshot the frame in place. GL
+        // surfaces cannot be one; those frames render through an intermediate.
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | (surface_caps.usages & wgpu::TextureUsages::COPY_SRC);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format: surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
@@ -1235,6 +1261,7 @@ impl WgpuRenderer {
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
         if let Err(error) = core.render_frame(
             scene,
+            &frame.texture,
             &frame_view,
             size,
             premultiplied_alpha,
@@ -1394,6 +1421,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                backdrop: backdrop::BackdropState::default(),
             },
             atlas,
             path_globals_offset,
@@ -1458,6 +1486,7 @@ impl WgpuRendererCore {
     fn render_frame(
         &mut self,
         scene: &Scene,
+        target: &wgpu::Texture,
         target_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
@@ -1509,7 +1538,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target, target_view, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1519,7 +1548,8 @@ impl WgpuRendererCore {
     fn record_frame(
         &mut self,
         scene: &Scene,
-        frame_view: &wgpu::TextureView,
+        target: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
@@ -1527,10 +1557,12 @@ impl WgpuRendererCore {
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
                 format!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
+                    "scene too large: {} paths, {} shadows, {} quads, {} backdrop blur rects, {} effect quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
+                    scene.backdrop_blur_rects.len(),
+                    scene.effect_quads.len(),
                     scene.underlines.len(),
                     scene.monochrome_sprites.len(),
                     scene.subpixel_sprites.len(),
@@ -1538,6 +1570,7 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        let frame = self.prepare_frame_target(scene, target, target_view);
 
         let mut encoder =
             self.resources()
@@ -1550,7 +1583,7 @@ impl WgpuRendererCore {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: &frame.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
@@ -1570,15 +1603,46 @@ impl WgpuRendererCore {
                         instance_range(range),
                         &mut pass,
                     ),
-                    PrimitiveBatch::BackdropBlurRects(_) => {
-                        // DirectX is the only backend with backdrop blur support.
+                    // A backdrop reads what has been drawn so far, so the pass
+                    // ends here and resumes after the composite.
+                    PrimitiveBatch::BackdropBlurRects(range) => {
+                        if !frame.backdrop || range.is_empty() {
+                            continue;
+                        }
+                        drop(pass);
+                        self.draw_backdrop_blur_rects(
+                            &mut encoder,
+                            &frame,
+                            &scene.backdrop_blur_rects[range.clone()],
+                            range.start,
+                            &instance_bindings.backdrop_blur_rects,
+                        )?;
+                        pass = continue_pass(&mut encoder, &frame.view, "main_pass_continued");
                     }
-                    PrimitiveBatch::EffectQuads { .. } => {
-                        // …and the only one with `--shading` effect pipelines.
-                        // The `.slang` sources retarget (`-target wgsl`, or
-                        // PEWPEW's SPIR-V→naga route), but the engine-owned
-                        // vertex stage and the pipeline table are per-backend,
-                        // so this is a real port rather than a flag.
+                    PrimitiveBatch::EffectQuads { effect_id, range } => {
+                        let effect_quads = &scene.effect_quads[range.clone()];
+                        match self.effect_pass(&frame, effect_id, effect_quads) {
+                            backdrop::EffectPass::Skip => {}
+                            backdrop::EffectPass::Blended => self.draw_blended_effects(
+                                effect_id,
+                                &instance_bindings.effect_quads,
+                                instance_range(range),
+                                &mut pass,
+                            ),
+                            backdrop::EffectPass::Backdrop => {
+                                drop(pass);
+                                self.draw_backdrop_effects(
+                                    &mut encoder,
+                                    &frame,
+                                    effect_id,
+                                    effect_quads,
+                                    range.start,
+                                    &instance_bindings.effect_quads,
+                                )?;
+                                pass =
+                                    continue_pass(&mut encoder, &frame.view, "main_pass_continued");
+                            }
+                        }
                     }
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
@@ -1599,20 +1663,7 @@ impl WgpuRendererCore {
                             &mut instance_offset,
                         )?;
 
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
+                        pass = continue_pass(&mut encoder, &frame.view, "main_pass_continued");
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -1666,6 +1717,7 @@ impl WgpuRendererCore {
                 }
             }
         }
+        self.finish_frame_target(&mut encoder, &frame);
 
         let submission = self
             .resources()
@@ -1689,6 +1741,16 @@ impl WgpuRendererCore {
                 "shadows_bind_group",
                 instance_offset,
                 &scene.shadows,
+            )?,
+            backdrop_blur_rects: self.write_instance_binding(
+                "backdrop_blur_rects_bind_group",
+                instance_offset,
+                &scene.backdrop_blur_rects,
+            )?,
+            effect_quads: self.write_instance_binding(
+                "effect_quads_bind_group",
+                instance_offset,
+                &scene.effect_quads,
             )?,
             underlines: self.write_instance_binding(
                 "underlines_bind_group",
@@ -2458,14 +2520,13 @@ impl WgpuHeadlessRenderer {
     fn render(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
         self.check_gpu_errors()?;
         self.ensure_render_target(size)?;
-        let view = self
+        let target = self
             .render_target
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
-            .view
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
+        let (texture, view) = (target.texture.clone(), target.view.clone());
         self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
+            .render_frame(scene, &texture, &view, size, false, wgpu::Color::BLACK)?;
         Ok(())
     }
 
@@ -2606,6 +2667,28 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
+}
+
+/// Reopens the frame target after a batch that needed passes of its own.
+fn continue_pass<'encoder>(
+    encoder: &'encoder mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    label: &str,
+) -> wgpu::RenderPass<'encoder> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]

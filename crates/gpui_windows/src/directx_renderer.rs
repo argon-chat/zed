@@ -2964,9 +2964,9 @@ pub(crate) mod shader_resources {
         hlsl: String,
     }
 
-    /// Must match `vn_effects::MANIFEST_SCHEMA`. Both sides refuse a manifest
+    /// Must match `sk_effects::MANIFEST_SCHEMA`. Both sides refuse a manifest
     /// they do not recognise rather than half-reading it.
-    const DYNAMIC_MANIFEST_SCHEMA: u32 = 4;
+    const DYNAMIC_MANIFEST_SCHEMA: u32 = 6;
 
     pub(crate) const EFFECTS_DIR_ENV: &str = "SK_EFFECTS_DIR";
 

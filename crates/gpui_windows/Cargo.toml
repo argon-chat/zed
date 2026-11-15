@@ -97,5 +97,8 @@ optional = true
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows-registry.workspace = true
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+gpui_wgpu = { workspace = true, features = ["test-support"] }
+
 [package.metadata.cargo-shear]
 ignored = ["scap"]
