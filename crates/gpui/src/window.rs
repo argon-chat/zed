@@ -1304,9 +1304,6 @@ pub(crate) struct DeferredDraw {
     /// vue-native fork: the `[SkContent]` effect the draw was deferred from
     /// inside, which paints it into its content ([`VnDeferScope`]).
     vn_scope: Option<VnDeferScope>,
-    /// vue-native fork: painted by its scope this frame, so not again after
-    /// the tree.
-    vn_scoped: bool,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     /// The entities the deferred element accessed while it was last drawn, in
@@ -5329,7 +5326,6 @@ impl Window {
                     element_opacity: deferred_draw.element_opacity,
                     vn_clip: deferred_draw.vn_clip.clone(),
                     vn_scope: deferred_draw.vn_scope.clone(),
-                    vn_scoped: deferred_draw.vn_scoped,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                     accessed_entities: deferred_draw.accessed_entities.clone(),
@@ -6398,7 +6394,6 @@ impl Window {
                 crate::VnClipNode::color_filters(&self.vn_clip_stack)
             },
             vn_scope: self.vn_defer_scope.clone(),
-            vn_scoped: false,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
