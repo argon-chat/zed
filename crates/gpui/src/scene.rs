@@ -2190,6 +2190,10 @@ pub struct EffectSpec {
     /// Whether this effect's output depends on `time`, i.e. whether the window
     /// must keep repainting for it to animate.
     pub animated: bool,
+    /// `Some(i)`: `params[i]` is a speed `time` is multiplied by, which the
+    /// painter integrates per element so a change of it does not jump.
+    #[serde(default)]
+    pub animated_param: Option<u8>,
     /// `Some(i)`: the painter writes the pointer's position in the element's
     /// 0..1 box units into `params[i..i + 2]`.
     pub pointer_param: Option<u8>,
@@ -2219,6 +2223,7 @@ impl EffectSpec {
         backdrop_radius_param: None,
         bleed_param: None,
         animated: false,
+        animated_param: None,
         pointer_param: None,
         pointer_times_param: None,
         clock_mask: 0,

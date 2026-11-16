@@ -948,6 +948,48 @@ fn vn_history_key(element: u64, spec: &EffectSpec) -> u64 {
     hasher.finish().max(1)
 }
 
+/// The phase an effect's `[SkAnimated]` speed has accumulated: its integral
+/// over the effect clock, so a change of speed bends the motion instead of
+/// rescaling all the time elapsed since the clock's zero. It starts at
+/// `speed * time`, which is what an unchanged speed gives anyway.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VnEffectPhase {
+    at: f32,
+    phase: f64,
+}
+
+impl VnEffectPhase {
+    /// Seconds an element may go unpainted before its phase is forgotten.
+    const KEEP: f32 = 10.;
+
+    fn advance(previous: Option<Self>, speed: f32, now: f32) -> Self {
+        match previous {
+            None => Self {
+                at: now,
+                phase: f64::from(speed) * f64::from(now),
+            },
+            Some(previous) if now > previous.at => Self {
+                at: now,
+                phase: previous.phase + f64::from(speed) * f64::from(now - previous.at),
+            },
+            Some(previous) => previous,
+        }
+    }
+
+    /// The speed the shader reads in place of the authored one: `time` times
+    /// it is the phase.
+    fn speed(&self, now: f32) -> Option<f32> {
+        (now > 1e-3).then(|| (self.phase / f64::from(now)) as f32)
+    }
+}
+
+fn vn_phase_key(element: u64, spec: &EffectSpec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = collections::FxHasher::default();
+    (element, spec.id, "phase").hash(&mut hasher);
+    hasher.finish()
+}
+
 fn transform_mask(
     matrix: TransformationMatrix,
     mask: ContentMask<Pixels>,
@@ -1764,6 +1806,9 @@ pub struct Window {
     /// vue-native fork: the identity of the element whose style paints next,
     /// which keys an `[SkHistory]` effect's state; 0 when it has none.
     vn_effect_element: u64,
+    /// vue-native fork: per element and effect, how far its `[SkAnimated]`
+    /// speed has advanced it ([`VnEffectPhase`]).
+    vn_effect_phases: FxHashMap<u64, VnEffectPhase>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -2935,6 +2980,7 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             vn_effect_pointer: VnEffectPointer::new(hovered.get()),
             vn_effect_element: 0,
+            vn_effect_phases: FxHashMap::default(),
             pointer_inside: hovered.get(),
             hovered,
             needs_present,
@@ -4421,6 +4467,9 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
+            let now = crate::effect_clock_seconds();
+            self.vn_effect_phases
+                .retain(|_, phase| now - phase.at < VnEffectPhase::KEEP);
             #[cfg(feature = "profiler")]
             {
                 let viewport_size = self.viewport_size;
@@ -6636,7 +6685,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
         let opacity = self.element_opacity();
         let Some(mut quad) =
-            self.vn_effect_quad(bounds, corner_radii, spec, opacity, textures.as_deref())
+            self.vn_effect_quad(bounds, corner_radii, spec, element, opacity, textures.as_deref())
         else {
             return;
         };
@@ -6710,6 +6759,7 @@ impl Window {
                 bounds,
                 corner_radii,
                 *spec,
+                element,
                 opacity * weight,
                 textures.as_deref(),
             ) else {
@@ -6764,6 +6814,7 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         spec: EffectSpec,
+        element: u64,
         opacity: f32,
         textures: Option<&crate::EffectTextureSet>,
     ) -> Option<EffectQuad> {
@@ -6824,6 +6875,18 @@ impl Window {
         if spec.follows_pointer() {
             let view = self.current_view();
             self.vn_effect_pointer.views.insert(view);
+        }
+        if let Some(slot) = spec.animated_param.map(usize::from)
+            && slot < params.len()
+            && element != 0
+        {
+            let key = vn_phase_key(element, &spec);
+            let previous = self.vn_effect_phases.get(&key).copied();
+            let phase = VnEffectPhase::advance(previous, params[slot], now);
+            self.vn_effect_phases.insert(key, phase);
+            if let Some(speed) = phase.speed(now) {
+                params[slot] = speed;
+            }
         }
 
         let mut clocked = spec;
@@ -13905,6 +13968,57 @@ mod vn_pointer_inside_tests {
             })
             .unwrap();
         assert!((params[4] - 0.75).abs() < 1e-4 && (params[5] - 0.25).abs() < 1e-4);
+    }
+
+    struct Spinning {
+        speed: Rc<Cell<f32>>,
+    }
+
+    impl Render for Spinning {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut spec = crate::EffectSpec::NONE;
+            spec.id = 0;
+            spec.animated_param = Some(0);
+            spec.params[0] = self.speed.get();
+            let mut element = div().id("spinning").size_full();
+            element.style().vn_effect = Some(spec);
+            element
+        }
+    }
+
+    #[gpui::test]
+    fn a_speed_change_continues_the_phase_instead_of_rescaling_the_clock(
+        cx: &mut TestAppContext,
+    ) {
+        let speed = Rc::new(Cell::new(1.));
+        let shared = speed.clone();
+        let window = cx.open_window(size(px(200.), px(100.)), move |_, _| Spinning {
+            speed: shared,
+        });
+        cx.run_until_parked();
+        let repaint = |cx: &mut TestAppContext| {
+            window.update(cx, |_, window, _| window.refresh()).unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, _| {
+                    let quad = window.rendered_frame.scene.effect_quads[0];
+                    (quad.params[0] * quad.time, quad.time)
+                })
+                .unwrap()
+        };
+        // A rescale is only visible once the clock is away from zero.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (before, then) = repaint(cx);
+        assert!((before - then).abs() < 1e-3, "an unchanged speed is `speed * time`");
+
+        speed.set(8.);
+        let (after, now) = repaint(cx);
+        let advanced = after - before;
+        assert!(
+            advanced >= -1e-3 && advanced <= 8. * (now - then) + 1e-3,
+            "the phase moved by {advanced} in {}s",
+            now - then
+        );
     }
 }
 
