@@ -366,6 +366,27 @@ impl VnClipNode {
         chain
     }
 
+    /// [`Self::outermost_first`] without the clips `base` is already inside
+    /// of: the layers a draw deferred from inside `base` reopens when it
+    /// paints within it.
+    pub fn inside_of(this: &Arc<VnClipNode>, base: Option<&Arc<VnClipNode>>) -> Vec<Arc<VnClipNode>> {
+        let chain = Self::outermost_first(this);
+        let Some(base) = base else { return chain };
+        let mut outer = Self::outermost_first(base).into_iter();
+        // A `color_filters` chain copies the nodes it keeps, sharing their geometry.
+        let same = |a: &Arc<VnClipNode>, b: &Arc<VnClipNode>| {
+            Arc::ptr_eq(a, b)
+                || (Arc::ptr_eq(&a.geometry, &b.geometry)
+                    && a.color_matrix == b.color_matrix
+                    && a.capture == b.capture)
+        };
+        let shared = chain
+            .iter()
+            .take_while(|node| outer.any(|o| same(&o, node)))
+            .count();
+        chain.into_iter().skip(shared).collect()
+    }
+
     /// Fixed-position descendants can escape geometric clips, but remain in
     /// their ancestors' color-filter groups until those groups composite.
     pub fn color_filters(clip: &Option<Arc<VnClipNode>>) -> Option<Arc<VnClipNode>> {

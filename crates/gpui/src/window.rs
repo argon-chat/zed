@@ -1301,11 +1301,45 @@ pub(crate) struct DeferredDraw {
     /// escapes its ancestors' clips). Its prepaint re-enters them, and its
     /// paint re-opens an isolated layer for each ([`Window::vn_with_clip_shape`]).
     vn_clip: Option<Arc<crate::VnClipNode>>,
+    /// vue-native fork: the `[SkContent]` effect the draw was deferred from
+    /// inside, which paints it into its content ([`VnDeferScope`]).
+    vn_scope: Option<VnDeferScope>,
+    /// vue-native fork: painted by its scope this frame, so not again after
+    /// the tree.
+    vn_scoped: bool,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     /// The entities the deferred element accessed while it was last drawn, in
     /// any phase, restored when its prepaint is reused.
     accessed_entities: FxHashSet<EntityId>,
+}
+
+/// vue-native fork: an element whose effect reads its own content. A draw
+/// deferred from inside it (a positioned descendant) paints into that
+/// content, after the element's in-flow subtree, rather than after the whole
+/// tree where the effect never sees it. `id` is the element's
+/// [`vn_element_key`]; `clip` the clip stack its subtree prepainted in, which
+/// the content group is already inside of.
+#[derive(Clone, Debug)]
+pub(crate) struct VnDeferScope {
+    id: u64,
+    clip: Option<Arc<crate::VnClipNode>>,
+}
+
+/// vue-native fork: an element's identity for per-element paint state, 0
+/// for none. Views are left out: a cached subtree is painted inside its view
+/// on one frame and replayed without it on the next.
+pub(crate) fn vn_element_key(id: Option<&GlobalElementId>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    id.map_or(0, |id| {
+        let mut hasher = collections::FxHasher::default();
+        for id in id.iter() {
+            if !matches!(id, ElementId::View(_)) {
+                id.hash(&mut hasher);
+            }
+        }
+        hasher.finish().max(1)
+    })
 }
 
 impl DeferredDraw {
@@ -1809,6 +1843,12 @@ pub struct Window {
     /// vue-native fork: per element and effect, how far its `[SkAnimated]`
     /// speed has advanced it ([`VnEffectPhase`]).
     vn_effect_phases: FxHashMap<u64, VnEffectPhase>,
+    /// vue-native fork: the scope a draw deferred now goes to, while
+    /// prepainting.
+    vn_defer_scope: Option<VnDeferScope>,
+    /// vue-native fork: the scopes whose content painted their draws this
+    /// frame.
+    vn_scopes_painted: FxHashSet<u64>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -2981,6 +3021,8 @@ impl Window {
             vn_effect_pointer: VnEffectPointer::new(hovered.get()),
             vn_effect_element: 0,
             vn_effect_phases: FxHashMap::default(),
+            vn_defer_scope: None,
+            vn_scopes_painted: FxHashSet::default(),
             pointer_inside: hovered.get(),
             hovered,
             needs_present,
@@ -4466,6 +4508,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            self.vn_scopes_painted.clear();
             self.draw_roots(cx);
             let now = crate::effect_clock_seconds();
             self.vn_effect_phases
@@ -4939,6 +4982,7 @@ impl Window {
                     element_opacity,
                     content_mask,
                     vn_clip,
+                    vn_scope,
                     prepaint_range,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
@@ -4956,6 +5000,7 @@ impl Window {
                         deferred_draw.element_opacity,
                         deferred_draw.content_mask,
                         deferred_draw.vn_clip.clone(),
+                        deferred_draw.vn_scope.clone(),
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -4980,7 +5025,9 @@ impl Window {
                                         window.with_absolute_element_opacity(element_opacity, |window| {
                                             window.with_absolute_element_transform(element_transform, |window| {
                                                 window.with_absolute_element_offset(absolute_offset, |window| {
+                                                    let outer = mem::replace(&mut window.vn_defer_scope, vn_scope);
                                                     element.prepaint(window, cx);
+                                                    window.vn_defer_scope = outer;
                                                 });
                                             });
                                         });
@@ -5024,55 +5071,143 @@ impl Window {
             return;
         }
 
+        // vue-native fork: the draws stay in place, since a `VnDeferScope`
+        // painting among them looks its own draws up.
         let traversal_order = self.deferred_draw_traversal_order();
-        let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
-            let deferred_draw = &mut deferred_draws[deferred_draw_ix];
-            self.element_id_stack
-                .clone_from(&deferred_draw.element_id_stack);
-            // vue-native fork: the text style too, as the prepaint side does.
-            // Without it a deferred element that reads `Window::text_style` in
-            // PAINT read the default, not what its ancestors set: an inline
-            // `<svg>` tinted by the inherited `color` painted black when it was
-            // `position: absolute` (m26 client sweep #36).
-            self.text_style_stack
-                .clone_from(&deferred_draw.text_style_stack);
-            self.next_frame
-                .dispatch_tree
-                .set_active_node(deferred_draw.parent_node);
+            let draw = &self.next_frame.deferred_draws[deferred_draw_ix];
+            // A replayed one was painted by its scope's replay.
+            if let Some(scope) = &draw.vn_scope
+                && (self.vn_scopes_painted.contains(&scope.id) || draw.element.is_none())
+            {
+                continue;
+            }
+            self.vn_paint_deferred_draw(deferred_draw_ix, None, cx);
+        }
+        self.element_id_stack.clear();
+        self.text_style_stack.clear();
+    }
 
-            let paint_start = self.paint_index();
-            let content_mask = deferred_draw.content_mask;
-            let element_transform = deferred_draw.element_transform;
-            let element_opacity = deferred_draw.element_opacity;
-            let vn_clip = deferred_draw.vn_clip.clone();
-            if let Some(element) = deferred_draw.element.as_mut() {
-                let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    self.with_rendered_view(deferred_draw.current_view, |window| {
-                        // Reopen inherited clipping and transforms in their original order.
-                        window.with_content_mask(content_mask, |window| {
-                            window.vn_reopen_clip_layers(vn_clip, cx, |window, cx| {
-                                window.with_absolute_element_opacity(element_opacity, |window| {
-                                    window.with_absolute_element_transform(element_transform, |window| {
-                                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                                            element.paint(window, cx);
-                                        });
+    /// Paints the deferred draw `ix`. In a scope, `scope` is the absolute
+    /// opacity the scope's content group took off, and the clip stack it is
+    /// inside of.
+    fn vn_paint_deferred_draw(
+        &mut self,
+        ix: usize,
+        scope: Option<(f32, Option<Arc<crate::VnClipNode>>)>,
+        cx: &mut App,
+    ) {
+        let deferred_draw = &mut self.next_frame.deferred_draws[ix];
+        self.element_id_stack
+            .clone_from(&deferred_draw.element_id_stack);
+        // vue-native fork: the text style too, as the prepaint side does.
+        // Without it a deferred element that reads `Window::text_style` in
+        // PAINT read the default, not what its ancestors set: an inline
+        // `<svg>` tinted by the inherited `color` painted black when it was
+        // `position: absolute` (m26 client sweep #36).
+        self.text_style_stack
+            .clone_from(&deferred_draw.text_style_stack);
+        self.next_frame
+            .dispatch_tree
+            .set_active_node(deferred_draw.parent_node);
+
+        let deferred_draw = &mut self.next_frame.deferred_draws[ix];
+        let content_mask = deferred_draw.content_mask;
+        let element_transform = deferred_draw.element_transform;
+        let (element_opacity, base) = match &scope {
+            Some((opacity, base)) => (
+                (deferred_draw.element_opacity / opacity).min(1.),
+                base.as_ref(),
+            ),
+            None => (deferred_draw.element_opacity, None),
+        };
+        let vn_clip = deferred_draw.vn_clip.clone();
+        let view = deferred_draw.current_view;
+        let rem_size = deferred_draw.rem_size;
+        let paint_range = deferred_draw.paint_range.clone();
+        let mut element = deferred_draw.element.take();
+
+        let paint_start = self.paint_index();
+        if let Some(element) = element.as_mut() {
+            let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                self.with_rendered_view(view, |window| {
+                    // Reopen inherited clipping and transforms in their original order.
+                    window.with_content_mask(content_mask, |window| {
+                        window.vn_reopen_clip_layers(vn_clip, base, cx, |window, cx| {
+                            window.with_absolute_element_opacity(element_opacity, |window| {
+                                window.with_absolute_element_transform(element_transform, |window| {
+                                    window.with_rem_size(Some(rem_size), |window| {
+                                        element.paint(window, cx);
                                     });
                                 });
                             });
                         });
                     });
                 });
-                deferred_draw.accessed_entities.extend(accessed_entities);
-            } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
-            }
-            let paint_end = self.paint_index();
-            deferred_draw.paint_range = paint_start..paint_end;
+            });
+            self.next_frame.deferred_draws[ix]
+                .accessed_entities
+                .extend(accessed_entities);
+        } else {
+            self.reuse_paint(paint_range);
         }
-        self.next_frame.deferred_draws = deferred_draws;
-        self.element_id_stack.clear();
-        self.text_style_stack.clear();
+        let paint_end = self.paint_index();
+        let deferred_draw = &mut self.next_frame.deferred_draws[ix];
+        deferred_draw.element = element;
+        deferred_draw.paint_range = paint_start..paint_end;
+    }
+
+    /// vue-native fork: paints the draws deferred from inside the content
+    /// effect of element `id` ([`VnDeferScope`]) in their stacking order,
+    /// into its content group, whose absolute opacity was `opacity`.
+    fn vn_paint_scope(&mut self, id: u64, opacity: f32, cx: &mut App) {
+        if id == 0 || !self.vn_scopes_painted.insert(id) {
+            return;
+        }
+        let mut order: SmallVec<[usize; 8]> = self
+            .next_frame
+            .deferred_draws
+            .iter()
+            .enumerate()
+            .filter(|(_, draw)| draw.vn_scope.as_ref().is_some_and(|scope| scope.id == id))
+            .map(|(ix, _)| ix)
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        let draws = &self.next_frame.deferred_draws;
+        order.sort_by(|a, b| draws[*a].order().cmp(&draws[*b].order()));
+        let element_id_stack = self.element_id_stack.clone();
+        let text_style_stack = self.text_style_stack.clone();
+        let active_node = self.next_frame.dispatch_tree.active_node_id();
+        for ix in order {
+            let base = self.next_frame.deferred_draws[ix]
+                .vn_scope
+                .as_ref()
+                .and_then(|scope| scope.clip.clone());
+            self.vn_paint_deferred_draw(ix, Some((opacity, base)), cx);
+        }
+        self.element_id_stack = element_id_stack;
+        self.text_style_stack = text_style_stack;
+        if let Some(node) = active_node {
+            self.next_frame.dispatch_tree.set_active_node(node);
+        }
+    }
+
+    /// vue-native fork: draws deferred in `f` belong to the content effect of
+    /// element `id` (0: none), which paints them ([`VnDeferScope`]).
+    pub fn vn_with_defer_scope<R>(&mut self, id: u64, f: impl FnOnce(&mut Self) -> R) -> R {
+        if id == 0 {
+            return f(self);
+        }
+        let scope = VnDeferScope {
+            id,
+            clip: self.vn_clip_stack.clone(),
+        };
+        let previous = self.vn_defer_scope.replace(scope);
+        let result = f(self);
+        self.vn_defer_scope = previous;
+        result
     }
 
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
@@ -5193,6 +5328,8 @@ impl Window {
                     vn_stack: deferred_draw.vn_stack.clone(),
                     element_opacity: deferred_draw.element_opacity,
                     vn_clip: deferred_draw.vn_clip.clone(),
+                    vn_scope: deferred_draw.vn_scope.clone(),
+                    vn_scoped: deferred_draw.vn_scoped,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                     accessed_entities: deferred_draw.accessed_entities.clone(),
@@ -5582,17 +5719,19 @@ impl Window {
     /// vue-native fork: a deferred draw's paint, inside an isolated layer for
     /// each clip shape it was deferred from inside, the outermost first. It
     /// paints after the clipped ancestor closed its own layer, so it is
-    /// composited through the same shapes on its own.
+    /// composited through the same shapes on its own. Painted inside a
+    /// [`VnDeferScope`], it reopens only the shapes inside the scope's `base`.
     fn vn_reopen_clip_layers<R>(
         &mut self,
         clip: Option<Arc<crate::VnClipNode>>,
+        base: Option<&Arc<crate::VnClipNode>>,
         cx: &mut App,
         f: impl FnOnce(&mut Self, &mut App) -> R,
     ) -> R {
         let Some(innermost) = clip.clone() else {
             return self.vn_with_absolute_clip_stack(None, |window| f(window, cx));
         };
-        let chain = crate::VnClipNode::outermost_first(&innermost);
+        let chain = crate::VnClipNode::inside_of(&innermost, base);
         self.vn_with_absolute_clip_stack(clip, |window| {
             for node in &chain {
                 let content_mask = window.snapped_content_mask();
@@ -6258,6 +6397,8 @@ impl Window {
             } else {
                 crate::VnClipNode::color_filters(&self.vn_clip_stack)
             },
+            vn_scope: self.vn_defer_scope.clone(),
+            vn_scoped: false,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
             accessed_entities: FxHashSet::default(),
@@ -6714,18 +6855,7 @@ impl Window {
     /// vue-native fork: names the element whose style paints next
     /// ([`Self::vn_take_effect_element`]).
     pub fn vn_set_effect_element(&mut self, id: Option<&GlobalElementId>) {
-        use std::hash::{Hash, Hasher};
-        // Views are left out: a cached subtree is painted inside its view on
-        // one frame and replayed without it on the next.
-        self.vn_effect_element = id.map_or(0, |id| {
-            let mut hasher = collections::FxHasher::default();
-            for id in id.iter() {
-                if !matches!(id, ElementId::View(_)) {
-                    id.hash(&mut hasher);
-                }
-            }
-            hasher.finish().max(1)
-        });
+        self.vn_effect_element = vn_element_key(id);
     }
 
     /// vue-native fork: the element [`Self::vn_set_effect_element`] named, 0
@@ -6743,11 +6873,12 @@ impl Window {
         corner_radii: Corners<Pixels>,
         effects: &[(EffectSpec, f32, Option<Arc<crate::EffectTextureSet>>)],
         element: u64,
-        f: impl FnOnce(&mut Self) -> R,
+        cx: &mut App,
+        f: impl FnOnce(&mut Self, &mut App) -> R,
     ) -> R {
         let opacity = self.element_opacity();
         if !self.invalidator.is_painting() || opacity <= 0. {
-            return f(self);
+            return f(self, cx);
         }
         let mut draws = Vec::new();
         let mut plain = 1.;
@@ -6800,9 +6931,10 @@ impl Window {
             content: true,
             content_mask,
         });
-        let opacity = mem::replace(&mut self.element_opacity, 1.);
-        let result = f(self);
-        self.element_opacity = opacity;
+        let outer = mem::replace(&mut self.element_opacity, 1.);
+        let result = f(self, cx);
+        self.vn_paint_scope(element, opacity, cx);
+        self.element_opacity = outer;
         self.next_frame.scene.vn_pop_isolation();
         result
     }

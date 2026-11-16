@@ -2647,7 +2647,14 @@ impl Interactivity {
 
                                 let scroll_offset =
                                     self.clamp_scroll_position(bounds, &style, window, cx);
-                                let result = f(&style, scroll_offset, hitbox, window, cx);
+                                let scope = if style.vn_reads_content() {
+                                    crate::window::vn_element_key(global_id)
+                                } else {
+                                    0
+                                };
+                                let result = window.vn_with_defer_scope(scope, |window| {
+                                    f(&style, scroll_offset, hitbox, window, cx)
+                                });
                                 (result, element_state)
                             },
                         )

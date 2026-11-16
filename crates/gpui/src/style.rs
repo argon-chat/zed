@@ -1839,9 +1839,18 @@ impl Style {
                 (*spec, *weight, textures)
             })
             .collect();
-        window.vn_with_effect_content(bounds, corner_radii, &shaded, element, |window| {
+        window.vn_with_effect_content(bounds, corner_radii, &shaded, element, cx, |window, cx| {
             self.paint_untransformed(bounds, window, cx, continuation, &effects, element, true)
         })
+    }
+
+    /// Whether an effect of this style reads the element's content, whose
+    /// deferred descendants then paint into it ([`Window::vn_with_defer_scope`]).
+    pub fn vn_reads_content(&self) -> bool {
+        [self.vn_effect, self.vn_effect_fade.map(|fade| fade.from)]
+            .into_iter()
+            .flatten()
+            .any(|spec| spec.is_some() && spec.flags & crate::EFFECT_FLAG_NEEDS_CONTENT != 0)
     }
 
     /// CSS paints the filtered backdrop underneath the element's own
