@@ -80,7 +80,11 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    // vue-native fork: where this frame's path tiles, curves and paints
+    // start, in words of the instance data.
+    path_tile_base: u32,
+    path_curve_base: u32,
+    path_paint_base: u32,
 }
 
 struct GammaParams {
@@ -337,29 +341,8 @@ fn oklab_to_linear_srgb(color: vec4<f32>) -> vec4<f32> {
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     let alpha = above.a + below.a * (1.0 - above.a);
-    let color = (above.rgb * above.a + below.rgb * below.a * (1.0 - above.a)) / alpha;
-    return vec4<f32>(color, alpha);
-}
-
-// A standard gaussian function, used for weighting samples
-fn gaussian(x: f32, sigma: f32) -> f32{
-    return exp(-(x * x) / (2.0 * sigma * sigma)) / (sqrt(2.0 * M_PI_F) * sigma);
-}
-
-// This approximates the error function, needed for the gaussian integral
-fn erf(v: vec2<f32>) -> vec2<f32> {
-    let s = sign(v);
-    let a = abs(v);
-    let r1 = 1.0 + (0.278393 + (0.230389 + (0.000972 + 0.078108 * a) * a) * a) * a;
-    let r2 = r1 * r1;
-    return s - s / (r2 * r2);
-}
-
-fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
-  let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
-  let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
-  return integral.y - integral.x;
+    let premultiplied = above.rgb * above.a + below.rgb * below.a * (1.0 - above.a);
+    return vec4<f32>(premultiplied / select(alpha, 1.0, alpha == 0.0), alpha);
 }
 
 // Selects corner radius based on quadrant.
@@ -1099,11 +1082,13 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
             }
         }
 
-        // Blend the border on top of the background and then linearly interpolate
-        // between the two as we slide inside the background.
-        let blended_border = over(background_color, border_color);
-        color = mix(interior_color, blended_border,
-                    saturate(antialias_threshold - inner_sdf));
+        let inner_coverage = saturate(antialias_threshold - inner_sdf);
+        var below = background_color;
+        if ((quad.background.flags & BG_RING) != 0u) {
+            below.a *= inner_coverage;
+        }
+        border_color.a *= inner_coverage;
+        color = over(below, border_color);
     }
 
     return blend_color(color, saturate(antialias_threshold - outer_sdf));
@@ -1174,25 +1159,28 @@ fn fmod(a: f32, b: f32) -> f32 {
 struct Shadow {
     order: u32,
     blur_radius: f32,
-    // The shadow rect for drop shadows; the "hole" rect for inset shadows.
+    // The area the shadow paints: the blurred extent of a drop shadow, or the element
+    // that an inset shadow is clipped to.
     bounds: Bounds,
     corner_radii: Corners,
     content_mask: Bounds,
     // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
     content_mask_radii: Corners,
     color: Hsla,
-    // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
-    // clip so the shadow never escapes the element.
-    element_bounds: Bounds,
-    element_corner_radii: Corners,
-    // 0 = drop shadow, 1 = inset shadow.
+    // The shape that is blurred: the silhouette of a drop shadow, or the hole of an
+    // inset shadow.
+    shape_bounds: Bounds,
+    shape_corner_radii: Corners,
+    // vue-native fork: 0 = drop shadow outside the border box, 1 = inset shadow,
+    // 2 = drop shadow under the box too.
     inset: u32,
     pad: u32, // align to 8 bytes
-    // vue-native fork: CSS `transform`. The Rust `#[repr(C)]` layout in
-    // gpui/src/scene.rs IS this layout, so the field must stay last and in
-    // sync. The vertex stage applies it and the fragment stage works in the
-    // untransformed frame, as gpui_windows' shaders.hlsl does.
+    // vue-native fork: CSS `transform`. The vertex stage applies it and the
+    // fragment stage works in the untransformed frame, as gpui_windows'
+    // shaders.hlsl does.
     transformation: TransformationMatrix,
+    // vue-native fork: the element's border box, rounded by `corner_radii`.
+    element_bounds: Bounds,
 }
 
 struct ShadowVarying {
@@ -1203,23 +1191,81 @@ struct ShadowVarying {
     @location(3) clip_distances: vec4<f32>,
     // vue-native fork: the pixel in the shadow's untransformed frame.
     @location(4) local_position: vec2<f32>,
+    @location(5) @interpolate(flat) blur_shape: vec4<f32>,
+    @location(6) @interpolate(flat) blur_r1: vec4<f32>,
+    @location(7) @interpolate(flat) blur_exponent: vec4<f32>,
+    @location(8) @interpolate(flat) blur_scale: vec4<f32>,
+}
+
+struct PreparedBlurredRoundedRect {
+    shape: vec4<f32>,
+    r1: vec4<f32>,
+    exponent: vec4<f32>,
+    scale: vec4<f32>,
+}
+
+fn erf7(input: f32) -> f32 {
+    let x = clamp(input, -10.0, 10.0) * (2.0 / sqrt(M_PI_F));
+    let xx = x * x;
+    let y = x + (0.24295 + (0.03395 + 0.0104 * xx) * xx) * (x * xx);
+    return y / sqrt(1.0 + y * y);
+}
+
+// Raph Levien's blurred rounded rectangle approximation, whose blur s is sigma * sqrt(2):
+// https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
+fn prepare_blurred_rounded_rect(size: vec2<f32>, corner_radii: Corners, sigma: f32) -> PreparedBlurredRoundedRect {
+    let s = max(sigma * sqrt(2.0), 1e-6);
+    let s_inv = 1.0 / s;
+    let min_edge = min(size.x, size.y);
+    let r_max = 0.5 * min_edge;
+    let radii = vec4<f32>(corner_radii.top_left, corner_radii.top_right,
+                          corner_radii.bottom_right, corner_radii.bottom_left);
+    let r0 = min(sqrt(radii * radii + 1.15 * 1.15 * s * s), vec4<f32>(r_max));
+    let r1 = min(sqrt(radii * radii + 4.0 * s * s), vec4<f32>(r_max));
+
+    let half_extent = 0.5 * s_inv * size;
+    let delta = 1.25 * s * (exp(-half_extent.x * half_extent.x) - exp(-half_extent.y * half_extent.y));
+    let adjusted_size = vec2<f32>(size.x + min(delta, 0.0), size.y - max(delta, 0.0));
+    let peak = s_inv * 0.5 * (max(adjusted_size.x, adjusted_size.y) - 0.5 * radii);
+
+    var output: PreparedBlurredRoundedRect;
+    output.shape = vec4<f32>(0.5 * adjusted_size, s_inv, min_edge);
+    output.r1 = r1;
+    output.exponent = 2.0 * r1 / r0;
+    output.scale = 0.5 * vec4<f32>(erf7(peak.x), erf7(peak.y), erf7(peak.z), erf7(peak.w));
+    return output;
+}
+
+fn pick_corner(center_to_point: vec2<f32>, values: vec4<f32>) -> f32 {
+    return pick_corner_radius(center_to_point, Corners(values.x, values.y, values.z, values.w));
+}
+
+fn blurred_rounded_rect(center_to_point: vec2<f32>, prepared: PreparedBlurredRoundedRect) -> f32 {
+    let r1 = pick_corner(center_to_point, prepared.r1);
+    let exponent = pick_corner(center_to_point, prepared.exponent);
+    let scale = pick_corner(center_to_point, prepared.scale);
+    let s_inv = prepared.shape.z;
+    let min_edge = prepared.shape.w;
+
+    let p0 = abs(center_to_point) - (prepared.shape.xy - r1);
+    let p1 = max(p0, vec2<f32>(0.0));
+    var d_pos: f32;
+    if (p1.x > 0.0 && p1.y > 0.0) {
+        d_pos = pow(pow(p1.x, exponent) + pow(p1.y, exponent), 1.0 / exponent);
+    } else {
+        d_pos = p1.x + p1.y;
+    }
+
+    let d_neg = min(max(p0.x, p0.y), 0.0);
+    let d = d_pos + d_neg - r1;
+    return scale * (erf7(s_inv * (min_edge + d)) - erf7(s_inv * d));
 }
 
 @vertex
 fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShadowVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     var shadow = load_shadow(instance_id);
-
-    var geometry: Bounds;
-    if (shadow.inset == 1u) {
-        geometry = shadow.element_bounds;
-    } else {
-        // Leave room for the gaussian tail outside the shadow rect.
-        let margin = 3.0 * shadow.blur_radius;
-        geometry = shadow.bounds;
-        geometry.origin -= vec2<f32>(margin);
-        geometry.size += 2.0 * vec2<f32>(margin);
-    }
+    let geometry = shadow.bounds;
 
     var out = ShadowVarying();
     out.position = to_device_position_transformed(unit_vertex, geometry, shadow.transformation);
@@ -1227,6 +1273,12 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, geometry, shadow.content_mask, shadow.transformation);
+    let blur = prepare_blurred_rounded_rect(shadow.shape_bounds.size, shadow.shape_corner_radii,
+                                            shadow.blur_radius);
+    out.blur_shape = blur.shape;
+    out.blur_r1 = blur.r1;
+    out.blur_exponent = blur.exponent;
+    out.blur_scale = blur.scale;
     return out;
 }
 
@@ -1238,33 +1290,16 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     }
 
     let shadow = load_shadow(input.shadow_id);
-    let half_size = shadow.bounds.size / 2.0;
-    let center = shadow.bounds.origin + half_size;
-    let center_to_point = input.local_position - center;
-
-    let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.local_position, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf(input.local_position, shadow.shape_bounds, shadow.shape_corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
-        // The signal is only non-zero in a limited range, so don't waste samples
-        let low = center_to_point.y - half_size.y;
-        let high = center_to_point.y + half_size.y;
-        let start = clamp(-3.0 * shadow.blur_radius, low, high);
-        let end = clamp(3.0 * shadow.blur_radius, low, high);
-
-        // Accumulate samples (we can get away with surprisingly few samples)
-        let step = (end - start) / 4.0;
-        var y = start + step * 0.5;
-        alpha = 0.0;
-        for (var i = 0; i < 4; i += 1) {
-            let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                shadow.blur_radius, corner_radius, half_size);
-            alpha +=  blur * gaussian(y, shadow.blur_radius) * step;
-            y += step;
-        }
+        let center = shadow.shape_bounds.origin + shadow.shape_bounds.size / 2.0;
+        let blur = PreparedBlurredRoundedRect(input.blur_shape, input.blur_r1,
+                                              input.blur_exponent, input.blur_scale);
+        alpha = blurred_rounded_rect(input.local_position - center, blur);
     }
 
     if (shadow.inset == 1u) {
@@ -1272,14 +1307,14 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
         let element_distance = quad_sdf(input.local_position, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+                                        shadow.corner_radii);
         alpha *= saturate(0.5 - element_distance);
     } else if (shadow.inset == 0u) {
         // vue-native fork: an outer shadow is clipped to the outside of the element's
         // border box (CSS Backgrounds 3 §7.1), so a translucent background shows what is
         // behind the element. inset == 2 is the unclipped variant.
         let element_distance = quad_sdf(input.local_position, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+                                        shadow.corner_radii);
         alpha *= saturate(0.5 + element_distance);
     }
 
@@ -1287,104 +1322,180 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha);
 }
 
-// --- path rasterization --- //
+// --- path tiles --- //
 
-struct PathRasterizationVertex {
-    xy_position: vec2<f32>,
-    st_position: vec2<f32>,
-    color: Background,
-    bounds: Bounds,
-    // vue-native fork: the path's content mask. `bounds` is the path clipped
-    // to it, which is the clip rect and the gradient's box; the rounded
-    // corners need the mask's own rect.
-    content_mask: Bounds,
-    content_mask_radii: Corners,
+struct PathTile {
+    paint: u32,
+    curve_start: u32,
+    curve_count: u32,
+    backdrop: i32,
+    top_left: vec2<f32>,
+    bottom_right: vec2<f32>,
+    reference: vec2<f32>,
+    curves_top_left: vec2<f32>,
+    curves_bottom_right: vec2<f32>,
 }
 
+struct PathCurve {
+    p0: vec2<f32>,
+    p1: vec2<f32>,
+    a: vec2<f32>,
+    b: vec2<f32>,
+    sign: f32,
+    pad: u32,
+}
 
+struct PathPaint {
+    bounds: Bounds,
+    content_mask: Bounds,
+    // vue-native fork: the content mask's rounded corners; see `content_mask_coverage`.
+    content_mask_radii: Corners,
+    color: Background,
+    even_odd: u32,
+    pad: u32,
+}
 
-struct PathRasterizationVarying {
+struct PathTileVarying {
     @builtin(position) position: vec4<f32>,
-    @location(0) st_position: vec2<f32>,
-    @location(1) @interpolate(flat) vertex_id: u32,
-    //TODO: use `clip_distance` once Naga supports it
-    @location(3) clip_distances: vec4<f32>,
+    @location(0) @interpolate(flat) tile_id: u32,
+    @location(1) @interpolate(flat) background_solid: vec4<f32>,
+    @location(2) @interpolate(flat) background_color0: vec4<f32>,
+    @location(3) @interpolate(flat) background_color1: vec4<f32>,
+    @location(4) @interpolate(flat) curve_box: vec4<f32>,
 }
 
 @vertex
-fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasterizationVarying {
-    let v = load_path_vertex(vertex_id);
+fn vs_path_tile(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PathTileVarying {
+    let tile = load_path_tile(instance_id);
+    let paint = load_path_paint(tile.paint);
 
-    var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
-    out.st_position = v.st_position;
-    out.vertex_id = vertex_id;
-    out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
+    // Neighboring tiles store their shared edge as the same number, so clipping each corner on its
+    // own gives them bit-identical edges, which the rasterizer neither overlaps nor leaves gaps
+    // between. Interpolating from an origin and a size would not.
+    let mask_top_left = paint.content_mask.origin;
+    let mask_bottom_right = paint.content_mask.origin + paint.content_mask.size;
+    let top_left = clamp(tile.top_left, mask_top_left, mask_bottom_right);
+    let bottom_right = clamp(tile.bottom_right, top_left, mask_bottom_right);
+    let position = vec2<f32>(
+        select(top_left.x, bottom_right.x, (vertex_id & 1u) != 0u),
+        select(top_left.y, bottom_right.y, (vertex_id & 2u) != 0u),
+    );
+
+    var out = PathTileVarying();
+    out.position = to_device_position_impl(position);
+    out.tile_id = instance_id;
+    out.curve_box = vec4<f32>(tile.curves_top_left, tile.curves_bottom_right);
+    let gradient = prepare_gradient_color(paint.color);
+    out.background_solid = gradient.solid;
+    out.background_color0 = gradient.color0;
+    out.background_color1 = gradient.color1;
     return out;
 }
 
+// Solves a*t^2 + b*t + c = 0 for the root in [0, 1] on a monotone piece.
+fn monotone_quadratic_root(a: f32, b: f32, c: f32, direction: f32) -> f32 {
+    let discriminant = max(b * b - 4.0 * a * c, 0.0);
+    let denominator = b + direction * sqrt(discriminant);
+    if (denominator == 0.0) {
+        return 0.0;
+    }
+    return saturate(-2.0 * c / denominator);
+}
+
+// Coverage estimate adapted from https://github.com/EricLengyel/Slug/blob/be3c13eb7d63f9e8aa5c583e42d92c374cb91d98/SlugPixelShader.hlsl
+// Copyright (c) 2017 Eric Lengyel.
+// Licensed under the MIT license.
+
+// Accumulates the curve's winding along the pixel's leftward and upward rays. Like Slug, a crossing
+// within half a pixel of the center counts fractionally.
+fn add_curve_winding(curve: PathCurve, center: vec2<f32>, winding: ptr<function, vec2<f32>>,
+    weight: ptr<function, vec2<f32>>) {
+    let min_x = min(curve.p0.x, curve.p1.x);
+    let max_x = max(curve.p0.x, curve.p1.x);
+
+    if (curve.p0.y <= center.y && center.y < curve.p1.y) {
+        if (max_x <= center.x - 0.5) {
+            (*winding).x += curve.sign;
+        } else {
+            let t = monotone_quadratic_root(curve.a.y, curve.b.y, curve.p0.y - center.y, 1.0);
+            let x = (curve.a.x * t + curve.b.x) * t + curve.p0.x;
+            let distance = center.x - x;
+            (*winding).x += curve.sign * saturate(distance + 0.5);
+            (*weight).x = max((*weight).x, saturate(1.0 - 2.0 * abs(distance)));
+        }
+    }
+
+    if (min_x <= center.x && center.x < max_x) {
+        let direction = select(-1.0, 1.0, curve.p1.x > curve.p0.x);
+        if (curve.p1.y <= center.y - 0.5) {
+            (*winding).y -= curve.sign * direction;
+        } else if (curve.p0.y < center.y + 0.5) {
+            let t = monotone_quadratic_root(curve.a.x, curve.b.x, curve.p0.x - center.x, direction);
+            let y = (curve.a.y * t + curve.b.y) * t + curve.p0.y;
+            let distance = center.y - y;
+            (*winding).y -= curve.sign * direction * saturate(distance + 0.5);
+            (*weight).y = max((*weight).y, saturate(1.0 - 2.0 * abs(distance)));
+        }
+    }
+}
+
+// The backdrop gives the unlisted curves' winding along a leftward ray from the tile's reference
+// corner. We need it at the current pixel, along both leftward and upward rays. Because paths are
+// closed, chains of unlisted curves can only begin or end where a listed curve does. So, we can
+// compute the winding at the current pixel by correcting the backdrop for each listed endpoint
+// between its ray and the pixel.
+fn correct_for_endpoint(endpoint: vec2<f32>, step: f32, reference: vec2<f32>, center: vec2<f32>,
+    winding: ptr<function, vec2<f32>>) {
+    if (endpoint.x <= reference.x) {
+        (*winding).x -= step * (f32(endpoint.y <= center.y) - f32(endpoint.y <= reference.y));
+    }
+    if (endpoint.y <= reference.y && endpoint.x <= center.x) {
+        (*winding).y += step;
+    }
+}
+
 @fragment
-fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f32> {
-    let dx = dpdx(input.st_position);
-    let dy = dpdy(input.st_position);
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
+fn fs_path_tile(input: PathTileVarying) -> @location(0) vec4<f32> {
+    let tile = load_path_tile(input.tile_id);
+    let paint = load_path_paint(tile.paint);
+    let center = floor(input.position.xy) + 0.5;
+
+    var coverage = 1.0;
+    if (all(center >= input.curve_box.xy) && all(center <= input.curve_box.zw)) {
+        var winding = vec2<f32>(f32(tile.backdrop));
+        var weight = vec2<f32>(0.0);
+        for (var i = 0u; i < tile.curve_count; i++) {
+            let curve = load_path_curve(tile.curve_start + i);
+            if (min(curve.p0.x, curve.p1.x) >= center.x + 0.5) {
+                break;
+            }
+            if (curve.p0.y < center.y + 0.5) {
+                add_curve_winding(curve, center, &winding, &weight);
+                correct_for_endpoint(curve.p0, curve.sign, tile.reference, center, &winding);
+                correct_for_endpoint(curve.p1, -curve.sign, tile.reference, center, &winding);
+            }
+        }
+
+        // Weight the winding computed by each ray by its nearest crossing's distance from the pixel center,
+        // using Slug's technique.
+        coverage = max(
+            abs(dot(winding, weight)) / max(weight.x + weight.y, 1.0 / 65536.0),
+            min(abs(winding.x), abs(winding.y)));
+        if (paint.even_odd != 0u) {
+            coverage = 1.0 - abs(1.0 - fract(coverage * 0.5) * 2.0);
+        } else {
+            coverage = saturate(coverage);
+        }
+    }
+
+    coverage *= content_mask_coverage(input.position.xy, paint.content_mask, paint.content_mask_radii);
+    if (coverage == 0.0) {
         return vec4<f32>(0.0);
     }
 
-    let v = load_path_vertex(input.vertex_id);
-    let background = v.color;
-    let bounds = v.bounds;
-
-    var alpha: f32;
-    if (length(vec2<f32>(dx.x, dy.x)) < 0.001) {
-        // If the gradient is too small, return a solid color.
-        alpha = 1.0;
-    } else {
-        let gradient = 2.0 * input.st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
-        let f = input.st_position.x * input.st_position.x - input.st_position.y;
-        let distance = f / length(gradient);
-        alpha = saturate(0.5 - distance);
-    }
-    let prepared_gradient = prepare_gradient_color(background);
-    let color = gradient_color(background, input.position.xy, bounds,
-        prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
-    alpha *= content_mask_coverage(input.position.xy, v.content_mask, v.content_mask_radii);
-    return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
-}
-
-// --- paths --- //
-
-struct PathSprite {
-    bounds: Bounds,
-}
-
-
-struct PathVarying {
-    @builtin(position) position: vec4<f32>,
-    @location(0) texture_coords: vec2<f32>,
-}
-
-@vertex
-fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PathVarying {
-    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
-    let sprite = load_path_sprite(instance_id);
-    // Don't apply content mask because it was already accounted for when rasterizing the path.
-    let device_position = to_device_position(unit_vertex, sprite.bounds);
-    // For screen-space intermediate texture, convert screen position to texture coordinates
-    let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
-
-    var out = PathVarying();
-    out.position = device_position;
-    out.texture_coords = texture_coords;
-
-    return out;
-}
-
-@fragment
-fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
-    return sample;
+    let color = gradient_color(paint.color, input.position.xy, paint.bounds,
+        input.background_solid, input.background_color0, input.background_color1);
+    return blend_color(color, coverage);
 }
 
 // --- underlines --- //

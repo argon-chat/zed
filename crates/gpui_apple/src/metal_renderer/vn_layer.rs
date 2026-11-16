@@ -775,6 +775,8 @@ mod tests {
             content_mask: mask(),
             color: rgb(0xffffff).into(),
             transformation: TransformationMatrix::unit(),
+            animation: gpui::SpriteAnimationId::NONE,
+            pad: 0,
         });
         scene.vn_pop_isolation();
         scene.vn_pop_isolation();

@@ -35,6 +35,8 @@ pub(super) const ROOT_CLIP_SEGMENTS: u32 = 3;
 pub(super) const ROOT_TEXT_BACKGROUNDS: u32 = 4;
 pub(super) const ROOT_TEXTURES: u32 = 5;
 pub(super) const ROOT_EFFECT_TEXTURES: u32 = 6;
+pub(super) const ROOT_PATH_CURVES: u32 = 7;
+pub(super) const ROOT_PATH_PAINTS: u32 = 8;
 /// The descriptors in a [`ROOT_TEXTURES`] table: t0, t2, and an effect
 /// layer's content and history at t7 and t8.
 pub(super) const TABLE_TEXTURES: usize = 4;
@@ -212,14 +214,13 @@ pub(super) struct Pipelines {
 /// The pipelines a window's frames use, most common first. Creating a PSO the
 /// driver has not cached yet (a new build or driver) takes tens of
 /// milliseconds, which on first use landed inside a frame.
-const WARM_MODULES: [(ShaderModule, u32); 15] = [
+const WARM_MODULES: [(ShaderModule, u32); 14] = [
     (ShaderModule::Quad, 1),
     (ShaderModule::MonochromeSprite, 1),
     (ShaderModule::Shadow, 1),
     (ShaderModule::PolychromeSprite, 1),
     (ShaderModule::Underline, 1),
-    (ShaderModule::PathRasterization, 4),
-    (ShaderModule::PathSprite, 1),
+    (ShaderModule::PathTile, 1),
     (ShaderModule::VnLayer, 1),
     (ShaderModule::BlurRect, 1),
     (ShaderModule::BlurDownsample, 1),
@@ -605,6 +606,8 @@ fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature> {
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         },
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 11),
+        descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 12),
     ];
     let sampler = |register, address| D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -680,9 +683,7 @@ fn module_blend(module: ShaderModule) -> Blend {
         ShaderModule::BlurDownsample | ShaderModule::BlurUpsample | ShaderModule::BlurRect => {
             Blend::Replace
         }
-        ShaderModule::PathRasterization
-        | ShaderModule::PathSprite
-        | ShaderModule::VnLayer => Blend::Premultiplied,
+        ShaderModule::VnLayer => Blend::Premultiplied,
         ShaderModule::SubpixelSprite => Blend::Subpixel,
         ShaderModule::Effect(effect) if effect.needs_backdrop() => Blend::Replace,
         // `sk_finish` outputs premultiplied colour.
@@ -821,8 +822,7 @@ fn compile_module(module: ShaderModule) -> Result<(Vec<u8>, Vec<u8>)> {
         ShaderModule::BlurUpsample => "blur_upsample",
         ShaderModule::BlurRect => "blur_rect",
         ShaderModule::Underline => "underline",
-        ShaderModule::PathRasterization => "path_rasterization",
-        ShaderModule::PathSprite => "path_sprite",
+        ShaderModule::PathTile => "path_tile",
         ShaderModule::MonochromeSprite => "monochrome_sprite",
         ShaderModule::SubpixelSprite => "subpixel_sprite",
         ShaderModule::PolychromeSprite => "polychrome_sprite",

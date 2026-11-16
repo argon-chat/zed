@@ -6,8 +6,8 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectQuad, PaintSurface, Path,
-    Point, PrimitiveBatch, ScaledPixels, Scene, Size, VnBatch, point, size,
+    AtlasTextureId, Bounds, ContentMask, DevicePixels, EffectQuad, PaintSurface, PrimitiveBatch,
+    ScaledPixels, Scene, Size, VnBatch, point, size,
 };
 use image::RgbaImage;
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
@@ -27,7 +27,7 @@ use objc2_metal::{
     MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
     MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
+    MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
 // vue-native: ungated, `render_to_image` reads back offscreen.
 use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
@@ -36,16 +36,10 @@ use parking_lot::Mutex;
 
 use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
 
-// Exported to metal
-pub(crate) type PointF = gpui::Point<f32>;
-
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
 #[cfg(feature = "runtime_shaders")]
 const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitched_shaders.metal"));
-// Use 4x MSAA, all devices support it.
-// https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
-const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -138,8 +132,7 @@ pub struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    paths_rasterization_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    path_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    path_tiles_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     underlines_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -157,25 +150,11 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
-    path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    path_sample_count: u32,
     sprite_gamma: SpriteGammaParams,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-}
-
-#[repr(C)]
-pub struct PathRasterizationVertex {
-    pub xy_position: Point<ScaledPixels>,
-    pub st_position: Point<f32>,
-    pub color: Background,
-    pub bounds: Bounds<ScaledPixels>,
-    /// vue-native fork: the mask itself, for its rounded corners; `bounds` is
-    /// the path clipped to it. Exported to shaders.metal through cbindgen.
-    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -301,7 +280,7 @@ impl MetalRenderer {
             ))
             .context("loading Metal library")?;
 
-        fn to_float2_bits(point: PointF) -> u64 {
+        fn to_float2_bits(point: gpui::Point<f32>) -> u64 {
             let mut output = point.y.to_bits() as u64;
             output <<= 32;
             output |= point.x.to_bits() as u64;
@@ -342,21 +321,12 @@ impl MetalRenderer {
         }
         .context("allocating unit vertex buffer")?;
 
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
+        let path_tiles_pipeline_state = build_pipeline_state(
             &device,
             &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        )?;
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "path_sprites",
-            "path_sprite_vertex",
-            "path_sprite_fragment",
+            "path_tiles",
+            "path_tile_vertex",
+            "path_tile_fragment",
             MTLPixelFormat::BGRA8Unorm,
         )?;
         let shadows_pipeline_state = build_pipeline_state(
@@ -441,8 +411,7 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             command_queue,
-            paths_rasterization_pipeline_state,
-            path_sprites_pipeline_state,
+            path_tiles_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
             underlines_pipeline_state,
@@ -457,9 +426,6 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            path_intermediate_texture: None,
-            path_intermediate_msaa_texture: None,
-            path_sample_count: PATH_SAMPLE_COUNT,
             sprite_gamma: SpriteGammaParams::from_env(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
@@ -521,6 +487,14 @@ impl MetalRenderer {
         };
     }
 
+    pub fn is_display_link_attached(&self) -> bool {
+        matches!(self.display_link_mode, DisplayLinkMode::Attached { .. })
+    }
+
+    pub fn presents_with_transaction(&self) -> bool {
+        self.presents_with_transaction
+    }
+
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
         if let Some(layer) = &self.layer {
@@ -532,75 +506,6 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        if let Err(error) = self.update_path_intermediate_textures(size) {
-            log::error!("failed to resize path textures: {error:#}");
-        }
-    }
-
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {
-        // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
-        // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
-        // https://github.com/zed-industries/zed/issues/36229
-        if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
-            return Ok(());
-        }
-
-        if self
-            .path_intermediate_texture
-            .as_ref()
-            .is_some_and(|texture| {
-                texture.width() == size.width.0 as usize
-                    && texture.height() == size.height.0 as usize
-            })
-        {
-            return Ok(());
-        }
-
-        self.path_intermediate_texture = None;
-        self.path_intermediate_msaa_texture = None;
-        let texture_descriptor = MTLTextureDescriptor::new();
-        // SAFETY: The dimensions are positive and this descriptor creates a 2D texture.
-        unsafe {
-            texture_descriptor.setWidth(size.width.0 as usize);
-            texture_descriptor.setHeight(size.height.0 as usize);
-        }
-        texture_descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.setStorageMode(MTLStorageMode::Private);
-        texture_descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-        let intermediate_texture = self
-            .device
-            .newTextureWithDescriptor(&texture_descriptor)
-            .context("allocating path intermediate texture")?;
-
-        let msaa_texture = if self.path_sample_count > 1 {
-            // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
-            // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
-            let storage_mode = if self.is_apple_gpu {
-                MTLStorageMode::Memoryless
-            } else {
-                MTLStorageMode::Private
-            };
-
-            let msaa_descriptor = texture_descriptor;
-            msaa_descriptor.setTextureType(MTLTextureType::Type2DMultisample);
-            msaa_descriptor.setStorageMode(storage_mode);
-            // SAFETY: The multisample texture uses the same sample count as its render pipeline.
-            unsafe {
-                msaa_descriptor.setSampleCount(self.path_sample_count as _);
-            }
-            Some(
-                self.device
-                    .newTextureWithDescriptor(&msaa_descriptor)
-                    .context("allocating multisample path texture")?,
-            )
-        } else {
-            None
-        };
-        self.path_intermediate_texture = Some(intermediate_texture);
-        self.path_intermediate_msaa_texture = msaa_texture;
-        Ok(())
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -675,9 +580,6 @@ impl MetalRenderer {
         texture: &ProtocolObject<dyn MTLTexture>,
         viewport_size: Size<DevicePixels>,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        if self.path_intermediate_texture.is_none() {
-            self.update_path_intermediate_textures(viewport_size)?;
-        }
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -763,10 +665,7 @@ impl MetalRenderer {
 
         // Headless callers do not have a Cocoa event-loop pool to release
         // autoreleased command buffers and render-pass descriptors.
-        objc2::rc::autoreleasepool(|_| {
-            self.update_path_intermediate_textures(size)?;
-            self.render_offscreen(scene, size)
-        })
+        objc2::rc::autoreleasepool(|_| self.render_offscreen(scene, size))
     }
 
     /// Renders a scene into a new offscreen texture of `size` and reads it
@@ -831,8 +730,6 @@ impl MetalRenderer {
         }
 
         objc2::rc::autoreleasepool(|_| {
-            self.update_path_intermediate_textures(size)?;
-
             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
                 texture.width() != size.width.0 as usize
                     || texture.height() != size.height.0 as usize
@@ -1008,36 +905,12 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    command_encoder.endEncoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        writer,
-                        viewport_size,
-                        command_buffer,
-                    )?;
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        &frame.texture,
-                        viewport_size,
-                        None,
-                    )?;
-
-                    if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
-                            writer,
-                            viewport_size,
-                            &command_encoder,
-                        ) {
-                            command_encoder.endEncoding();
-                            return Err(error);
-                        }
-                    }
-                }
+                PrimitiveBatch::Paths(range) => self.draw_path_tiles(
+                    instance_bindings.path_tile_range(range),
+                    instance_bindings,
+                    viewport_size,
+                    &command_encoder,
+                ),
                 PrimitiveBatch::Underlines(range) => {
                     self.draw_underlines(range, instance_bindings, viewport_size, &command_encoder)
                 }
@@ -1078,89 +951,59 @@ impl MetalRenderer {
         Ok(())
     }
 
-    fn draw_paths_to_intermediate(
+    fn draw_path_tiles(
         &self,
-        paths: &[Path<ScaledPixels>],
-        writer: &mut InstanceBufferWriter,
+        tiles: Range<usize>,
+        instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-    ) -> Result<bool> {
-        if paths.is_empty() {
-            return Ok(false);
-        }
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
-
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-                content_mask: path.content_mask,
-            }));
-        }
-        let vertex_instance_bindings = writer.write(&vertices)?;
-
-        let render_pass_descriptor = MTLRenderPassDescriptor::new();
-        // SAFETY: Index zero is within the render pass's color attachment array.
-        let color_attachment = unsafe {
-            render_pass_descriptor
-                .colorAttachments()
-                .objectAtIndexedSubscript(0)
-        };
-        color_attachment.setLoadAction(MTLLoadAction::Clear);
-        color_attachment.setClearColor(MTLClearColor {
-            red: 0.,
-            green: 0.,
-            blue: 0.,
-            alpha: 0.,
-        });
-
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
-            color_attachment.setTexture(Some(msaa_texture));
-            color_attachment.setResolveTexture(Some(intermediate_texture));
-            color_attachment.setStoreAction(MTLStoreAction::MultisampleResolve);
-        } else {
-            color_attachment.setTexture(Some(intermediate_texture));
-            color_attachment.setStoreAction(MTLStoreAction::Store);
+        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    ) {
+        if tiles.is_empty() {
+            return;
         }
 
-        let command_encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-            .context("creating path render command encoder")?;
-        command_encoder.setRenderPipelineState(&self.paths_rasterization_pipeline_state);
-        // SAFETY: The binding contains vertices.len() shader-compatible vertices at an aligned offset.
-        // Metal retains the buffer, and writer.finish publishes CPU writes before submission.
-        // The viewport bytes are copied from a live value into the matching shader slot.
+        command_encoder.setRenderPipelineState(&self.path_tiles_pipeline_state);
+        // SAFETY: The tile range and the frame's curves and paints match the uploaded shader layouts and slots.
+        // Metal retains the buffers, writer.finish publishes their writes, and viewport bytes are copied.
         unsafe {
             command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&vertex_instance_bindings.buffer),
-                vertex_instance_bindings.offset,
-                PathRasterizationInputIndex::Vertices as usize,
+                Some(&instance_bindings.path_tiles.buffer),
+                instance_bindings.path_tiles.offset,
+                PathTileInputIndex::Tiles as usize,
+            );
+            command_encoder.setVertexBuffer_offset_atIndex(
+                Some(&instance_bindings.path_paints.buffer),
+                instance_bindings.path_paints.offset,
+                PathTileInputIndex::Paints as usize,
             );
             command_encoder.setVertexBytes_length_atIndex(
                 ptr::NonNull::from(&viewport_size).cast(),
                 mem::size_of_val(&viewport_size),
-                PathRasterizationInputIndex::ViewportSize as usize,
+                PathTileInputIndex::ViewportSize as usize,
             );
             command_encoder.setFragmentBuffer_offset_atIndex(
-                Some(&vertex_instance_bindings.buffer),
-                vertex_instance_bindings.offset,
-                PathRasterizationInputIndex::Vertices as usize,
+                Some(&instance_bindings.path_tiles.buffer),
+                instance_bindings.path_tiles.offset,
+                PathTileInputIndex::Tiles as usize,
             );
-            command_encoder.drawPrimitives_vertexStart_vertexCount(
-                MTLPrimitiveType::Triangle,
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&instance_bindings.path_curves.buffer),
+                instance_bindings.path_curves.offset,
+                PathTileInputIndex::Curves as usize,
+            );
+            command_encoder.setFragmentBuffer_offset_atIndex(
+                Some(&instance_bindings.path_paints.buffer),
+                instance_bindings.path_paints.offset,
+                PathTileInputIndex::Paints as usize,
+            );
+            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::TriangleStrip,
                 0,
-                vertices.len(),
+                4,
+                tiles.len(),
+                tiles.start,
             );
         }
-
-        command_encoder.endEncoding();
-        Ok(true)
     }
 
     fn draw_shadows(
@@ -1251,83 +1094,6 @@ impl MetalRenderer {
                 quads.start,
             );
         }
-    }
-
-    fn draw_paths_from_intermediate(
-        &self,
-        paths: &[Path<ScaledPixels>],
-        writer: &mut InstanceBufferWriter,
-        viewport_size: Size<DevicePixels>,
-        command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    ) -> Result<()> {
-        let (Some(first_path), Some(last_path)) = (paths.first(), paths.last()) else {
-            return Ok(());
-        };
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
-
-        command_encoder.setRenderPipelineState(&self.path_sprites_pipeline_state);
-        // SAFETY: The shader slots match the unit vertices, copied viewport, and retained path texture.
-        // The preceding render pass writes this tracked texture before it is sampled.
-        unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&self.unit_vertices),
-                0,
-                SpriteInputIndex::Vertices as usize,
-            );
-            command_encoder.setVertexBytes_length_atIndex(
-                ptr::NonNull::from(&viewport_size).cast(),
-                mem::size_of_val(&viewport_size),
-                SpriteInputIndex::ViewportSize as usize,
-            );
-            command_encoder.setFragmentTexture_atIndex(
-                Some(intermediate_texture),
-                SpriteInputIndex::AtlasTexture as usize,
-            );
-        }
-
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        let sprites;
-        if last_path.order == first_path.order {
-            sprites = paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            sprites = vec![PathSprite { bounds }];
-        }
-
-        let sprite_instance_bindings = writer.write(&sprites)?;
-        // SAFETY: The draw uses six unit vertices and exactly the sprites written at this aligned binding.
-        // Metal retains the buffer, and writer.finish publishes CPU writes before submission.
-        unsafe {
-            command_encoder.setVertexBuffer_offset_atIndex(
-                Some(&sprite_instance_bindings.buffer),
-                sprite_instance_bindings.offset,
-                SpriteInputIndex::Sprites as usize,
-            );
-            command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
-                MTLPrimitiveType::Triangle,
-                0,
-                6,
-                sprites.len(),
-            );
-        }
-        Ok(())
     }
 
     fn draw_underlines(
@@ -1779,46 +1545,6 @@ fn build_premultiplied_pipeline_state(
         .with_context(|| format!("creating {label} render pipeline"))
 }
 
-fn build_path_rasterization_pipeline_state(
-    device: &ProtocolObject<dyn MTLDevice>,
-    library: &ProtocolObject<dyn MTLLibrary>,
-    label: &str,
-    vertex_fn_name: &str,
-    fragment_fn_name: &str,
-    pixel_format: MTLPixelFormat,
-    path_sample_count: u32,
-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
-    let vertex_fn = library
-        .newFunctionWithName(&NSString::from_str(vertex_fn_name))
-        .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
-    let fragment_fn = library
-        .newFunctionWithName(&NSString::from_str(fragment_fn_name))
-        .with_context(|| format!("locating fragment function {fragment_fn_name}"))?;
-
-    let descriptor = MTLRenderPipelineDescriptor::new();
-    descriptor.setLabel(Some(&NSString::from_str(label)));
-    descriptor.setVertexFunction(Some(vertex_fn.as_ref()));
-    descriptor.setFragmentFunction(Some(fragment_fn.as_ref()));
-    if path_sample_count > 1 {
-        descriptor.setRasterSampleCount(path_sample_count as _);
-        descriptor.setAlphaToCoverageEnabled(false);
-    }
-    // SAFETY: Index zero is within the pipeline's color attachment array.
-    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    color_attachment.setPixelFormat(pixel_format);
-    color_attachment.setBlendingEnabled(true);
-    color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
-    color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
-    color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
-    color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-    color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-
-    device
-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
-        .with_context(|| format!("creating {label} render pipeline"))
-}
-
 #[derive(Clone)]
 struct InstanceBinding {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1836,6 +1562,11 @@ struct GroupDraw<'a> {
 
 struct InstanceBindings {
     quads: InstanceBinding,
+    path_tiles: InstanceBinding,
+    path_curves: InstanceBinding,
+    path_paints: InstanceBinding,
+    /// The first tile of each of `Scene::paths`, and one past the last.
+    path_tile_starts: Vec<usize>,
     shadows: InstanceBinding,
     backdrop_blur_rects: InstanceBinding,
     effect_quads: InstanceBinding,
@@ -1845,13 +1576,32 @@ struct InstanceBindings {
     surfaces: InstanceBinding,
 }
 
+impl InstanceBindings {
+    fn path_tile_range(&self, paths: Range<usize>) -> Range<usize> {
+        self.path_tile_starts[paths.start]..self.path_tile_starts[paths.end]
+    }
+}
+
 fn write_instances(
     scene: &Scene,
     effect_quads: &[EffectQuad],
     writer: &mut InstanceBufferWriter,
 ) -> Result<InstanceBindings> {
+    let mut path_paints = Vec::with_capacity(scene.paths.len());
+    let mut path_curves = Vec::new();
+    let mut path_tiles = Vec::new();
+    let mut path_tile_starts = Vec::with_capacity(scene.paths.len() + 1);
+    for path in &scene.paths {
+        path_tile_starts.push(path_tiles.len());
+        path.append_to(&mut path_paints, &mut path_curves, &mut path_tiles);
+    }
+    path_tile_starts.push(path_tiles.len());
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
+        path_tiles: writer.write(&path_tiles)?,
+        path_curves: writer.write(&path_curves)?,
+        path_paints: writer.write(&path_paints)?,
+        path_tile_starts,
         shadows: writer.write(&scene.shadows)?,
         backdrop_blur_rects: writer.write(&scene.backdrop_blur_rects)?,
         effect_quads: writer.write(effect_quads)?,
@@ -2078,9 +1828,11 @@ enum VnLayerInputIndex {
 }
 
 #[repr(C)]
-enum PathRasterizationInputIndex {
-    Vertices = 0,
-    ViewportSize = 1,
+enum PathTileInputIndex {
+    Tiles = 0,
+    Curves = 1,
+    Paints = 2,
+    ViewportSize = 3,
 }
 
 /// Buffer slots of the backdrop and effect pipelines. `Globals` and
@@ -2102,12 +1854,6 @@ enum BackdropTextureIndex {
     Original = 2,
     Content = 7,
     History = 8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[repr(C)]
-pub struct PathSprite {
-    pub bounds: Bounds<ScaledPixels>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2153,6 +1899,7 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Point;
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
         CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
@@ -2203,6 +1950,8 @@ mod tests {
                 content_mask: ContentMask::rect(bounds),
                 color: rgb(foreground).into(),
                 transformation: gpui::TransformationMatrix::unit(),
+                animation: gpui::SpriteAnimationId::NONE,
+                pad: 0,
             });
         }
         scene.finish();
@@ -2265,6 +2014,8 @@ mod tests {
             content_mask: ContentMask::rect(frame),
             color: rgb(0x000000).into(),
             transformation: gpui::TransformationMatrix::unit(),
+            animation: gpui::SpriteAnimationId::NONE,
+            pad: 0,
         });
         scene.finish();
         let image =
@@ -2281,60 +2032,6 @@ mod tests {
                     "({x}, {y}): {actual:?}, expected {expected}"
                 );
             }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn path_intermediate_textures_are_reused_until_resize() -> Result<()> {
-        let mut renderer = MetalRenderer::new_headless(Default::default())?;
-        let initial_size = size(DevicePixels(64), DevicePixels(64));
-        renderer.update_path_intermediate_textures(initial_size)?;
-        let initial_texture = renderer
-            .path_intermediate_texture
-            .clone()
-            .context("missing path intermediate texture")?;
-        let initial_msaa_texture = renderer.path_intermediate_msaa_texture.clone();
-
-        renderer.update_path_intermediate_textures(initial_size)?;
-        assert!(ptr::eq(
-            &*initial_texture,
-            renderer
-                .path_intermediate_texture
-                .as_deref()
-                .context("missing reused texture")?,
-        ));
-        assert_eq!(
-            initial_msaa_texture.as_ref().map(Retained::as_ptr),
-            renderer
-                .path_intermediate_msaa_texture
-                .as_ref()
-                .map(Retained::as_ptr),
-        );
-
-        renderer.update_path_intermediate_textures(size(DevicePixels(128), DevicePixels(64)))?;
-        let resized_texture = renderer
-            .path_intermediate_texture
-            .as_deref()
-            .context("missing resized texture")?;
-        assert_eq!(
-            (resized_texture.width(), resized_texture.height()),
-            (128, 64)
-        );
-        assert!(!ptr::eq(&*initial_texture, resized_texture));
-        if let Some(texture) = &renderer.path_intermediate_msaa_texture {
-            assert_eq!((texture.width(), texture.height()), (128, 64));
-        }
-
-        for (width, height) in [(0, 64), (64, 0), (-1, 64), (64, -1)] {
-            renderer.update_path_intermediate_textures(size(
-                DevicePixels(width),
-                DevicePixels(height),
-            ))?;
-            assert!(renderer.path_intermediate_texture.is_none());
-            assert!(renderer.path_intermediate_msaa_texture.is_none());
-            renderer.update_path_intermediate_textures(initial_size)?;
-            assert!(renderer.path_intermediate_texture.is_some());
         }
         Ok(())
     }

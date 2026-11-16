@@ -225,6 +225,8 @@ fn tile_scene(tile: AtlasTile) -> Scene {
         AtlasTextureKind::Monochrome => scene.insert_primitive(MonochromeSprite {
             order: 0,
             raw_coverage: false.into(),
+            animation: gpui::SpriteAnimationId::NONE,
+            pad: 0,
             tile,
             bounds,
             content_mask,

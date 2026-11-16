@@ -5,15 +5,14 @@ use std::{
     process::Command,
 };
 
-const MODULES: [(&str, &str); 12] = [
+const MODULES: [(&str, &str); 11] = [
     ("Quad", "quad"),
     ("Shadow", "shadow"),
     ("BlurDownsample", "blur_downsample"),
     ("BlurUpsample", "blur_upsample"),
     ("BlurRect", "blur_rect"),
     ("Underline", "underline"),
-    ("PathRasterization", "path_rasterization"),
-    ("PathSprite", "path_sprite"),
+    ("PathTile", "path_tile"),
     ("MonochromeSprite", "monochrome_sprite"),
     ("SubpixelSprite", "subpixel_sprite"),
     ("PolychromeSprite", "polychrome_sprite"),

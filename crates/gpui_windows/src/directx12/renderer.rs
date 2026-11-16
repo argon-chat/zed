@@ -4,7 +4,8 @@ use super::{
     device::{CommandStats, Device, KeepAlive, TextureLocation, transition},
     pipelines::{
         HISTORY_FORMAT, Pipelines, ROOT_BATCH, ROOT_CLIP_SEGMENTS, ROOT_EFFECT_TEXTURES,
-        ROOT_GLOBALS, ROOT_INSTANCES, ROOT_TEXT_BACKGROUNDS, ROOT_TEXTURES, TABLE_TEXTURES,
+        ROOT_GLOBALS, ROOT_INSTANCES, ROOT_PATH_CURVES, ROOT_PATH_PAINTS, ROOT_TEXT_BACKGROUNDS,
+        ROOT_TEXTURES, TABLE_TEXTURES,
     },
 };
 use crate::directx_renderer::{FontInfo, shader_resources::ShaderModule};
@@ -53,9 +54,6 @@ const DESCRIPTORS_PER_PAGE: u32 = 256;
 const MAX_CACHED_DESCRIPTOR_PAGES: usize = 16;
 const _: () = assert!(std::mem::size_of::<GlobalParams>() == 48);
 const _: () = assert!(std::mem::offset_of!(GlobalParams, is_bgr) == 32);
-const _: () = assert!(std::mem::size_of::<PathRasterizationSprite>() == 292);
-const _: () = assert!(std::mem::offset_of!(PathRasterizationSprite, color) == 16);
-const _: () = assert!(std::mem::size_of::<PathSprite>() == 16);
 type Retained = Arc<Mutex<Vec<KeepAlive>>>;
 
 /// One persistently mapped upload-heap buffer that a frame slot sub-allocates
@@ -340,20 +338,6 @@ struct GlobalParams {
     is_bgr: u32,
     padding: [u32; 3],
 }
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PathRasterizationSprite {
-    xy_position: Point<ScaledPixels>,
-    st_position: Point<f32>,
-    color: Background,
-    bounds: Bounds<ScaledPixels>,
-    content_mask: ContentMask<ScaledPixels>,
-}
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct PathSprite {
-    bounds: Bounds<ScaledPixels>,
-}
 
 struct Target {
     resource: ID3D12Resource,
@@ -590,8 +574,6 @@ pub(crate) struct DirectXRenderer {
     skip_draws: bool,
     present_no_wait: bool,
     layers: Vec<Arc<Target>>,
-    path_msaa: Option<Arc<Target>>,
-    path_resolved: Option<Arc<Target>>,
     snapshot: Option<Arc<Target>>,
     blur: Vec<Arc<Target>>,
     idle_frames: ScratchIdle,
@@ -711,8 +693,6 @@ impl DirectXRenderer {
             skip_draws: false,
             present_no_wait: false,
             layers: Vec::new(),
-            path_msaa: None,
-            path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
             idle_frames: ScratchIdle::default(),
@@ -768,8 +748,6 @@ impl DirectXRenderer {
         self.latency.take();
         self.swap_chain.take();
         self.layers.clear();
-        self.path_msaa = None;
-        self.path_resolved = None;
         self.snapshot = None;
         self.blur.clear();
         self.effect_textures.clear();
@@ -823,8 +801,6 @@ impl DirectXRenderer {
         // not recreate committed upload buffers on every step.
         self.fences = [0; BUFFERS];
         self.layers.clear();
-        self.path_msaa = None;
-        self.path_resolved = None;
         self.snapshot = None;
         self.blur.clear();
         Ok(())
@@ -985,13 +961,6 @@ impl DirectXRenderer {
         }
         trim_scratch(&mut self.layers, depth, &mut self.idle_frames.layers);
         self.vn_age_snapshots(scene);
-        let path_targets = if scene.paths.is_empty() { 0 } else { 1 };
-        let mut held = usize::from(self.path_msaa.is_some());
-        trim_scratch_count(&mut held, path_targets, &mut self.idle_frames.paths);
-        if held == 0 {
-            self.path_msaa = None;
-            self.path_resolved = None;
-        }
         let needs_backdrop = self.prepare_pipelines(scene)?;
         let backdrop_levels = if needs_backdrop {
             scene
@@ -1135,8 +1104,6 @@ impl DirectXRenderer {
                 width: self.width,
                 height: self.height,
                 layers: &mut self.layers,
-                path_msaa: &mut self.path_msaa,
-                path_resolved: &mut self.path_resolved,
                 snapshot: &mut self.snapshot,
                 blur: &mut self.blur,
                 bound: BoundState::default(),
@@ -1209,8 +1176,7 @@ impl DirectXRenderer {
                 ShaderModule::PolychromeSprite,
                 1,
             ),
-            (!scene.paths.is_empty(), ShaderModule::PathRasterization, 4),
-            (!scene.paths.is_empty(), ShaderModule::PathSprite, 1),
+            (!scene.paths.is_empty(), ShaderModule::PathTile, 1),
             (!scene.vn_layers.is_empty(), ShaderModule::VnLayer, 1),
             (
                 !scene.backdrop_blur_rects.is_empty(),
@@ -1450,7 +1416,6 @@ const SCRATCH_RELEASE_FRAMES: u32 = 90;
 #[derive(Default)]
 struct ScratchIdle {
     layers: u32,
-    paths: u32,
     backdrop: u32,
 }
 
@@ -1829,8 +1794,6 @@ struct Encoding<'a> {
     width: u32,
     height: u32,
     layers: &'a mut Vec<Arc<Target>>,
-    path_msaa: &'a mut Option<Arc<Target>>,
-    path_resolved: &'a mut Option<Arc<Target>>,
     snapshot: &'a mut Option<Arc<Target>>,
     blur: &'a mut Vec<Arc<Target>>,
     bound: BoundState,
@@ -2363,109 +2326,34 @@ impl Encoding<'_> {
             }
         }
     }
-    fn paths(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
-        let Some(first_path) = paths.first() else {
-            return Ok(());
-        };
-        let mut union = first_path.clipped_bounds();
-        for path in paths.iter().skip(1) {
-            union = union.union(&path.clipped_bounds());
-        }
-        // Path sprites sample the resolved texture only inside their clipped
-        // bounds, texel for pixel. Rasterize, clear and resolve just that
-        // region (with a pixel of slack) instead of the whole window.
-        let region = intersect(round_out(&union, 1), self.clip);
-        if is_empty(&region) {
-            return Ok(());
-        }
-        if self.path_msaa.is_none() {
-            *self.path_msaa = Some(Target::new(self.gpu, self.width, self.height, 4)?);
-        }
-        if self.path_resolved.is_none() {
-            *self.path_resolved = Some(Target::new(self.gpu, self.width, self.height, 1)?);
-        }
-        let msaa = self
-            .path_msaa
-            .as_ref()
-            .context("D3D12 path MSAA target missing")?
-            .clone();
-        let resolved = self
-            .path_resolved
-            .as_ref()
-            .context("D3D12 path resolve target missing")?
-            .clone();
-        let mut vertices = Vec::new();
+    fn paths(&mut self, paths: &[PaintedPath]) -> Result<()> {
+        let mut paints = Vec::with_capacity(paths.len());
+        let mut curves = Vec::new();
+        let mut tiles = Vec::new();
         for path in paths {
-            vertices.extend(path.vertices.iter().map(|vertex| PathRasterizationSprite {
-                xy_position: vertex.xy_position,
-                st_position: vertex.st_position,
-                color: path.color,
-                bounds: path.clipped_bounds(),
-                content_mask: path.content_mask,
-            }));
+            path.append_to(&mut paints, &mut curves, &mut tiles);
         }
-        let buffer = upload(self.gpu, &self.retained, self.uploads, &vertices)?;
-        self.bind_target_rect(&msaa, region)?;
+        if tiles.is_empty() {
+            return Ok(());
+        }
+        let dummy = self.data.dummy;
+        let curves = upload_or_dummy(self.gpu, &self.retained, dummy, self.uploads, &curves)?;
+        let paints = upload(self.gpu, &self.retained, self.uploads, &paints)?;
+        let buffer = upload(self.gpu, &self.retained, self.uploads, &tiles)?;
+        self.bind_root();
         unsafe {
             self.list
-                .ClearRenderTargetView(msaa.rtv(), &[0.0; 4], Some(&[region]));
+                .SetGraphicsRootShaderResourceView(ROOT_PATH_CURVES, curves);
+            self.list
+                .SetGraphicsRootShaderResourceView(ROOT_PATH_PAINTS, paints);
         }
         self.draw(
-            ShaderModule::PathRasterization,
+            ShaderModule::PathTile,
             buffer,
             0,
-            1,
-            vertices.len() as u32,
-            None,
-            None,
+            tiles.len() as u32,
             4,
-        )?;
-        msaa.to(self.list, D3D12_RESOURCE_STATE_RESOLVE_SOURCE, self.changes);
-        resolved.to(self.list, D3D12_RESOURCE_STATE_RESOLVE_DEST, self.changes);
-        retain(&self.retained, resolved.clone());
-        match self.list.cast::<ID3D12GraphicsCommandList1>() {
-            Ok(list) => unsafe {
-                list.ResolveSubresourceRegion(
-                    &resolved.resource,
-                    0,
-                    region.left as u32,
-                    region.top as u32,
-                    &msaa.resource,
-                    0,
-                    Some(&region),
-                    FORMAT,
-                    D3D12_RESOLVE_MODE_AVERAGE,
-                );
-            },
-            Err(_) => unsafe {
-                self.list
-                    .ResolveSubresource(&resolved.resource, 0, &msaa.resource, 0, FORMAT);
-            },
-        }
-        resolved.to(self.list, SHADER_READ, self.changes);
-        let sprites = if paths
-            .last()
-            .is_some_and(|last| last.order == first_path.order)
-        {
-            paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![PathSprite { bounds: union }]
-        };
-        let buffer = upload(self.gpu, &self.retained, self.uploads, &sprites)?;
-        let target = self.target.clone();
-        self.bind_target(&target)?;
-        self.draw(
-            ShaderModule::PathSprite,
-            buffer,
-            0,
-            sprites.len() as u32,
-            4,
-            Some(&resolved.sampled()),
+            None,
             None,
             1,
         )
@@ -2855,8 +2743,6 @@ mod tests {
             skip_draws: false,
             present_no_wait: false,
             layers: Vec::new(),
-            path_msaa: None,
-            path_resolved: None,
             snapshot: None,
             blur: Vec::new(),
             idle_frames: ScratchIdle::default(),
@@ -2929,6 +2815,8 @@ mod tests {
             content_mask,
             color: rgb(0x000000).into(),
             transformation: TransformationMatrix::unit(),
+            animation: SpriteAnimationId::NONE,
+            pad: 0,
         });
         scene.finish();
         let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
@@ -2946,7 +2834,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     #[ignore = "requires a native D3D12 hardware adapter; run explicitly for renderer qualification"]
-    fn native_quads_preserve_premultiplied_alpha_and_paths_resolve_antialiasing() -> Result<()> {
+    fn native_quads_preserve_premultiplied_alpha_and_paths_antialias() -> Result<()> {
         let mut renderer = offscreen(128, 64)?;
         let content_mask = mask(128., 64.);
         let mut scene = Scene::default();
@@ -2956,13 +2844,17 @@ mod tests {
             rgba(0x0000ff80),
             content_mask,
         ));
-        let mut path = Path::new(point(px(70.25), px(4.25)));
+        let mut path = PathBuilder::fill();
+        path.move_to(point(px(70.25), px(4.25)));
         path.line_to(point(px(110.25), px(4.25)));
         path.line_to(point(px(70.25), px(44.25)));
-        let mut path = path.scale(1.);
-        path.content_mask = content_mask;
-        path.color = rgb(0xffffff).into();
-        scene.insert_primitive(path);
+        path.close();
+        scene.insert_primitive(PaintedPath::new(
+            path.build()?,
+            1.,
+            ContentMask::rect(Bounds::new(point(px(0.), px(0.)), size(px(128.), px(64.)))),
+            rgb(0xffffff).into(),
+        ));
         scene.finish();
         let image = renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
         assert_eq!(image.get_pixel(8, 8).0, [255, 0, 0, 255]);
@@ -2980,17 +2872,7 @@ mod tests {
                 let alpha = image.get_pixel(x, y).0[3];
                 alpha > 0 && alpha < 255
             })),
-            "the fractional triangle edge must retain MSAA coverage"
-        );
-        renderer.render_to_image(&Scene::default(), WindowBackgroundAppearance::Transparent)?;
-        assert!(
-            renderer.path_msaa.is_some(),
-            "a short gap must keep the MSAA scratch for the next path frame"
-        );
-        draw_repeatedly(&mut renderer, &Scene::default(), SCRATCH_RELEASE_FRAMES)?;
-        assert!(
-            renderer.path_msaa.is_none() && renderer.path_resolved.is_none(),
-            "a scene without paths must release the full-window MSAA scratch textures"
+            "the fractional triangle edge must be antialiased"
         );
         Ok(())
     }
@@ -3074,6 +2956,8 @@ mod tests {
             content_mask,
             color: rgb(0xffffff).into(),
             transformation: TransformationMatrix::unit(),
+            animation: SpriteAnimationId::NONE,
+            pad: 0,
         });
         scene.vn_pop_isolation();
         scene.vn_pop_isolation();
@@ -3690,13 +3574,17 @@ mod tests {
             let mut scene = Scene::default();
             scene.insert_primitive(quad(bounds(0., 0., 32., 32.), rgb(color), content_mask));
             let x = if frame < BUFFERS { 8.25 } else { 12.25 };
-            let mut path = Path::new(point(px(x), px(8.25)));
+            let mut path = PathBuilder::fill();
+            path.move_to(point(px(x), px(8.25)));
             path.line_to(point(px(x + 16.), px(8.25)));
             path.line_to(point(px(x), px(24.25)));
-            let mut path = path.scale(1.);
-            path.content_mask = content_mask;
-            path.color = rgb(0xffffff).into();
-            scene.insert_primitive(path);
+            path.close();
+            scene.insert_primitive(PaintedPath::new(
+                path.build()?,
+                1.,
+                ContentMask::rect(Bounds::new(point(px(0.), px(0.)), size(px(32.), px(32.)))),
+                rgb(0xffffff).into(),
+            ));
             scene.finish();
             let fence = renderer.render(
                 &scene,
@@ -3708,7 +3596,7 @@ mod tests {
             uploads.finish();
             assert!(
                 uploads.cursor >= 5 * 256,
-                "globals, dummy, quads and both path streams must use the pool"
+                "globals, quads and the path streams must use the pool"
             );
             let resource = &uploads.buffer.as_ref().unwrap().resource;
             if let Some(previous) = &identities[slot] {

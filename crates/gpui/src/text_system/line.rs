@@ -543,14 +543,6 @@ fn paint_line(
         &mut Window,
     ),
 ) -> Result<()> {
-    let line_bounds = line_paint_bounds(
-        origin,
-        layout,
-        line_height,
-        align,
-        align_width,
-        wrap_boundaries,
-    );
     // vue-native fork: each `text-shadow` is a pass of its own beneath the text, last first, in a
     // layer of its own so its sprites order below the glyphs they shadow.
     let mut paint_pass = |shadow_ix: Option<usize>, window: &mut Window| -> Result<()> {
@@ -887,15 +879,9 @@ fn paint_line(
         .max()
         .unwrap_or(0);
     for shadow_ix in (0..shadow_count).rev() {
-        let bounds = decoration_runs
-            .iter()
-            .filter_map(|run| run.text_shadow.get(shadow_ix))
-            .fold(line_bounds, |bounds, shadow| {
-                bounds.union(&shadow_glyph_bounds(line_bounds, *shadow))
-            });
-        window.paint_layer(bounds, |window| paint_pass(Some(shadow_ix), window))?;
+        window.paint_layer(|window| paint_pass(Some(shadow_ix), window))?;
     }
-    window.paint_layer(line_bounds, |window| paint_pass(None, window))
+    window.paint_layer(|window| paint_pass(None, window))
 }
 
 /// Where a shadow of glyphs within `bounds` can reach: three standard deviations of its blur.
@@ -954,15 +940,7 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = line_paint_bounds(
-        origin,
-        layout,
-        line_height,
-        align,
-        align_width,
-        wrap_boundaries,
-    );
-    window.paint_layer(line_bounds, |window| {
+    window.paint_layer(|window| {
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -1091,51 +1069,6 @@ fn paint_line_background(
 
         Ok(())
     })
-}
-
-fn line_paint_bounds(
-    origin: Point<Pixels>,
-    layout: &LineLayout,
-    line_height: Pixels,
-    align: TextAlign,
-    align_width: Option<Pixels>,
-    wrap_boundaries: &[WrapBoundary],
-) -> Bounds<Pixels> {
-    let mut bounds = Bounds::new(
-        origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
-    );
-    if align == TextAlign::Left || layout.len == 0 {
-        return bounds;
-    }
-
-    let align_width = align_width.unwrap_or(layout.width);
-    let mut row_start = Pixels::ZERO;
-    let row_ends = wrap_boundaries
-        .iter()
-        .map(|boundary| {
-            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
-                .position
-                .x
-        })
-        .chain([layout.width]);
-    for (row, row_end) in row_ends.enumerate() {
-        let width = row_end - row_start;
-        let offset = match align {
-            TextAlign::Left => Pixels::ZERO,
-            TextAlign::Center => (align_width - width) / 2.,
-            TextAlign::Right => align_width - width,
-        };
-        bounds = bounds.union(&Bounds::new(
-            point(origin.x + offset, origin.y + line_height * row as f32),
-            size(width, line_height),
-        ));
-        row_start = row_end;
-    }
-    bounds
 }
 
 fn aligned_origin_x(
@@ -1495,68 +1428,6 @@ mod tests {
         context
             .update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
-    }
-
-    #[test]
-    fn test_aligned_line_paint_bounds() {
-        let line = make_shaped_line("abcd", &[(0, 0.), (1, 10.), (2, 20.), (3, 30.)], 40., &[]);
-        let origin = point(px(10.), px(20.));
-        let line_height = px(16.);
-        for (wrapped, align_width, expected_edges) in [
-            (false, None, [(10., 50.), (10., 50.), (10., 50.)]),
-            (true, None, [(10., 50.), (10., 50.), (10., 50.)]),
-            (false, Some(40.), [(10., 50.), (10., 50.), (10., 50.)]),
-            (true, Some(40.), [(10., 50.), (10., 50.), (10., 50.)]),
-            (false, Some(100.), [(10., 50.), (10., 80.), (10., 110.)]),
-            (true, Some(100.), [(10., 50.), (10., 70.), (10., 110.)]),
-            (false, Some(10.), [(10., 50.), (-5., 50.), (-20., 50.)]),
-            (true, Some(10.), [(10., 50.), (5., 50.), (0., 50.)]),
-            (false, Some(0.), [(10., 50.), (-10., 50.), (-30., 50.)]),
-            (true, Some(0.), [(10., 50.), (0., 50.), (-10., 50.)]),
-        ] {
-            let boundaries = if wrapped {
-                vec![WrapBoundary {
-                    run_ix: 0,
-                    glyph_ix: 2,
-                }]
-            } else {
-                Vec::new()
-            };
-            for (align, (left, right)) in [TextAlign::Left, TextAlign::Center, TextAlign::Right]
-                .into_iter()
-                .zip(expected_edges)
-            {
-                assert_eq!(
-                    line_paint_bounds(
-                        origin,
-                        &line.layout,
-                        line_height,
-                        align,
-                        align_width.map(px),
-                        &boundaries,
-                    ),
-                    Bounds::new(
-                        point(px(left), origin.y),
-                        size(px(right - left), px(if wrapped { 32. } else { 16. })),
-                    ),
-                    "wrapped={wrapped}, align={align:?}, align_width={align_width:?}",
-                );
-            }
-        }
-        let empty = make_shaped_line("", &[], 0., &[]);
-        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
-            assert_eq!(
-                line_paint_bounds(
-                    origin,
-                    &empty.layout,
-                    line_height,
-                    align,
-                    Some(px(100.)),
-                    &[]
-                ),
-                Bounds::new(origin, size(Pixels::ZERO, line_height)),
-            );
-        }
     }
 
     #[gpui::test]

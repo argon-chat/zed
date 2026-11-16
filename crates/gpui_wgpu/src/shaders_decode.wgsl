@@ -5,7 +5,7 @@
 // vue-native fork: the records are read word by word on both transports,
 // because WGSL cannot declare them. A `vec2` or `mat2x2` member is 8-byte
 // aligned in WGSL and the Rust `#[repr(C)]` records are 4-byte aligned, so
-// `Quad` (89 words) and `PathRasterizationVertex` (73) have no WGSL struct
+// `Quad` (89 words) and `PathPaint` (71) have no WGSL struct
 // with their stride and field offsets. `array<Quad>` read every quad past
 // the first from the wrong bytes, and wgpu refused a buffer of one quad.
 
@@ -145,7 +145,7 @@ fn load_quad(instance_id: u32) -> Quad {
 }
 
 fn load_shadow(instance_id: u32) -> Shadow {
-    var cursor = instance_cursor(instance_id * 38u);
+    var cursor = instance_cursor(instance_id * 42u);
     return Shadow(
         read_word(&cursor),
         read_f32(&cursor),
@@ -159,26 +159,50 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_word(&cursor),
         read_word(&cursor),
         read_transformation(&cursor),
+        read_bounds(&cursor),
     );
 }
 
-fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    // 73 words: 8 + the 57 of `Background` + the vue-native content mask's
-    // rect and radii.
-    var cursor = instance_cursor(vertex_id * 73u);
-    return PathRasterizationVertex(
+// The path arrays are written together each frame; `globals` holds where each
+// starts, in words, and tiles index the curves and paints from there.
+fn load_path_tile(instance_id: u32) -> PathTile {
+    var cursor = instance_cursor(globals.path_tile_base + instance_id * 14u);
+    return PathTile(
+        read_word(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+        read_i32(&cursor),
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
-        read_background(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+    );
+}
+
+fn load_path_curve(index: u32) -> PathCurve {
+    var cursor = instance_cursor(globals.path_curve_base + index * 10u);
+    return PathCurve(
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_vec2_f32(&cursor),
+        read_f32(&cursor),
+        read_word(&cursor),
+    );
+}
+
+fn load_path_paint(index: u32) -> PathPaint {
+    // 71 words: 12 + the 57 of `Background` + 2.
+    var cursor = instance_cursor(globals.path_paint_base + index * 71u);
+    return PathPaint(
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
+        read_background(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
     );
-}
-
-fn load_path_sprite(instance_id: u32) -> PathSprite {
-    var cursor = instance_cursor(instance_id * 4u);
-    return PathSprite(read_bounds(&cursor));
 }
 
 fn load_underline(instance_id: u32) -> Underline {
@@ -197,7 +221,8 @@ fn load_underline(instance_id: u32) -> Underline {
 }
 
 fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
-    var cursor = instance_cursor(instance_id * 32u);
+    // 34 words: the last two are upstream's animation id and padding, unread.
+    var cursor = instance_cursor(instance_id * 34u);
     return MonochromeSprite(
         read_word(&cursor),
         read_word(&cursor),

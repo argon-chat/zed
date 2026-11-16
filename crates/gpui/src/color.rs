@@ -1079,6 +1079,11 @@ impl Background {
         self
     }
 
+    /// vue-native fork: whether this is a [`Self::ring`] background.
+    pub(crate) fn is_ring(&self) -> bool {
+        self.flags & BG_RING != 0
+    }
+
     /// Use specified color space for color interpolation.
     ///
     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>

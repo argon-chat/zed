@@ -67,7 +67,7 @@ impl VnPathVerb {
         sweep: bool,
         to: [f32; 2],
     ) {
-        use lyon::geom::{Angle, ArcFlags, SvgArc, point as lpoint, vector};
+        use lyon_path::geom::{Angle, ArcFlags, SvgArc, point as lpoint, vector};
         if from == to {
             return;
         }
